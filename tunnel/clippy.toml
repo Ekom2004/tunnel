@@ -1,0 +1,3 @@
+# Keep workspace-wide Clippy configuration here as the codebase grows.
+# Phase 1 quality gates are enforced through CI and crate attributes.
+

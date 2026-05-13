@@ -1,0 +1,12 @@
+[package]
+name = "tunnel-cli"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tunnel-shared.workspace = true
+
