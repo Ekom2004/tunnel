@@ -5,6 +5,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -13,11 +14,12 @@ use anyhow::{anyhow, Context, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 use tun::AbstractDevice;
 use tunnel_shared::{
     decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentToGateway, ComponentKind,
-    GatewayToAgent, HealthState, HealthStatus, SocketEndpoint, TunnelConfig, UsageRecord,
-    WireGuardConfig,
+    GatewayToAgent, HealthState, HealthStatus, RuntimeStatus, SocketEndpoint, TransportKind,
+    TunnelConfig, UsageRecord, WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -30,6 +32,12 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     output_dir: Option<PathBuf>,
+    #[arg(long, default_value = "/private/tmp/tunnel-gateway-state.json")]
+    state_file: PathBuf,
+    #[arg(long)]
+    cleanup_only: bool,
+    #[arg(long, default_value_t = 5)]
+    status_interval_secs: u64,
     #[command(flatten)]
     tun: TunArgs,
 }
@@ -67,8 +75,27 @@ enum SystemCommandMode {
     Apply,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GatewayRuntimeState {
+    tunnel_interface: String,
+    nat_anchor_name: Option<String>,
+    nat_rules_path: Option<PathBuf>,
+    forwarding_was_enabled: Option<bool>,
+    egress_interface: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ByteCounters {
+    ingress_bytes: AtomicU64,
+    egress_bytes: AtomicU64,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.cleanup_only {
+        return run_cleanup_only(&cli);
+    }
 
     if let Some(config_path) = &cli.config {
         let config: TunnelConfig = serde_json::from_str(&fs::read_to_string(config_path)?)?;
@@ -79,6 +106,51 @@ fn main() -> Result<()> {
     }
 
     run_json_session_gateway(&cli)
+}
+
+fn run_cleanup_only(cli: &Cli) -> Result<()> {
+    let state = load_gateway_state(&cli.state_file)?;
+
+    if cli.tun.forwarding_mode != SystemCommandMode::Skip {
+        let commands = build_forwarding_cleanup_commands(&state);
+        execute_commands(
+            cli.tun.forwarding_mode,
+            "gateway forwarding cleanup",
+            &commands,
+        )?;
+    } else {
+        println!("gateway forwarding cleanup skipped: forwarding_mode is skip");
+    }
+
+    if cli.tun.nat_mode != SystemCommandMode::Skip {
+        handle_nat_cleanup(cli.tun.nat_mode, &state)?;
+    } else {
+        println!("gateway nat cleanup skipped: nat_mode is skip");
+    }
+
+    if cli.tun.forwarding_mode == SystemCommandMode::Apply
+        || cli.tun.nat_mode == SystemCommandMode::Apply
+    {
+        remove_gateway_state(&cli.state_file)?;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&RuntimeStatus {
+            component: ComponentKind::Gateway,
+            tenant_id: None,
+            tunnel_id: None,
+            transport: TransportKind::WireGuardUdp,
+            tunnel_interface: Some(state.tunnel_interface),
+            peer_endpoint: None,
+            ingress_bytes: 0,
+            egress_bytes: 0,
+            observed_at_unix_secs: now_unix_secs(),
+            detail: String::from("gateway cleanup complete"),
+        })?
+    );
+
+    Ok(())
 }
 
 fn run_json_session_gateway(cli: &Cli) -> Result<()> {
@@ -128,12 +200,20 @@ fn run_wireguard_gateway(
     )?;
     let interface_name = device.tun_name()?;
     println!("gateway wireguard tun ready: {interface_name}");
+    let previous_forwarding = query_ip_forwarding_enabled().ok();
     handle_gateway_networking(&cli.tun, &interface_name)?;
+    save_gateway_state(
+        &cli.state_file,
+        &cli.tun,
+        &interface_name,
+        previous_forwarding,
+    )?;
 
     let tunnel = Arc::new(Mutex::new(build_wireguard_tunnel(wireguard, 2)?));
     let peer = Arc::new(Mutex::new(resolve_optional_socket_endpoint(
         wireguard.peer_endpoint.as_ref(),
     )?));
+    let counters = Arc::new(ByteCounters::default());
     let output_file = prepare_output_file(
         cli.output_dir.as_deref(),
         &config.tenant_id,
@@ -142,11 +222,26 @@ fn run_wireguard_gateway(
     let output_file = Arc::new(Mutex::new(output_file));
     let (mut tun_reader, mut tun_writer) = device.split();
 
+    spawn_status_thread(
+        cli.status_interval_secs,
+        RuntimeStatusContext {
+            component: ComponentKind::Gateway,
+            tenant_id: Some(config.tenant_id.clone()),
+            tunnel_id: Some(config.tunnel_id.clone()),
+            transport: TransportKind::WireGuardUdp,
+            tunnel_interface: interface_name.clone(),
+            detail: String::from("wireguard gateway running"),
+        },
+        Arc::clone(&peer),
+        Arc::clone(&counters),
+    );
+
     {
         let socket = socket.try_clone()?;
         let tunnel = Arc::clone(&tunnel);
         let peer = Arc::clone(&peer);
         let output = Arc::clone(&output_file);
+        let counters = Arc::clone(&counters);
         thread::spawn(move || {
             if let Err(error) = wireguard_udp_receiver_loop(
                 socket,
@@ -154,6 +249,7 @@ fn run_wireguard_gateway(
                 peer,
                 &mut tun_writer,
                 Some(output),
+                counters,
                 "gateway",
             ) {
                 eprintln!("gateway wireguard udp receiver stopped: {error:#}");
@@ -177,6 +273,7 @@ fn run_wireguard_gateway(
         socket,
         tunnel,
         peer,
+        counters,
         config.max_chunk_bytes.max(cli.tun.tun_mtu as usize + 256),
         "gateway",
     )
@@ -222,7 +319,14 @@ fn handle_client(stream: TcpStream, cli: &Cli) -> Result<()> {
         let device = create_tun_device(&cli.tun, None, None)?;
         let interface_name = device.tun_name()?;
         println!("gateway tun ready: {interface_name}");
+        let previous_forwarding = query_ip_forwarding_enabled().ok();
         handle_gateway_networking(&cli.tun, &interface_name)?;
+        save_gateway_state(
+            &cli.state_file,
+            &cli.tun,
+            &interface_name,
+            previous_forwarding,
+        )?;
         let (mut tun_reader, writer_half) = device.split();
         tun_writer = Some(writer_half);
 
@@ -314,6 +418,7 @@ fn wireguard_tun_sender_loop(
     socket: UdpSocket,
     tunnel: Arc<Mutex<Tunn>>,
     peer: Arc<Mutex<Option<SocketAddr>>>,
+    counters: Arc<ByteCounters>,
     max_packet_bytes: usize,
     label: &str,
 ) -> Result<()> {
@@ -324,6 +429,9 @@ fn wireguard_tun_sender_loop(
         if amount == 0 {
             continue;
         }
+        counters
+            .egress_bytes
+            .fetch_add(amount as u64, Ordering::Relaxed);
 
         let mut network_buf = vec![0_u8; amount + 512];
         let result = {
@@ -343,6 +451,7 @@ fn wireguard_udp_receiver_loop(
     peer: Arc<Mutex<Option<SocketAddr>>>,
     tun_writer: &mut impl Write,
     output_file: Option<Arc<Mutex<Option<File>>>>,
+    counters: Arc<ByteCounters>,
     label: &str,
 ) -> Result<()> {
     let mut datagram = vec![0_u8; 65535];
@@ -377,6 +486,9 @@ fn wireguard_udp_receiver_loop(
                     continue;
                 }
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    counters
+                        .ingress_bytes
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
                     if let Some(output_file) = &output_file {
                         let mut guard = output_file
                             .lock()
@@ -482,6 +594,91 @@ fn resolve_socket_endpoint(endpoint: &SocketEndpoint) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("could not resolve {}:{}", endpoint.host, endpoint.port))
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeStatusContext {
+    component: ComponentKind,
+    tenant_id: Option<String>,
+    tunnel_id: Option<String>,
+    transport: TransportKind,
+    tunnel_interface: String,
+    detail: String,
+}
+
+fn spawn_status_thread(
+    interval_secs: u64,
+    context: RuntimeStatusContext,
+    peer: Arc<Mutex<Option<SocketAddr>>>,
+    counters: Arc<ByteCounters>,
+) {
+    if interval_secs == 0 {
+        return;
+    }
+
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(interval_secs));
+        let peer_endpoint = peer
+            .lock()
+            .ok()
+            .and_then(|guard| guard.map(|addr| addr.to_string()));
+        let status = RuntimeStatus {
+            component: context.component.clone(),
+            tenant_id: context.tenant_id.clone(),
+            tunnel_id: context.tunnel_id.clone(),
+            transport: context.transport.clone(),
+            tunnel_interface: Some(context.tunnel_interface.clone()),
+            peer_endpoint,
+            ingress_bytes: counters.ingress_bytes.load(Ordering::Relaxed),
+            egress_bytes: counters.egress_bytes.load(Ordering::Relaxed),
+            observed_at_unix_secs: now_unix_secs(),
+            detail: context.detail.clone(),
+        };
+
+        match serde_json::to_string_pretty(&status) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(error) => eprintln!("gateway status render failed: {error}"),
+        }
+    });
+}
+
+fn save_gateway_state(
+    state_file: &PathBuf,
+    tun_args: &TunArgs,
+    interface_name: &str,
+    forwarding_was_enabled: Option<bool>,
+) -> Result<()> {
+    let state = GatewayRuntimeState {
+        tunnel_interface: interface_name.to_owned(),
+        nat_anchor_name: build_nat_anchor_name(interface_name, tun_args),
+        nat_rules_path: build_nat_rules_path(interface_name, tun_args),
+        forwarding_was_enabled,
+        egress_interface: tun_args.egress_interface.clone(),
+    };
+    fs::write(state_file, serde_json::to_string_pretty(&state)?)?;
+    Ok(())
+}
+
+fn load_gateway_state(state_file: &PathBuf) -> Result<GatewayRuntimeState> {
+    let state = fs::read_to_string(state_file).with_context(|| {
+        format!(
+            "failed to read gateway state file: {}",
+            state_file.display()
+        )
+    })?;
+    Ok(serde_json::from_str(&state)?)
+}
+
+fn remove_gateway_state(state_file: &PathBuf) -> Result<()> {
+    if state_file.exists() {
+        fs::remove_file(state_file).with_context(|| {
+            format!(
+                "failed to remove gateway state file: {}",
+                state_file.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn forward_tun_packets_json(
     tun_reader: &mut impl Read,
     writer: Arc<Mutex<TcpStream>>,
@@ -557,6 +754,38 @@ fn handle_gateway_networking(tun_args: &TunArgs, interface_name: &str) -> Result
     handle_nat(tun_args.nat_mode, interface_name, tun_args)
 }
 
+fn build_nat_anchor_name(interface_name: &str, tun_args: &TunArgs) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return Some(format!("{}/{}", tun_args.pf_anchor_prefix, interface_name));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = interface_name;
+        let _ = tun_args;
+        None
+    }
+}
+
+fn build_nat_rules_path(interface_name: &str, tun_args: &TunArgs) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        return Some(
+            tun_args
+                .pf_rules_dir
+                .join(format!("tunnel-{interface_name}.pf.conf")),
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = interface_name;
+        let _ = tun_args;
+        None
+    }
+}
+
 fn handle_forwarding(mode: SystemCommandMode, interface_name: &str) -> Result<()> {
     if mode == SystemCommandMode::Skip {
         return Ok(());
@@ -584,6 +813,85 @@ fn handle_nat(mode: SystemCommandMode, interface_name: &str, tun_args: &TunArgs)
 
     #[allow(unreachable_code)]
     Ok(())
+}
+
+fn build_forwarding_cleanup_commands(state: &GatewayRuntimeState) -> Vec<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut commands = vec![
+            vec![
+                String::from("iptables"),
+                String::from("-D"),
+                String::from("FORWARD"),
+                String::from("-i"),
+                state.tunnel_interface.clone(),
+                String::from("-j"),
+                String::from("ACCEPT"),
+            ],
+            vec![
+                String::from("iptables"),
+                String::from("-D"),
+                String::from("FORWARD"),
+                String::from("-o"),
+                state.tunnel_interface.clone(),
+                String::from("-m"),
+                String::from("state"),
+                String::from("--state"),
+                String::from("RELATED,ESTABLISHED"),
+                String::from("-j"),
+                String::from("ACCEPT"),
+            ],
+        ];
+
+        if matches!(state.forwarding_was_enabled, Some(false)) {
+            commands.push(vec![
+                String::from("sysctl"),
+                String::from("-w"),
+                String::from("net.ipv4.ip_forward=0"),
+            ]);
+        }
+
+        commands
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if matches!(state.forwarding_was_enabled, Some(false)) {
+            return vec![vec![
+                String::from("sysctl"),
+                String::from("-w"),
+                String::from("net.inet.ip.forwarding=0"),
+            ]];
+        }
+
+        Vec::new()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = state;
+        Vec::new()
+    }
+}
+
+fn handle_nat_cleanup(mode: SystemCommandMode, state: &GatewayRuntimeState) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return handle_macos_nat_cleanup(mode, state);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let commands = build_nat_cleanup_commands(state)?;
+        return execute_commands(mode, "gateway nat cleanup", &commands);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = mode;
+        let _ = state;
+        Ok(())
+    }
 }
 
 fn build_forwarding_commands(interface_name: &str) -> Vec<Vec<String>> {
@@ -639,6 +947,43 @@ fn build_forwarding_commands(interface_name: &str) -> Vec<Vec<String>> {
     }
 }
 
+fn query_ip_forwarding_enabled() -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("sysctl")
+            .args(["-n", "net.ipv4.ip_forward"])
+            .output()
+            .context("failed to query net.ipv4.ip_forward")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "failed to query net.ipv4.ip_forward: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout).trim() == "1");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("sysctl")
+            .args(["-n", "net.inet.ip.forwarding"])
+            .output()
+            .context("failed to query net.inet.ip.forwarding")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "failed to query net.inet.ip.forwarding: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout).trim() == "1");
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Ok(false)
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 fn build_nat_commands(
     interface_name: &str,
@@ -680,6 +1025,38 @@ fn build_nat_commands(
         let _ = egress_interface;
         Ok(Vec::new())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn build_nat_cleanup_commands(state: &GatewayRuntimeState) -> Result<Vec<Vec<String>>> {
+    let egress_interface = state
+        .egress_interface
+        .as_deref()
+        .ok_or_else(|| anyhow!("gateway state missing egress interface"))?;
+    Ok(vec![
+        vec![
+            String::from("iptables"),
+            String::from("-t"),
+            String::from("nat"),
+            String::from("-D"),
+            String::from("POSTROUTING"),
+            String::from("-o"),
+            String::from(egress_interface),
+            String::from("-j"),
+            String::from("MASQUERADE"),
+        ],
+        vec![
+            String::from("iptables"),
+            String::from("-D"),
+            String::from("FORWARD"),
+            String::from("-i"),
+            state.tunnel_interface.clone(),
+            String::from("-o"),
+            String::from(egress_interface),
+            String::from("-j"),
+            String::from("ACCEPT"),
+        ],
+    ])
 }
 
 #[cfg(target_os = "macos")]
@@ -730,6 +1107,43 @@ fn handle_macos_nat(
             )?;
             println!("gateway nat anchor: {anchor_name}");
             println!("gateway nat rules path: {}", rules_path.display());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_nat_cleanup(mode: SystemCommandMode, state: &GatewayRuntimeState) -> Result<()> {
+    let anchor_name = state
+        .nat_anchor_name
+        .as_deref()
+        .ok_or_else(|| anyhow!("gateway state missing nat anchor name"))?;
+    let rules_path = state
+        .nat_rules_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("gateway state missing nat rules path"))?;
+
+    match mode {
+        SystemCommandMode::Skip => Ok(()),
+        SystemCommandMode::Print => {
+            println!("gateway nat cleanup command: pfctl -a {anchor_name} -F all");
+            println!("gateway nat cleanup file removal: {}", rules_path.display());
+            Ok(())
+        }
+        SystemCommandMode::Apply => {
+            run_command(
+                "gateway nat cleanup",
+                &["pfctl", "-a", anchor_name, "-F", "all"],
+            )?;
+            if rules_path.exists() {
+                fs::remove_file(rules_path).with_context(|| {
+                    format!(
+                        "failed to remove gateway nat rules file: {}",
+                        rules_path.display()
+                    )
+                })?;
+            }
+            println!("gateway nat cleanup anchor: {anchor_name}");
             Ok(())
         }
     }

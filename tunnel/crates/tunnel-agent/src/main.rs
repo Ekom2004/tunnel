@@ -5,6 +5,7 @@ use std::io::{self, BufReader, IsTerminal, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -13,10 +14,11 @@ use anyhow::{anyhow, Context, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, ValueEnum};
+use serde::{Deserialize, Serialize};
 use tun::AbstractDevice;
 use tunnel_shared::{
-    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentToGateway, GatewayToAgent,
-    SocketEndpoint, TunnelConfig, WireGuardConfig,
+    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentToGateway, ComponentKind,
+    GatewayToAgent, RuntimeStatus, SocketEndpoint, TransportKind, TunnelConfig, WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -29,6 +31,12 @@ struct Cli {
     input: Option<PathBuf>,
     #[arg(long)]
     payload: Option<String>,
+    #[arg(long, default_value = "/private/tmp/tunnel-agent-state.json")]
+    state_file: PathBuf,
+    #[arg(long)]
+    cleanup_only: bool,
+    #[arg(long, default_value_t = 5)]
+    status_interval_secs: u64,
     #[command(flatten)]
     tun: TunArgs,
 }
@@ -63,11 +71,65 @@ fn main() -> Result<()> {
     let config: TunnelConfig = serde_json::from_str(&fs::read_to_string(&cli.config)?)?;
     config.validate()?;
 
+    if cli.cleanup_only {
+        return run_cleanup_only(&cli, &config);
+    }
+
     if let Some(wireguard) = &config.wireguard {
-        return run_wireguard_mode(&config, &cli.tun, wireguard);
+        return run_wireguard_mode(&config, &cli, wireguard);
     }
 
     run_json_session_mode(&config, &cli)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AgentRuntimeState {
+    tunnel_interface: String,
+    destination_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ByteCounters {
+    ingress_bytes: AtomicU64,
+    egress_bytes: AtomicU64,
+}
+
+fn run_cleanup_only(cli: &Cli, config: &TunnelConfig) -> Result<()> {
+    let state = load_agent_state(&cli.state_file)?;
+    if cli.tun.route_mode == SystemCommandMode::Skip {
+        println!("agent cleanup skipped: route_mode is skip");
+        return Ok(());
+    }
+
+    let commands =
+        build_agent_route_cleanup_commands(&state.tunnel_interface, &state.destination_cidrs);
+    execute_commands(cli.tun.route_mode, "agent route cleanup", &commands)?;
+
+    if cli.tun.route_mode == SystemCommandMode::Apply {
+        remove_state_file(&cli.state_file)?;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&RuntimeStatus {
+            component: ComponentKind::Agent,
+            tenant_id: Some(config.tenant_id.clone()),
+            tunnel_id: Some(config.tunnel_id.clone()),
+            transport: if config.wireguard.is_some() {
+                TransportKind::WireGuardUdp
+            } else {
+                TransportKind::JsonTcp
+            },
+            tunnel_interface: Some(state.tunnel_interface),
+            peer_endpoint: None,
+            ingress_bytes: 0,
+            egress_bytes: 0,
+            observed_at_unix_secs: now_unix_secs(),
+            detail: String::from("agent cleanup complete"),
+        })?
+    );
+
+    Ok(())
 }
 
 fn run_json_session_mode(config: &TunnelConfig, cli: &Cli) -> Result<()> {
@@ -83,7 +145,7 @@ fn run_json_session_mode(config: &TunnelConfig, cli: &Cli) -> Result<()> {
     spawn_heartbeat_thread(Arc::clone(&writer), config.heartbeat_interval_secs);
 
     if cli.tun.tun {
-        run_json_tun_mode(config, &cli.tun, writer, &mut reader)
+        run_json_tun_mode(config, cli, &cli.tun, writer, &mut reader)
     } else {
         run_payload_mode(config, cli, &writer, &mut reader)
     }
@@ -116,6 +178,7 @@ fn run_payload_mode(
 
 fn run_json_tun_mode(
     config: &TunnelConfig,
+    cli: &Cli,
     tun_args: &TunArgs,
     writer: Arc<Mutex<TcpStream>>,
     reader: &mut BufReader<TcpStream>,
@@ -124,6 +187,11 @@ fn run_json_tun_mode(
     let interface_name = device.tun_name()?;
     println!("agent tun ready: {interface_name}");
 
+    save_agent_state(
+        &cli.state_file,
+        &interface_name,
+        &config.route_policy.destination_cidrs,
+    )?;
     handle_agent_routes(tun_args.route_mode, &interface_name, config)?;
 
     let (mut tun_reader, mut tun_writer) = device.split();
@@ -173,11 +241,8 @@ fn run_json_tun_mode(
     Ok(())
 }
 
-fn run_wireguard_mode(
-    config: &TunnelConfig,
-    tun_args: &TunArgs,
-    wireguard: &WireGuardConfig,
-) -> Result<()> {
+fn run_wireguard_mode(config: &TunnelConfig, cli: &Cli, wireguard: &WireGuardConfig) -> Result<()> {
+    let tun_args = &cli.tun;
     let device = create_tun_device(
         tun_args,
         Some(&wireguard.local_tunnel_address),
@@ -186,6 +251,11 @@ fn run_wireguard_mode(
     let interface_name = device.tun_name()?;
     println!("agent wireguard tun ready: {interface_name}");
 
+    save_agent_state(
+        &cli.state_file,
+        &interface_name,
+        &config.route_policy.destination_cidrs,
+    )?;
     handle_agent_routes(tun_args.route_mode, &interface_name, config)?;
 
     let peer_endpoint = resolve_socket_endpoint(
@@ -202,16 +272,37 @@ fn run_wireguard_mode(
 
     let tunnel = Arc::new(Mutex::new(build_wireguard_tunnel(wireguard, 1)?));
     let peer = Arc::new(Mutex::new(Some(peer_endpoint)));
+    let counters = Arc::new(ByteCounters::default());
     let (mut tun_reader, mut tun_writer) = device.split();
+
+    spawn_status_thread(
+        cli.status_interval_secs,
+        RuntimeStatusContext {
+            component: ComponentKind::Agent,
+            tenant_id: config.tenant_id.clone(),
+            tunnel_id: config.tunnel_id.clone(),
+            transport: TransportKind::WireGuardUdp,
+            tunnel_interface: interface_name.clone(),
+            detail: String::from("wireguard agent running"),
+        },
+        Arc::clone(&peer),
+        Arc::clone(&counters),
+    );
 
     {
         let socket = socket.try_clone()?;
         let tunnel = Arc::clone(&tunnel);
         let peer = Arc::clone(&peer);
+        let counters = Arc::clone(&counters);
         thread::spawn(move || {
-            if let Err(error) =
-                wireguard_udp_receiver_loop(socket, tunnel, peer, &mut tun_writer, "agent")
-            {
+            if let Err(error) = wireguard_udp_receiver_loop(
+                socket,
+                tunnel,
+                peer,
+                &mut tun_writer,
+                counters,
+                "agent",
+            ) {
                 eprintln!("agent wireguard udp receiver stopped: {error:#}");
             }
         });
@@ -233,6 +324,7 @@ fn run_wireguard_mode(
         socket,
         tunnel,
         peer,
+        counters,
         config.max_chunk_bytes.max(tun_args.tun_mtu as usize + 256),
         "agent",
     )
@@ -243,6 +335,7 @@ fn wireguard_tun_sender_loop(
     socket: UdpSocket,
     tunnel: Arc<Mutex<Tunn>>,
     peer: Arc<Mutex<Option<SocketAddr>>>,
+    counters: Arc<ByteCounters>,
     max_packet_bytes: usize,
     label: &str,
 ) -> Result<()> {
@@ -253,6 +346,9 @@ fn wireguard_tun_sender_loop(
         if amount == 0 {
             continue;
         }
+        counters
+            .egress_bytes
+            .fetch_add(amount as u64, Ordering::Relaxed);
 
         let mut network_buf = vec![0_u8; amount + 512];
         let result = {
@@ -271,6 +367,7 @@ fn wireguard_udp_receiver_loop(
     tunnel: Arc<Mutex<Tunn>>,
     peer: Arc<Mutex<Option<SocketAddr>>>,
     tun_writer: &mut impl Write,
+    counters: Arc<ByteCounters>,
     label: &str,
 ) -> Result<()> {
     let mut datagram = vec![0_u8; 65535];
@@ -305,6 +402,9 @@ fn wireguard_udp_receiver_loop(
                     continue;
                 }
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    counters
+                        .ingress_bytes
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
                     tun_writer.write_all(packet)?;
                     tun_writer.flush()?;
                     break;
@@ -393,6 +493,79 @@ fn resolve_socket_endpoint(endpoint: &SocketEndpoint) -> Result<SocketAddr> {
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("could not resolve {}:{}", endpoint.host, endpoint.port))
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeStatusContext {
+    component: ComponentKind,
+    tenant_id: String,
+    tunnel_id: String,
+    transport: TransportKind,
+    tunnel_interface: String,
+    detail: String,
+}
+
+fn spawn_status_thread(
+    interval_secs: u64,
+    context: RuntimeStatusContext,
+    peer: Arc<Mutex<Option<SocketAddr>>>,
+    counters: Arc<ByteCounters>,
+) {
+    if interval_secs == 0 {
+        return;
+    }
+
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(interval_secs));
+        let peer_endpoint = peer
+            .lock()
+            .ok()
+            .and_then(|guard| guard.map(|addr| addr.to_string()));
+        let status = RuntimeStatus {
+            component: context.component.clone(),
+            tenant_id: Some(context.tenant_id.clone()),
+            tunnel_id: Some(context.tunnel_id.clone()),
+            transport: context.transport.clone(),
+            tunnel_interface: Some(context.tunnel_interface.clone()),
+            peer_endpoint,
+            ingress_bytes: counters.ingress_bytes.load(Ordering::Relaxed),
+            egress_bytes: counters.egress_bytes.load(Ordering::Relaxed),
+            observed_at_unix_secs: now_unix_secs(),
+            detail: context.detail.clone(),
+        };
+
+        match serde_json::to_string_pretty(&status) {
+            Ok(rendered) => println!("{rendered}"),
+            Err(error) => eprintln!("agent status render failed: {error}"),
+        }
+    });
+}
+
+fn save_agent_state(
+    state_file: &PathBuf,
+    tunnel_interface: &str,
+    destination_cidrs: &[String],
+) -> Result<()> {
+    let state = AgentRuntimeState {
+        tunnel_interface: tunnel_interface.to_owned(),
+        destination_cidrs: destination_cidrs.to_vec(),
+    };
+    fs::write(state_file, serde_json::to_string_pretty(&state)?)?;
+    Ok(())
+}
+
+fn load_agent_state(state_file: &PathBuf) -> Result<AgentRuntimeState> {
+    let state = fs::read_to_string(state_file)
+        .with_context(|| format!("failed to read agent state file: {}", state_file.display()))?;
+    Ok(serde_json::from_str(&state)?)
+}
+
+fn remove_state_file(state_file: &PathBuf) -> Result<()> {
+    if state_file.exists() {
+        fs::remove_file(state_file)
+            .with_context(|| format!("failed to remove state file: {}", state_file.display()))?;
+    }
+    Ok(())
 }
 
 fn forward_tun_packets_json(
@@ -506,6 +679,49 @@ fn build_agent_route_commands(interface_name: &str, config: &TunnelConfig) -> Ve
                 vec![
                     String::from("echo"),
                     format!("manual route required for {cidr} via {interface_name}"),
+                ]
+            }
+        })
+        .collect()
+}
+
+fn build_agent_route_cleanup_commands(
+    interface_name: &str,
+    destination_cidrs: &[String],
+) -> Vec<Vec<String>> {
+    destination_cidrs
+        .iter()
+        .map(|cidr| {
+            #[cfg(target_os = "linux")]
+            {
+                vec![
+                    String::from("ip"),
+                    String::from("route"),
+                    String::from("del"),
+                    cidr.clone(),
+                    String::from("dev"),
+                    String::from(interface_name),
+                ]
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                vec![
+                    String::from("route"),
+                    String::from("-n"),
+                    String::from("delete"),
+                    String::from("-net"),
+                    cidr.clone(),
+                    String::from("-interface"),
+                    String::from(interface_name),
+                ]
+            }
+
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                vec![
+                    String::from("echo"),
+                    format!("manual route cleanup required for {cidr} via {interface_name}"),
                 ]
             }
         })

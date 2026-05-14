@@ -62,6 +62,20 @@ pub struct WireGuardConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeStatus {
+    pub component: ComponentKind,
+    pub tenant_id: Option<String>,
+    pub tunnel_id: Option<String>,
+    pub transport: TransportKind,
+    pub tunnel_interface: Option<String>,
+    pub peer_endpoint: Option<String>,
+    pub ingress_bytes: u64,
+    pub egress_bytes: u64,
+    pub observed_at_unix_secs: u64,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SocketEndpoint {
     pub host: String,
     pub port: u16,
@@ -71,6 +85,12 @@ pub struct SocketEndpoint {
 pub enum WireGuardRole {
     Agent,
     Gateway,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransportKind {
+    JsonTcp,
+    WireGuardUdp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
