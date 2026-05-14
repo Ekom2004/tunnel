@@ -3,6 +3,7 @@
 use std::io::{BufRead, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,6 +16,7 @@ pub struct TunnelConfig {
     pub route_policy: RoutePolicy,
     pub heartbeat_interval_secs: u64,
     pub max_chunk_bytes: usize,
+    pub wireguard: Option<WireGuardConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +45,32 @@ pub struct UsageRecord {
     pub ingress_bytes: u64,
     pub egress_bytes: u64,
     pub observed_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireGuardConfig {
+    pub local_bind_host: String,
+    pub local_bind_port: u16,
+    pub peer_endpoint: Option<SocketEndpoint>,
+    pub local_tunnel_address: String,
+    pub peer_tunnel_address: String,
+    pub private_key_base64: String,
+    pub peer_public_key_base64: String,
+    pub preshared_key_base64: Option<String>,
+    pub persistent_keepalive_secs: Option<u16>,
+    pub role: WireGuardRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SocketEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WireGuardRole {
+    Agent,
+    Gateway,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,6 +136,20 @@ pub enum ConfigError {
     EmptyTunnelId,
     #[error("tenant id must not be empty")]
     EmptyTenantId,
+    #[error("wireguard local bind host must not be empty")]
+    EmptyWireGuardBindHost,
+    #[error("wireguard local tunnel address must not be empty")]
+    EmptyWireGuardTunnelAddress,
+    #[error("wireguard peer tunnel address must not be empty")]
+    EmptyWireGuardPeerTunnelAddress,
+    #[error("wireguard peer endpoint host must not be empty when configured")]
+    EmptyWireGuardPeerEndpointHost,
+    #[error("wireguard private key is invalid")]
+    InvalidWireGuardPrivateKey,
+    #[error("wireguard peer public key is invalid")]
+    InvalidWireGuardPeerPublicKey,
+    #[error("wireguard preshared key is invalid")]
+    InvalidWireGuardPresharedKey,
 }
 
 #[derive(Debug, Error)]
@@ -144,8 +186,60 @@ impl TunnelConfig {
             return Err(ConfigError::InvalidChunkSize);
         }
 
+        if let Some(wireguard) = &self.wireguard {
+            wireguard.validate()?;
+        }
+
         Ok(())
     }
+}
+
+impl WireGuardConfig {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.local_bind_host.trim().is_empty() {
+            return Err(ConfigError::EmptyWireGuardBindHost);
+        }
+
+        if self.local_tunnel_address.trim().is_empty() {
+            return Err(ConfigError::EmptyWireGuardTunnelAddress);
+        }
+
+        if self.peer_tunnel_address.trim().is_empty() {
+            return Err(ConfigError::EmptyWireGuardPeerTunnelAddress);
+        }
+
+        if let Some(endpoint) = &self.peer_endpoint {
+            if endpoint.host.trim().is_empty() {
+                return Err(ConfigError::EmptyWireGuardPeerEndpointHost);
+            }
+        }
+
+        decode_key_32_raw(&self.private_key_base64)
+            .map_err(|_| ConfigError::InvalidWireGuardPrivateKey)?;
+        decode_key_32_raw(&self.peer_public_key_base64)
+            .map_err(|_| ConfigError::InvalidWireGuardPeerPublicKey)?;
+
+        if let Some(key) = &self.preshared_key_base64 {
+            decode_key_32_raw(key).map_err(|_| ConfigError::InvalidWireGuardPresharedKey)?;
+        }
+
+        Ok(())
+    }
+}
+
+pub fn decode_key_32(value: &str) -> Result<[u8; 32], ConfigError> {
+    decode_key_32_raw(value).map_err(|_| ConfigError::InvalidWireGuardPrivateKey)
+}
+
+pub fn encode_key_32(value: &[u8; 32]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(value)
+}
+
+fn decode_key_32_raw(
+    value: &str,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(value)?;
+    Ok(bytes.as_slice().try_into()?)
 }
 
 pub fn now_unix_secs() -> u64 {
@@ -201,6 +295,7 @@ mod tests {
             },
             heartbeat_interval_secs: 5,
             max_chunk_bytes: 4096,
+            wireguard: None,
         };
 
         assert_eq!(config.validate(), Ok(()));
@@ -222,6 +317,7 @@ mod tests {
             },
             heartbeat_interval_secs: 5,
             max_chunk_bytes: 0,
+            wireguard: None,
         };
 
         assert_eq!(config.validate(), Err(ConfigError::InvalidChunkSize));

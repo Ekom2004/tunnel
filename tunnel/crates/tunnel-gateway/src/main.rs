@@ -2,25 +2,32 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Args, Parser};
+use boringtun::noise::{Tunn, TunnResult};
+use boringtun::x25519::{PublicKey, StaticSecret};
+use clap::{Args, Parser, ValueEnum};
 use tun::AbstractDevice;
 use tunnel_shared::{
-    now_unix_secs, read_json_line, write_json_line, AgentToGateway, ComponentKind, GatewayToAgent,
-    HealthState, HealthStatus, UsageRecord,
+    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentToGateway, ComponentKind,
+    GatewayToAgent, HealthState, HealthStatus, SocketEndpoint, TunnelConfig, UsageRecord,
+    WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
 #[command(name = "tunnel-gateway")]
-#[command(about = "Phase 1 Gum Tunnel gateway harness", long_about = None)]
+#[command(about = "Phase 1 Tunnel gateway", long_about = None)]
 struct Cli {
     #[arg(long, default_value = "127.0.0.1:7000")]
     bind: String,
+    #[arg(long)]
+    config: Option<PathBuf>,
     #[arg(long)]
     output_dir: Option<PathBuf>,
     #[command(flatten)]
@@ -41,10 +48,40 @@ struct TunArgs {
     tun_netmask: String,
     #[arg(long, default_value_t = 1500)]
     tun_mtu: u16,
+    #[arg(long)]
+    egress_interface: Option<String>,
+    #[arg(long, value_enum, default_value_t = SystemCommandMode::Skip)]
+    forwarding_mode: SystemCommandMode,
+    #[arg(long, value_enum, default_value_t = SystemCommandMode::Skip)]
+    nat_mode: SystemCommandMode,
+    #[arg(long, default_value = "/private/tmp")]
+    pf_rules_dir: PathBuf,
+    #[arg(long, default_value = "com.apple/tunnel")]
+    pf_anchor_prefix: String,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum SystemCommandMode {
+    Skip,
+    Print,
+    Apply,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(config_path) = &cli.config {
+        let config: TunnelConfig = serde_json::from_str(&fs::read_to_string(config_path)?)?;
+        config.validate()?;
+        if let Some(wireguard) = &config.wireguard {
+            return run_wireguard_gateway(&cli, &config, wireguard);
+        }
+    }
+
+    run_json_session_gateway(&cli)
+}
+
+fn run_json_session_gateway(cli: &Cli) -> Result<()> {
     let listener = TcpListener::bind(&cli.bind)?;
     let status = HealthStatus {
         component: ComponentKind::Gateway,
@@ -56,7 +93,7 @@ fn main() -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_client(stream, &cli) {
+                if let Err(error) = handle_client(stream, cli) {
                     eprintln!("gateway connection failed: {error:#}");
                 }
             }
@@ -65,6 +102,84 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_wireguard_gateway(
+    cli: &Cli,
+    config: &TunnelConfig,
+    wireguard: &WireGuardConfig,
+) -> Result<()> {
+    let bind_addr = format!(
+        "{}:{}",
+        wireguard.local_bind_host, wireguard.local_bind_port
+    );
+    let socket = UdpSocket::bind(&bind_addr)?;
+    let status = HealthStatus {
+        component: ComponentKind::Gateway,
+        state: HealthState::Healthy,
+        detail: format!("wireguard gateway listening on {bind_addr}"),
+    };
+    println!("{}", serde_json::to_string_pretty(&status)?);
+
+    let device = create_tun_device(
+        &cli.tun,
+        Some(&wireguard.local_tunnel_address),
+        Some(&wireguard.peer_tunnel_address),
+    )?;
+    let interface_name = device.tun_name()?;
+    println!("gateway wireguard tun ready: {interface_name}");
+    handle_gateway_networking(&cli.tun, &interface_name)?;
+
+    let tunnel = Arc::new(Mutex::new(build_wireguard_tunnel(wireguard, 2)?));
+    let peer = Arc::new(Mutex::new(resolve_optional_socket_endpoint(
+        wireguard.peer_endpoint.as_ref(),
+    )?));
+    let output_file = prepare_output_file(
+        cli.output_dir.as_deref(),
+        &config.tenant_id,
+        &config.tunnel_id,
+    )?;
+    let output_file = Arc::new(Mutex::new(output_file));
+    let (mut tun_reader, mut tun_writer) = device.split();
+
+    {
+        let socket = socket.try_clone()?;
+        let tunnel = Arc::clone(&tunnel);
+        let peer = Arc::clone(&peer);
+        let output = Arc::clone(&output_file);
+        thread::spawn(move || {
+            if let Err(error) = wireguard_udp_receiver_loop(
+                socket,
+                tunnel,
+                peer,
+                &mut tun_writer,
+                Some(output),
+                "gateway",
+            ) {
+                eprintln!("gateway wireguard udp receiver stopped: {error:#}");
+            }
+        });
+    }
+
+    {
+        let socket = socket.try_clone()?;
+        let tunnel = Arc::clone(&tunnel);
+        let peer = Arc::clone(&peer);
+        thread::spawn(move || {
+            if let Err(error) = wireguard_timer_loop(socket, tunnel, peer, "gateway") {
+                eprintln!("gateway wireguard timer stopped: {error:#}");
+            }
+        });
+    }
+
+    wireguard_tun_sender_loop(
+        &mut tun_reader,
+        socket,
+        tunnel,
+        peer,
+        config.max_chunk_bytes.max(cli.tun.tun_mtu as usize + 256),
+        "gateway",
+    )
 }
 
 fn handle_client(stream: TcpStream, cli: &Cli) -> Result<()> {
@@ -104,9 +219,10 @@ fn handle_client(stream: TcpStream, cli: &Cli) -> Result<()> {
     let mut tun_writer = None;
 
     if cli.tun.tun {
-        let device = create_tun_device(&cli.tun)?;
+        let device = create_tun_device(&cli.tun, None, None)?;
         let interface_name = device.tun_name()?;
         println!("gateway tun ready: {interface_name}");
+        handle_gateway_networking(&cli.tun, &interface_name)?;
         let (mut tun_reader, writer_half) = device.split();
         tun_writer = Some(writer_half);
 
@@ -114,7 +230,7 @@ fn handle_client(stream: TcpStream, cli: &Cli) -> Result<()> {
         let max_packet_bytes = cli.tun.tun_mtu as usize + 256;
         thread::spawn(move || {
             if let Err(error) =
-                forward_tun_packets(&mut tun_reader, writer_for_packets, max_packet_bytes)
+                forward_tun_packets_json(&mut tun_reader, writer_for_packets, max_packet_bytes)
             {
                 eprintln!("gateway tun reader stopped: {error:#}");
             }
@@ -193,7 +309,180 @@ fn handle_client(stream: TcpStream, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn forward_tun_packets(
+fn wireguard_tun_sender_loop(
+    tun_reader: &mut impl Read,
+    socket: UdpSocket,
+    tunnel: Arc<Mutex<Tunn>>,
+    peer: Arc<Mutex<Option<SocketAddr>>>,
+    max_packet_bytes: usize,
+    label: &str,
+) -> Result<()> {
+    let mut buf = vec![0_u8; max_packet_bytes];
+
+    loop {
+        let amount = tun_reader.read(&mut buf)?;
+        if amount == 0 {
+            continue;
+        }
+
+        let mut network_buf = vec![0_u8; amount + 512];
+        let result = {
+            let mut guard = tunnel
+                .lock()
+                .map_err(|_| anyhow!("{label} wireguard lock poisoned"))?;
+            guard.encapsulate(&buf[..amount], &mut network_buf)
+        };
+
+        send_wireguard_network_result(result, &socket, &peer, label)?;
+    }
+}
+
+fn wireguard_udp_receiver_loop(
+    socket: UdpSocket,
+    tunnel: Arc<Mutex<Tunn>>,
+    peer: Arc<Mutex<Option<SocketAddr>>>,
+    tun_writer: &mut impl Write,
+    output_file: Option<Arc<Mutex<Option<File>>>>,
+    label: &str,
+) -> Result<()> {
+    let mut datagram = vec![0_u8; 65535];
+    let mut plaintext = vec![0_u8; 65535];
+
+    loop {
+        let (amount, src_addr) = socket.recv_from(&mut datagram)?;
+        {
+            let mut peer_guard = peer
+                .lock()
+                .map_err(|_| anyhow!("{label} peer lock poisoned"))?;
+            *peer_guard = Some(src_addr);
+        }
+
+        let mut input = Some((src_addr.ip(), amount));
+
+        loop {
+            let result = {
+                let mut guard = tunnel
+                    .lock()
+                    .map_err(|_| anyhow!("{label} wireguard lock poisoned"))?;
+                if let Some((src_ip, len)) = input.take() {
+                    guard.decapsulate(Some(src_ip), &datagram[..len], &mut plaintext)
+                } else {
+                    guard.decapsulate(None, &[], &mut plaintext)
+                }
+            };
+
+            match result {
+                TunnResult::WriteToNetwork(packet) => {
+                    send_udp_packet(&socket, &peer, packet, label)?;
+                    continue;
+                }
+                TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    if let Some(output_file) = &output_file {
+                        let mut guard = output_file
+                            .lock()
+                            .map_err(|_| anyhow!("{label} output file lock poisoned"))?;
+                        if let Some(file) = guard.as_mut() {
+                            file.write_all(packet)?;
+                            file.flush()?;
+                        }
+                    }
+                    tun_writer.write_all(packet)?;
+                    tun_writer.flush()?;
+                    break;
+                }
+                TunnResult::Done => break,
+                TunnResult::Err(error) => {
+                    eprintln!("{label} wireguard decapsulate error: {error:?}");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn wireguard_timer_loop(
+    socket: UdpSocket,
+    tunnel: Arc<Mutex<Tunn>>,
+    peer: Arc<Mutex<Option<SocketAddr>>>,
+    label: &str,
+) -> Result<()> {
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        let mut buf = vec![0_u8; 65535];
+        let result = {
+            let mut guard = tunnel
+                .lock()
+                .map_err(|_| anyhow!("{label} wireguard lock poisoned"))?;
+            guard.update_timers(&mut buf)
+        };
+
+        if let TunnResult::WriteToNetwork(packet) = result {
+            send_udp_packet(&socket, &peer, packet, label)?;
+        }
+    }
+}
+
+fn send_wireguard_network_result(
+    result: TunnResult<'_>,
+    socket: &UdpSocket,
+    peer: &Arc<Mutex<Option<SocketAddr>>>,
+    label: &str,
+) -> Result<()> {
+    match result {
+        TunnResult::WriteToNetwork(packet) => send_udp_packet(socket, peer, packet, label),
+        TunnResult::Done => Ok(()),
+        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => Ok(()),
+        TunnResult::Err(error) => Err(anyhow!("{label} wireguard encapsulate error: {error:?}")),
+    }
+}
+
+fn send_udp_packet(
+    socket: &UdpSocket,
+    peer: &Arc<Mutex<Option<SocketAddr>>>,
+    packet: &[u8],
+    label: &str,
+) -> Result<()> {
+    let target = *peer
+        .lock()
+        .map_err(|_| anyhow!("{label} peer lock poisoned"))?;
+    let target = target.ok_or_else(|| anyhow!("{label} peer endpoint is unknown"))?;
+    socket.send_to(packet, target)?;
+    Ok(())
+}
+
+fn build_wireguard_tunnel(wireguard: &WireGuardConfig, index: u32) -> Result<Tunn> {
+    let private_key = StaticSecret::from(decode_key_32(&wireguard.private_key_base64)?);
+    let peer_public_key = PublicKey::from(decode_key_32(&wireguard.peer_public_key_base64)?);
+    let preshared_key = wireguard
+        .preshared_key_base64
+        .as_ref()
+        .map(|key| decode_key_32(key))
+        .transpose()?;
+
+    Ok(Tunn::new(
+        private_key,
+        peer_public_key,
+        preshared_key,
+        wireguard.persistent_keepalive_secs,
+        index,
+        None,
+    ))
+}
+
+fn resolve_optional_socket_endpoint(
+    endpoint: Option<&SocketEndpoint>,
+) -> Result<Option<SocketAddr>> {
+    endpoint.map(resolve_socket_endpoint).transpose()
+}
+
+fn resolve_socket_endpoint(endpoint: &SocketEndpoint) -> Result<SocketAddr> {
+    format!("{}:{}", endpoint.host, endpoint.port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("could not resolve {}:{}", endpoint.host, endpoint.port))
+}
+
+fn forward_tun_packets_json(
     tun_reader: &mut impl Read,
     writer: Arc<Mutex<TcpStream>>,
     max_packet_bytes: usize,
@@ -226,11 +515,15 @@ fn send_gateway_message(writer: &Arc<Mutex<TcpStream>>, message: &GatewayToAgent
     Ok(())
 }
 
-fn create_tun_device(tun_args: &TunArgs) -> Result<tun::Device> {
+fn create_tun_device(
+    tun_args: &TunArgs,
+    local_address: Option<&str>,
+    peer_address: Option<&str>,
+) -> Result<tun::Device> {
     let mut config = tun::Configuration::default();
     config
-        .address(parse_ip(&tun_args.tun_address)?)
-        .destination(parse_ip(&tun_args.tun_destination)?)
+        .address(parse_ip(local_address.unwrap_or(&tun_args.tun_address))?)
+        .destination(parse_ip(peer_address.unwrap_or(&tun_args.tun_destination))?)
         .netmask(parse_ip(&tun_args.tun_netmask)?)
         .mtu(tun_args.tun_mtu)
         .up();
@@ -244,6 +537,11 @@ fn create_tun_device(tun_args: &TunArgs) -> Result<tun::Device> {
         platform.ensure_root_privileges(true);
     });
 
+    #[cfg(target_os = "macos")]
+    config.platform_config(|platform| {
+        platform.enable_routing(false);
+    });
+
     let device = tun::create(&config)?;
     Ok(device)
 }
@@ -252,6 +550,279 @@ fn parse_ip(value: &str) -> Result<IpAddr> {
     value
         .parse()
         .with_context(|| format!("invalid IP address: {value}"))
+}
+
+fn handle_gateway_networking(tun_args: &TunArgs, interface_name: &str) -> Result<()> {
+    handle_forwarding(tun_args.forwarding_mode, interface_name)?;
+    handle_nat(tun_args.nat_mode, interface_name, tun_args)
+}
+
+fn handle_forwarding(mode: SystemCommandMode, interface_name: &str) -> Result<()> {
+    if mode == SystemCommandMode::Skip {
+        return Ok(());
+    }
+
+    let commands = build_forwarding_commands(interface_name);
+    execute_commands(mode, "gateway forwarding", &commands)
+}
+
+fn handle_nat(mode: SystemCommandMode, interface_name: &str, tun_args: &TunArgs) -> Result<()> {
+    if mode == SystemCommandMode::Skip {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return handle_macos_nat(mode, interface_name, tun_args);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let commands = build_nat_commands(interface_name, tun_args.egress_interface.as_deref())?;
+        return execute_commands(mode, "gateway nat", &commands);
+    }
+
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+fn build_forwarding_commands(interface_name: &str) -> Vec<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            vec![
+                String::from("sysctl"),
+                String::from("-w"),
+                String::from("net.ipv4.ip_forward=1"),
+            ],
+            vec![
+                String::from("iptables"),
+                String::from("-A"),
+                String::from("FORWARD"),
+                String::from("-i"),
+                String::from(interface_name),
+                String::from("-j"),
+                String::from("ACCEPT"),
+            ],
+            vec![
+                String::from("iptables"),
+                String::from("-A"),
+                String::from("FORWARD"),
+                String::from("-o"),
+                String::from(interface_name),
+                String::from("-m"),
+                String::from("state"),
+                String::from("--state"),
+                String::from("RELATED,ESTABLISHED"),
+                String::from("-j"),
+                String::from("ACCEPT"),
+            ],
+        ]
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = interface_name;
+        vec![vec![
+            String::from("sysctl"),
+            String::from("-w"),
+            String::from("net.inet.ip.forwarding=1"),
+        ]]
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        vec![vec![
+            String::from("echo"),
+            format!("manual forwarding enable required for {interface_name}"),
+        ]]
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn build_nat_commands(
+    interface_name: &str,
+    egress_interface: Option<&str>,
+) -> Result<Vec<Vec<String>>> {
+    #[cfg(target_os = "linux")]
+    {
+        let egress_interface = egress_interface
+            .ok_or_else(|| anyhow!("--egress-interface is required when nat-mode is not skip"))?;
+        Ok(vec![
+            vec![
+                String::from("iptables"),
+                String::from("-t"),
+                String::from("nat"),
+                String::from("-A"),
+                String::from("POSTROUTING"),
+                String::from("-o"),
+                String::from(egress_interface),
+                String::from("-j"),
+                String::from("MASQUERADE"),
+            ],
+            vec![
+                String::from("iptables"),
+                String::from("-A"),
+                String::from("FORWARD"),
+                String::from("-i"),
+                String::from(interface_name),
+                String::from("-o"),
+                String::from(egress_interface),
+                String::from("-j"),
+                String::from("ACCEPT"),
+            ],
+        ])
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = interface_name;
+        let _ = egress_interface;
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handle_macos_nat(
+    mode: SystemCommandMode,
+    interface_name: &str,
+    tun_args: &TunArgs,
+) -> Result<()> {
+    let egress_interface = tun_args
+        .egress_interface
+        .as_deref()
+        .ok_or_else(|| anyhow!("--egress-interface is required when nat-mode is not skip"))?;
+    let subnet = ipv4_subnet(&tun_args.tun_address, &tun_args.tun_netmask)?;
+    let anchor_name = format!("{}/{}", tun_args.pf_anchor_prefix, interface_name);
+    let rules_path = tun_args
+        .pf_rules_dir
+        .join(format!("tunnel-{interface_name}.pf.conf"));
+    let rules = build_macos_pf_rules(interface_name, egress_interface, &subnet);
+
+    match mode {
+        SystemCommandMode::Skip => Ok(()),
+        SystemCommandMode::Print => {
+            println!("gateway nat anchor: {anchor_name}");
+            println!("gateway nat rules path: {}", rules_path.display());
+            println!("gateway nat rules:\n{rules}");
+            println!("gateway nat command: pfctl -E");
+            println!(
+                "gateway nat command: pfctl -a {} -f {}",
+                anchor_name,
+                rules_path.display()
+            );
+            Ok(())
+        }
+        SystemCommandMode::Apply => {
+            fs::create_dir_all(&tun_args.pf_rules_dir)?;
+            fs::write(&rules_path, &rules)?;
+            run_command("gateway nat", &["pfctl", "-E"])?;
+            let rules_path_string = rules_path.to_string_lossy().into_owned();
+            run_command(
+                "gateway nat",
+                &[
+                    "pfctl",
+                    "-a",
+                    anchor_name.as_str(),
+                    "-f",
+                    &rules_path_string,
+                ],
+            )?;
+            println!("gateway nat anchor: {anchor_name}");
+            println!("gateway nat rules path: {}", rules_path.display());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_pf_rules(interface_name: &str, egress_interface: &str, subnet: &str) -> String {
+    format!(
+        "nat on {egress_interface} from {subnet} to any -> ({egress_interface})\n\
+pass out quick on {egress_interface} inet from {subnet} to any keep state\n\
+pass in quick on {interface_name} inet from {subnet} to any keep state\n\
+pass out quick on {interface_name} inet from any to {subnet} keep state\n"
+    )
+}
+
+fn run_command(label: &str, command: &[&str]) -> Result<()> {
+    let rendered = command.join(" ");
+    let mut process = Command::new(command[0]);
+    if command.len() > 1 {
+        process.args(&command[1..]);
+    }
+    let output = process
+        .output()
+        .with_context(|| format!("failed to execute {label} command: {rendered}"))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{label} command failed: {rendered}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+    Ok(())
+}
+
+fn ipv4_subnet(address: &str, netmask: &str) -> Result<String> {
+    let address: Ipv4Addr = address
+        .parse()
+        .with_context(|| format!("invalid IPv4 address: {address}"))?;
+    let netmask: Ipv4Addr = netmask
+        .parse()
+        .with_context(|| format!("invalid IPv4 netmask: {netmask}"))?;
+
+    let address_u32 = u32::from(address);
+    let mask_u32 = u32::from(netmask);
+    let network = Ipv4Addr::from(address_u32 & mask_u32);
+    let prefix = mask_u32.count_ones();
+
+    Ok(format!("{network}/{prefix}"))
+}
+
+fn execute_commands(mode: SystemCommandMode, label: &str, commands: &[Vec<String>]) -> Result<()> {
+    for command in commands {
+        let rendered = shell_join(command);
+        match mode {
+            SystemCommandMode::Skip => {}
+            SystemCommandMode::Print => {
+                println!("{label} command: {rendered}");
+            }
+            SystemCommandMode::Apply => {
+                println!("{label} apply: {rendered}");
+                let mut process = Command::new(&command[0]);
+                if command.len() > 1 {
+                    process.args(&command[1..]);
+                }
+                let output = process
+                    .output()
+                    .with_context(|| format!("failed to execute {label} command: {rendered}"))?;
+                if !output.status.success() {
+                    return Err(anyhow!(
+                        "{label} command failed: {rendered}\nstdout: {}\nstderr: {}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn shell_join(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| {
+            if part.contains(' ') {
+                format!("{part:?}")
+            } else {
+                part.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn prepare_output_file(
