@@ -14,12 +14,11 @@ use anyhow::{anyhow, Context, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, ValueEnum};
-use serde::{Deserialize, Serialize};
 use tun::AbstractDevice;
 use tunnel_shared::{
     decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentToGateway, ComponentKind,
-    GatewayToAgent, HealthState, HealthStatus, RuntimeStatus, SocketEndpoint, TransportKind,
-    TunnelConfig, UsageRecord, WireGuardConfig,
+    GatewayRuntimeState, GatewayToAgent, HealthState, HealthStatus, RuntimeStatus, SocketEndpoint,
+    TransportKind, TunnelConfig, UsageRecord, WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -34,6 +33,8 @@ struct Cli {
     output_dir: Option<PathBuf>,
     #[arg(long, default_value = "/private/tmp/tunnel-gateway-state.json")]
     state_file: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-gateway-status.json")]
+    status_file: PathBuf,
     #[arg(long)]
     cleanup_only: bool,
     #[arg(long, default_value_t = 5)]
@@ -73,15 +74,6 @@ enum SystemCommandMode {
     Skip,
     Print,
     Apply,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GatewayRuntimeState {
-    tunnel_interface: String,
-    nat_anchor_name: Option<String>,
-    nat_rules_path: Option<PathBuf>,
-    forwarding_was_enabled: Option<bool>,
-    egress_interface: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -132,11 +124,12 @@ fn run_cleanup_only(cli: &Cli) -> Result<()> {
         || cli.tun.nat_mode == SystemCommandMode::Apply
     {
         remove_gateway_state(&cli.state_file)?;
+        remove_gateway_state(&cli.status_file)?;
     }
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&RuntimeStatus {
+    emit_status(
+        &cli.status_file,
+        &RuntimeStatus {
             component: ComponentKind::Gateway,
             tenant_id: None,
             tunnel_id: None,
@@ -147,8 +140,8 @@ fn run_cleanup_only(cli: &Cli) -> Result<()> {
             egress_bytes: 0,
             observed_at_unix_secs: now_unix_secs(),
             detail: String::from("gateway cleanup complete"),
-        })?
-    );
+        },
+    )?;
 
     Ok(())
 }
@@ -224,6 +217,7 @@ fn run_wireguard_gateway(
 
     spawn_status_thread(
         cli.status_interval_secs,
+        cli.status_file.clone(),
         RuntimeStatusContext {
             component: ComponentKind::Gateway,
             tenant_id: Some(config.tenant_id.clone()),
@@ -606,6 +600,7 @@ struct RuntimeStatusContext {
 
 fn spawn_status_thread(
     interval_secs: u64,
+    status_file: PathBuf,
     context: RuntimeStatusContext,
     peer: Arc<Mutex<Option<SocketAddr>>>,
     counters: Arc<ByteCounters>,
@@ -633,9 +628,8 @@ fn spawn_status_thread(
             detail: context.detail.clone(),
         };
 
-        match serde_json::to_string_pretty(&status) {
-            Ok(rendered) => println!("{rendered}"),
-            Err(error) => eprintln!("gateway status render failed: {error}"),
+        if let Err(error) = emit_status(&status_file, &status) {
+            eprintln!("gateway status render failed: {error}");
         }
     });
 }
@@ -676,6 +670,13 @@ fn remove_gateway_state(state_file: &PathBuf) -> Result<()> {
             )
         })?;
     }
+    Ok(())
+}
+
+fn emit_status(status_file: &PathBuf, status: &RuntimeStatus) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(status)?;
+    fs::write(status_file, &rendered)?;
+    println!("{rendered}");
     Ok(())
 }
 

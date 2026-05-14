@@ -14,11 +14,11 @@ use anyhow::{anyhow, Context, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, ValueEnum};
-use serde::{Deserialize, Serialize};
 use tun::AbstractDevice;
 use tunnel_shared::{
-    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentToGateway, ComponentKind,
-    GatewayToAgent, RuntimeStatus, SocketEndpoint, TransportKind, TunnelConfig, WireGuardConfig,
+    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentRuntimeState,
+    AgentToGateway, ComponentKind, GatewayToAgent, RuntimeStatus, SocketEndpoint, TransportKind,
+    TunnelConfig, WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -33,6 +33,8 @@ struct Cli {
     payload: Option<String>,
     #[arg(long, default_value = "/private/tmp/tunnel-agent-state.json")]
     state_file: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-agent-status.json")]
+    status_file: PathBuf,
     #[arg(long)]
     cleanup_only: bool,
     #[arg(long, default_value_t = 5)]
@@ -82,12 +84,6 @@ fn main() -> Result<()> {
     run_json_session_mode(&config, &cli)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AgentRuntimeState {
-    tunnel_interface: String,
-    destination_cidrs: Vec<String>,
-}
-
 #[derive(Debug, Default)]
 struct ByteCounters {
     ingress_bytes: AtomicU64,
@@ -107,11 +103,12 @@ fn run_cleanup_only(cli: &Cli, config: &TunnelConfig) -> Result<()> {
 
     if cli.tun.route_mode == SystemCommandMode::Apply {
         remove_state_file(&cli.state_file)?;
+        remove_state_file(&cli.status_file)?;
     }
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&RuntimeStatus {
+    emit_status(
+        &cli.status_file,
+        &RuntimeStatus {
             component: ComponentKind::Agent,
             tenant_id: Some(config.tenant_id.clone()),
             tunnel_id: Some(config.tunnel_id.clone()),
@@ -126,8 +123,8 @@ fn run_cleanup_only(cli: &Cli, config: &TunnelConfig) -> Result<()> {
             egress_bytes: 0,
             observed_at_unix_secs: now_unix_secs(),
             detail: String::from("agent cleanup complete"),
-        })?
-    );
+        },
+    )?;
 
     Ok(())
 }
@@ -277,6 +274,7 @@ fn run_wireguard_mode(config: &TunnelConfig, cli: &Cli, wireguard: &WireGuardCon
 
     spawn_status_thread(
         cli.status_interval_secs,
+        cli.status_file.clone(),
         RuntimeStatusContext {
             component: ComponentKind::Agent,
             tenant_id: config.tenant_id.clone(),
@@ -507,6 +505,7 @@ struct RuntimeStatusContext {
 
 fn spawn_status_thread(
     interval_secs: u64,
+    status_file: PathBuf,
     context: RuntimeStatusContext,
     peer: Arc<Mutex<Option<SocketAddr>>>,
     counters: Arc<ByteCounters>,
@@ -534,9 +533,8 @@ fn spawn_status_thread(
             detail: context.detail.clone(),
         };
 
-        match serde_json::to_string_pretty(&status) {
-            Ok(rendered) => println!("{rendered}"),
-            Err(error) => eprintln!("agent status render failed: {error}"),
+        if let Err(error) = emit_status(&status_file, &status) {
+            eprintln!("agent status render failed: {error}");
         }
     });
 }
@@ -565,6 +563,13 @@ fn remove_state_file(state_file: &PathBuf) -> Result<()> {
         fs::remove_file(state_file)
             .with_context(|| format!("failed to remove state file: {}", state_file.display()))?;
     }
+    Ok(())
+}
+
+fn emit_status(status_file: &PathBuf, status: &RuntimeStatus) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(status)?;
+    fs::write(status_file, &rendered)?;
+    println!("{rendered}");
     Ok(())
 }
 

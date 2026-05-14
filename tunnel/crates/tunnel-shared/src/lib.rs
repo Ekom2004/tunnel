@@ -76,6 +76,21 @@ pub struct RuntimeStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRuntimeState {
+    pub tunnel_interface: String,
+    pub destination_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayRuntimeState {
+    pub tunnel_interface: String,
+    pub nat_anchor_name: Option<String>,
+    pub nat_rules_path: Option<std::path::PathBuf>,
+    pub forwarding_was_enabled: Option<bool>,
+    pub egress_interface: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SocketEndpoint {
     pub host: String,
     pub port: u16,
