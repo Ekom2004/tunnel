@@ -80,6 +80,14 @@ enum SystemCommandMode {
 struct ByteCounters {
     ingress_bytes: AtomicU64,
     egress_bytes: AtomicU64,
+    last_ingress_at_unix_secs: AtomicU64,
+    last_egress_at_unix_secs: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PeerStatus {
+    endpoint: Option<SocketAddr>,
+    last_activity_unix_secs: u64,
 }
 
 fn main() -> Result<()> {
@@ -131,6 +139,7 @@ fn run_cleanup_only(cli: &Cli) -> Result<()> {
         &cli.status_file,
         &RuntimeStatus {
             component: ComponentKind::Gateway,
+            state: HealthState::Healthy,
             tenant_id: None,
             tunnel_id: None,
             transport: TransportKind::WireGuardUdp,
@@ -203,9 +212,10 @@ fn run_wireguard_gateway(
     )?;
 
     let tunnel = Arc::new(Mutex::new(build_wireguard_tunnel(wireguard, 2)?));
-    let peer = Arc::new(Mutex::new(resolve_optional_socket_endpoint(
-        wireguard.peer_endpoint.as_ref(),
-    )?));
+    let peer = Arc::new(Mutex::new(PeerStatus {
+        endpoint: resolve_optional_socket_endpoint(wireguard.peer_endpoint.as_ref())?,
+        last_activity_unix_secs: now_unix_secs(),
+    }));
     let counters = Arc::new(ByteCounters::default());
     let output_file = prepare_output_file(
         cli.output_dir.as_deref(),
@@ -411,7 +421,7 @@ fn wireguard_tun_sender_loop(
     tun_reader: &mut impl Read,
     socket: UdpSocket,
     tunnel: Arc<Mutex<Tunn>>,
-    peer: Arc<Mutex<Option<SocketAddr>>>,
+    peer: Arc<Mutex<PeerStatus>>,
     counters: Arc<ByteCounters>,
     max_packet_bytes: usize,
     label: &str,
@@ -426,6 +436,9 @@ fn wireguard_tun_sender_loop(
         counters
             .egress_bytes
             .fetch_add(amount as u64, Ordering::Relaxed);
+        counters
+            .last_egress_at_unix_secs
+            .store(now_unix_secs(), Ordering::Relaxed);
 
         let mut network_buf = vec![0_u8; amount + 512];
         let result = {
@@ -442,7 +455,7 @@ fn wireguard_tun_sender_loop(
 fn wireguard_udp_receiver_loop(
     socket: UdpSocket,
     tunnel: Arc<Mutex<Tunn>>,
-    peer: Arc<Mutex<Option<SocketAddr>>>,
+    peer: Arc<Mutex<PeerStatus>>,
     tun_writer: &mut impl Write,
     output_file: Option<Arc<Mutex<Option<File>>>>,
     counters: Arc<ByteCounters>,
@@ -457,7 +470,8 @@ fn wireguard_udp_receiver_loop(
             let mut peer_guard = peer
                 .lock()
                 .map_err(|_| anyhow!("{label} peer lock poisoned"))?;
-            *peer_guard = Some(src_addr);
+            peer_guard.endpoint = Some(src_addr);
+            peer_guard.last_activity_unix_secs = now_unix_secs();
         }
 
         let mut input = Some((src_addr.ip(), amount));
@@ -476,13 +490,16 @@ fn wireguard_udp_receiver_loop(
 
             match result {
                 TunnResult::WriteToNetwork(packet) => {
-                    send_udp_packet(&socket, &peer, packet, label)?;
+                    let _ = send_udp_packet(&socket, &peer, packet, label)?;
                     continue;
                 }
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
                     counters
                         .ingress_bytes
                         .fetch_add(packet.len() as u64, Ordering::Relaxed);
+                    counters
+                        .last_ingress_at_unix_secs
+                        .store(now_unix_secs(), Ordering::Relaxed);
                     if let Some(output_file) = &output_file {
                         let mut guard = output_file
                             .lock()
@@ -509,7 +526,7 @@ fn wireguard_udp_receiver_loop(
 fn wireguard_timer_loop(
     socket: UdpSocket,
     tunnel: Arc<Mutex<Tunn>>,
-    peer: Arc<Mutex<Option<SocketAddr>>>,
+    peer: Arc<Mutex<PeerStatus>>,
     label: &str,
 ) -> Result<()> {
     loop {
@@ -523,7 +540,7 @@ fn wireguard_timer_loop(
         };
 
         if let TunnResult::WriteToNetwork(packet) = result {
-            send_udp_packet(&socket, &peer, packet, label)?;
+            let _ = send_udp_packet(&socket, &peer, packet, label)?;
         }
     }
 }
@@ -531,11 +548,14 @@ fn wireguard_timer_loop(
 fn send_wireguard_network_result(
     result: TunnResult<'_>,
     socket: &UdpSocket,
-    peer: &Arc<Mutex<Option<SocketAddr>>>,
+    peer: &Arc<Mutex<PeerStatus>>,
     label: &str,
 ) -> Result<()> {
     match result {
-        TunnResult::WriteToNetwork(packet) => send_udp_packet(socket, peer, packet, label),
+        TunnResult::WriteToNetwork(packet) => {
+            let _ = send_udp_packet(socket, peer, packet, label)?;
+            Ok(())
+        }
         TunnResult::Done => Ok(()),
         TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => Ok(()),
         TunnResult::Err(error) => Err(anyhow!("{label} wireguard encapsulate error: {error:?}")),
@@ -544,16 +564,19 @@ fn send_wireguard_network_result(
 
 fn send_udp_packet(
     socket: &UdpSocket,
-    peer: &Arc<Mutex<Option<SocketAddr>>>,
+    peer: &Arc<Mutex<PeerStatus>>,
     packet: &[u8],
     label: &str,
-) -> Result<()> {
-    let target = *peer
+) -> Result<bool> {
+    let mut guard = peer
         .lock()
         .map_err(|_| anyhow!("{label} peer lock poisoned"))?;
-    let target = target.ok_or_else(|| anyhow!("{label} peer endpoint is unknown"))?;
+    let Some(target) = guard.endpoint else {
+        return Ok(false);
+    };
     socket.send_to(packet, target)?;
-    Ok(())
+    guard.last_activity_unix_secs = now_unix_secs();
+    Ok(true)
 }
 
 fn build_wireguard_tunnel(wireguard: &WireGuardConfig, index: u32) -> Result<Tunn> {
@@ -602,7 +625,7 @@ fn spawn_status_thread(
     interval_secs: u64,
     status_file: PathBuf,
     context: RuntimeStatusContext,
-    peer: Arc<Mutex<Option<SocketAddr>>>,
+    peer: Arc<Mutex<PeerStatus>>,
     counters: Arc<ByteCounters>,
 ) {
     if interval_secs == 0 {
@@ -611,12 +634,40 @@ fn spawn_status_thread(
 
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(interval_secs));
-        let peer_endpoint = peer
+        let now = now_unix_secs();
+        let (peer_endpoint, last_peer_activity) = peer
             .lock()
             .ok()
-            .and_then(|guard| guard.map(|addr| addr.to_string()));
+            .map(|guard| {
+                (
+                    guard.endpoint.map(|addr| addr.to_string()),
+                    guard.last_activity_unix_secs,
+                )
+            })
+            .unwrap_or((None, 0));
+        let last_ingress = counters.last_ingress_at_unix_secs.load(Ordering::Relaxed);
+        let last_egress = counters.last_egress_at_unix_secs.load(Ordering::Relaxed);
+        let last_activity = last_peer_activity.max(last_ingress).max(last_egress);
+        let is_stale = last_activity != 0 && now.saturating_sub(last_activity) > interval_secs * 3;
+        let (state, detail) = if peer_endpoint.is_none() {
+            (
+                HealthState::Degraded,
+                String::from("wireguard peer endpoint is not established"),
+            )
+        } else if is_stale {
+            (
+                HealthState::Degraded,
+                format!(
+                    "wireguard path is stale; last activity {}s ago",
+                    now.saturating_sub(last_activity)
+                ),
+            )
+        } else {
+            (HealthState::Healthy, context.detail.clone())
+        };
         let status = RuntimeStatus {
             component: context.component.clone(),
+            state,
             tenant_id: context.tenant_id.clone(),
             tunnel_id: context.tunnel_id.clone(),
             transport: context.transport.clone(),
@@ -625,7 +676,7 @@ fn spawn_status_thread(
             ingress_bytes: counters.ingress_bytes.load(Ordering::Relaxed),
             egress_bytes: counters.egress_bytes.load(Ordering::Relaxed),
             observed_at_unix_secs: now_unix_secs(),
-            detail: context.detail.clone(),
+            detail,
         };
 
         if let Err(error) = emit_status(&status_file, &status) {

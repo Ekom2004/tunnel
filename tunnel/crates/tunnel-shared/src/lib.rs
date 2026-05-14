@@ -64,6 +64,7 @@ pub struct WireGuardConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeStatus {
     pub component: ComponentKind,
+    pub state: HealthState,
     pub tenant_id: Option<String>,
     pub tunnel_id: Option<String>,
     pub transport: TransportKind,
