@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
-use tunnel_shared::{AgentRuntimeState, GatewayRuntimeState, RuntimeStatus};
+use tunnel_shared::{
+    AgentRuntimeState, GatewayRuntimeState, HealthState, RuntimeStatus, TunnelPhase,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "tunnel")]
@@ -193,7 +195,33 @@ struct SoakReport {
     max_jitter_ms: Option<f64>,
     bounced_agent_at: Option<u32>,
     bounced_gateway_at: Option<u32>,
+    agent_recovery_secs: Option<f64>,
+    gateway_recovery_secs: Option<f64>,
+    agent_phase_transitions: Vec<PhaseTransition>,
+    gateway_phase_transitions: Vec<PhaseTransition>,
+    agent_degraded_samples: u32,
+    gateway_degraded_samples: u32,
+    agent_stale_samples: u32,
+    gateway_stale_samples: u32,
     elapsed_secs: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct PhaseTransition {
+    sequence: u32,
+    from: Option<TunnelPhase>,
+    to: TunnelPhase,
+    observed_at_unix_secs: u64,
+}
+
+#[derive(Debug, Default)]
+struct StatusHistory {
+    transitions: Vec<PhaseTransition>,
+    last_phase: Option<TunnelPhase>,
+    degraded_samples: u32,
+    stale_samples: u32,
+    recovery_started_at: Option<Instant>,
+    recovered_after_secs: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -420,17 +448,21 @@ fn run_soak(args: SoakArgs) -> Result<()> {
     let mut received = 0_u32;
     let mut bounced_agent = None;
     let mut bounced_gateway = None;
+    let mut agent_history = StatusHistory::default();
+    let mut gateway_history = StatusHistory::default();
 
     for sequence in 1..=args.count {
         if args.bounce_agent_at == Some(sequence) {
             restart_component(&mut session, ComponentSelection::Agent)?;
             bounced_agent = Some(sequence);
+            agent_history.recovery_started_at = Some(Instant::now());
             save_manifest(&args.session_file, &session)?;
         }
 
         if args.bounce_gateway_at == Some(sequence) {
             restart_component(&mut session, ComponentSelection::Gateway)?;
             bounced_gateway = Some(sequence);
+            gateway_history.recovery_started_at = Some(Instant::now());
             save_manifest(&args.session_file, &session)?;
         }
 
@@ -439,6 +471,19 @@ fn run_soak(args: SoakArgs) -> Result<()> {
             received += 1;
             samples.push(rtt_ms);
         }
+
+        observe_status_history(
+            sequence,
+            &session.agent_status_file,
+            &mut agent_history,
+            start,
+        )?;
+        observe_status_history(
+            sequence,
+            &session.gateway_status_file,
+            &mut gateway_history,
+            start,
+        )?;
 
         if sequence != args.count {
             thread::sleep(Duration::from_secs_f64(args.interval_secs));
@@ -467,10 +512,58 @@ fn run_soak(args: SoakArgs) -> Result<()> {
         max_jitter_ms: max_jitter(&samples),
         bounced_agent_at: bounced_agent,
         bounced_gateway_at: bounced_gateway,
+        agent_recovery_secs: agent_history.recovered_after_secs,
+        gateway_recovery_secs: gateway_history.recovered_after_secs,
+        agent_phase_transitions: agent_history.transitions,
+        gateway_phase_transitions: gateway_history.transitions,
+        agent_degraded_samples: agent_history.degraded_samples,
+        gateway_degraded_samples: gateway_history.degraded_samples,
+        agent_stale_samples: agent_history.stale_samples,
+        gateway_stale_samples: gateway_history.stale_samples,
         elapsed_secs: start.elapsed().as_secs_f64(),
     };
 
     println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn observe_status_history(
+    sequence: u32,
+    status_path: &Path,
+    history: &mut StatusHistory,
+    _suite_started_at: Instant,
+) -> Result<()> {
+    let Some(status) = read_optional_json::<RuntimeStatus>(status_path)? else {
+        return Ok(());
+    };
+
+    if status.state != HealthState::Healthy {
+        history.degraded_samples += 1;
+    }
+    if status.phase == TunnelPhase::Stale {
+        history.stale_samples += 1;
+    }
+
+    if history.last_phase.as_ref() != Some(&status.phase) {
+        history.transitions.push(PhaseTransition {
+            sequence,
+            from: history.last_phase.clone(),
+            to: status.phase.clone(),
+            observed_at_unix_secs: status.observed_at_unix_secs,
+        });
+        history.last_phase = Some(status.phase.clone());
+    }
+
+    if status.phase == TunnelPhase::Active
+        && history.recovered_after_secs.is_none()
+        && history.recovery_started_at.is_some()
+    {
+        history.recovered_after_secs = history
+            .recovery_started_at
+            .take()
+            .map(|instant| instant.elapsed().as_secs_f64());
+    }
+
     Ok(())
 }
 

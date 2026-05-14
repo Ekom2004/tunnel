@@ -65,6 +65,7 @@ pub struct WireGuardConfig {
 pub struct RuntimeStatus {
     pub component: ComponentKind,
     pub state: HealthState,
+    pub phase: TunnelPhase,
     pub tenant_id: Option<String>,
     pub tunnel_id: Option<String>,
     pub transport: TransportKind,
@@ -72,6 +73,10 @@ pub struct RuntimeStatus {
     pub peer_endpoint: Option<String>,
     pub ingress_bytes: u64,
     pub egress_bytes: u64,
+    pub last_ingress_at_unix_secs: Option<u64>,
+    pub last_egress_at_unix_secs: Option<u64>,
+    pub last_peer_activity_unix_secs: Option<u64>,
+    pub last_activity_unix_secs: Option<u64>,
     pub observed_at_unix_secs: u64,
     pub detail: String,
 }
@@ -107,6 +112,14 @@ pub enum WireGuardRole {
 pub enum TransportKind {
     JsonTcp,
     WireGuardUdp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TunnelPhase {
+    Establishing,
+    Recovering,
+    Active,
+    Stale,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

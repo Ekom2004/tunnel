@@ -18,7 +18,7 @@ use tun::AbstractDevice;
 use tunnel_shared::{
     decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentToGateway, ComponentKind,
     GatewayRuntimeState, GatewayToAgent, HealthState, HealthStatus, RuntimeStatus, SocketEndpoint,
-    TransportKind, TunnelConfig, UsageRecord, WireGuardConfig,
+    TransportKind, TunnelConfig, TunnelPhase, UsageRecord, WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -140,6 +140,7 @@ fn run_cleanup_only(cli: &Cli) -> Result<()> {
         &RuntimeStatus {
             component: ComponentKind::Gateway,
             state: HealthState::Healthy,
+            phase: TunnelPhase::Active,
             tenant_id: None,
             tunnel_id: None,
             transport: TransportKind::WireGuardUdp,
@@ -147,6 +148,10 @@ fn run_cleanup_only(cli: &Cli) -> Result<()> {
             peer_endpoint: None,
             ingress_bytes: 0,
             egress_bytes: 0,
+            last_ingress_at_unix_secs: None,
+            last_egress_at_unix_secs: None,
+            last_peer_activity_unix_secs: None,
+            last_activity_unix_secs: None,
             observed_at_unix_secs: now_unix_secs(),
             detail: String::from("gateway cleanup complete"),
         },
@@ -235,6 +240,7 @@ fn run_wireguard_gateway(
             transport: TransportKind::WireGuardUdp,
             tunnel_interface: interface_name.clone(),
             detail: String::from("wireguard gateway running"),
+            started_at_unix_secs: now_unix_secs(),
         },
         Arc::clone(&peer),
         Arc::clone(&counters),
@@ -619,6 +625,7 @@ struct RuntimeStatusContext {
     transport: TransportKind,
     tunnel_interface: String,
     detail: String,
+    started_at_unix_secs: u64,
 }
 
 fn spawn_status_thread(
@@ -649,25 +656,44 @@ fn spawn_status_thread(
         let last_egress = counters.last_egress_at_unix_secs.load(Ordering::Relaxed);
         let last_activity = last_peer_activity.max(last_ingress).max(last_egress);
         let is_stale = last_activity != 0 && now.saturating_sub(last_activity) > interval_secs * 3;
-        let (state, detail) = if peer_endpoint.is_none() {
+        let uptime = now.saturating_sub(context.started_at_unix_secs);
+        let has_traffic = counters.ingress_bytes.load(Ordering::Relaxed) > 0
+            || counters.egress_bytes.load(Ordering::Relaxed) > 0;
+        let (state, phase, detail) = if peer_endpoint.is_none() {
             (
                 HealthState::Degraded,
+                TunnelPhase::Establishing,
                 String::from("wireguard peer endpoint is not established"),
+            )
+        } else if !has_traffic && uptime <= interval_secs * 3 {
+            (
+                HealthState::Degraded,
+                TunnelPhase::Recovering,
+                format!(
+                    "wireguard peer discovered; awaiting traffic {}s after start",
+                    uptime
+                ),
             )
         } else if is_stale {
             (
                 HealthState::Degraded,
+                TunnelPhase::Stale,
                 format!(
                     "wireguard path is stale; last activity {}s ago",
                     now.saturating_sub(last_activity)
                 ),
             )
         } else {
-            (HealthState::Healthy, context.detail.clone())
+            (
+                HealthState::Healthy,
+                TunnelPhase::Active,
+                context.detail.clone(),
+            )
         };
         let status = RuntimeStatus {
             component: context.component.clone(),
             state,
+            phase,
             tenant_id: context.tenant_id.clone(),
             tunnel_id: context.tunnel_id.clone(),
             transport: context.transport.clone(),
@@ -675,6 +701,10 @@ fn spawn_status_thread(
             peer_endpoint,
             ingress_bytes: counters.ingress_bytes.load(Ordering::Relaxed),
             egress_bytes: counters.egress_bytes.load(Ordering::Relaxed),
+            last_ingress_at_unix_secs: non_zero_u64(last_ingress),
+            last_egress_at_unix_secs: non_zero_u64(last_egress),
+            last_peer_activity_unix_secs: non_zero_u64(last_peer_activity),
+            last_activity_unix_secs: non_zero_u64(last_activity),
             observed_at_unix_secs: now_unix_secs(),
             detail,
         };
@@ -729,6 +759,10 @@ fn emit_status(status_file: &PathBuf, status: &RuntimeStatus) -> Result<()> {
     fs::write(status_file, &rendered)?;
     println!("{rendered}");
     Ok(())
+}
+
+fn non_zero_u64(value: u64) -> Option<u64> {
+    (value != 0).then_some(value)
 }
 
 fn forward_tun_packets_json(
