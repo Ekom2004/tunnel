@@ -17,8 +17,9 @@ use clap::{Args, Parser, ValueEnum};
 use tun::AbstractDevice;
 use tunnel_shared::{
     decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentToGateway, ComponentKind,
-    GatewayRuntimeState, GatewayToAgent, HealthState, HealthStatus, RuntimeStatus, SocketEndpoint,
-    TransportKind, TunnelConfig, TunnelPhase, UsageRecord, WireGuardConfig,
+    GatewayRuntimeState, GatewayToAgent, HealthState, HealthStatus, PacketPathTelemetry,
+    RuntimeStatus, SocketEndpoint, TransportKind, TunnelConfig, TunnelPhase, UsageRecord,
+    WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -84,6 +85,17 @@ struct ByteCounters {
     egress_bytes: AtomicU64,
     last_ingress_at_unix_secs: AtomicU64,
     last_egress_at_unix_secs: AtomicU64,
+    tun_read_packets: AtomicU64,
+    tun_read_bytes: AtomicU64,
+    tun_write_packets: AtomicU64,
+    tun_write_bytes: AtomicU64,
+    udp_rx_packets: AtomicU64,
+    udp_rx_bytes: AtomicU64,
+    udp_tx_packets: AtomicU64,
+    udp_tx_bytes: AtomicU64,
+    wireguard_encapsulated_packets: AtomicU64,
+    wireguard_decapsulated_packets: AtomicU64,
+    last_packet_error: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -154,6 +166,7 @@ fn run_cleanup_only(cli: &Cli) -> Result<()> {
             last_egress_at_unix_secs: None,
             last_peer_activity_unix_secs: None,
             last_activity_unix_secs: None,
+            packet_path: PacketPathTelemetry::default(),
             observed_at_unix_secs: now_unix_secs(),
             detail: String::from("gateway cleanup complete"),
         },
@@ -277,8 +290,9 @@ fn run_wireguard_gateway(
         let socket = socket.try_clone()?;
         let tunnel = Arc::clone(&tunnel);
         let peer = Arc::clone(&peer);
+        let counters = Arc::clone(&counters);
         thread::spawn(move || {
-            if let Err(error) = wireguard_timer_loop(socket, tunnel, peer, "gateway") {
+            if let Err(error) = wireguard_timer_loop(socket, tunnel, peer, counters, "gateway") {
                 eprintln!("gateway wireguard timer stopped: {error:#}");
             }
         });
@@ -448,6 +462,10 @@ fn wireguard_tun_sender_loop(
         counters
             .egress_bytes
             .fetch_add(amount as u64, Ordering::Relaxed);
+        counters.tun_read_packets.fetch_add(1, Ordering::Relaxed);
+        counters
+            .tun_read_bytes
+            .fetch_add(amount as u64, Ordering::Relaxed);
         counters
             .last_egress_at_unix_secs
             .store(now_unix_secs(), Ordering::Relaxed);
@@ -460,7 +478,7 @@ fn wireguard_tun_sender_loop(
             guard.encapsulate(&buf[..amount], &mut network_buf)
         };
 
-        send_wireguard_network_result(result, &socket, &peer, label)?;
+        send_wireguard_network_result(result, &socket, &peer, &counters, label)?;
     }
 }
 
@@ -478,6 +496,10 @@ fn wireguard_udp_receiver_loop(
 
     loop {
         let (amount, src_addr) = socket.recv_from(&mut datagram)?;
+        counters.udp_rx_packets.fetch_add(1, Ordering::Relaxed);
+        counters
+            .udp_rx_bytes
+            .fetch_add(amount as u64, Ordering::Relaxed);
         {
             let mut peer_guard = peer
                 .lock()
@@ -502,10 +524,13 @@ fn wireguard_udp_receiver_loop(
 
             match result {
                 TunnResult::WriteToNetwork(packet) => {
-                    let _ = send_udp_packet(&socket, &peer, packet, label)?;
+                    let _ = send_udp_packet(&socket, &peer, packet, &counters, label)?;
                     continue;
                 }
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    counters
+                        .wireguard_decapsulated_packets
+                        .fetch_add(1, Ordering::Relaxed);
                     counters
                         .ingress_bytes
                         .fetch_add(packet.len() as u64, Ordering::Relaxed);
@@ -523,10 +548,18 @@ fn wireguard_udp_receiver_loop(
                     }
                     tun_writer.write_all(packet)?;
                     tun_writer.flush()?;
+                    counters.tun_write_packets.fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .tun_write_bytes
+                        .fetch_add(packet.len() as u64, Ordering::Relaxed);
                     break;
                 }
                 TunnResult::Done => break,
                 TunnResult::Err(error) => {
+                    record_packet_error(
+                        &counters,
+                        format!("wireguard decapsulate error: {error:?}"),
+                    );
                     eprintln!("{label} wireguard decapsulate error: {error:?}");
                     break;
                 }
@@ -539,6 +572,7 @@ fn wireguard_timer_loop(
     socket: UdpSocket,
     tunnel: Arc<Mutex<Tunn>>,
     peer: Arc<Mutex<PeerStatus>>,
+    counters: Arc<ByteCounters>,
     label: &str,
 ) -> Result<()> {
     loop {
@@ -552,7 +586,7 @@ fn wireguard_timer_loop(
         };
 
         if let TunnResult::WriteToNetwork(packet) = result {
-            let _ = send_udp_packet(&socket, &peer, packet, label)?;
+            let _ = send_udp_packet(&socket, &peer, packet, &counters, label)?;
         }
     }
 }
@@ -561,16 +595,23 @@ fn send_wireguard_network_result(
     result: TunnResult<'_>,
     socket: &UdpSocket,
     peer: &Arc<Mutex<PeerStatus>>,
+    counters: &Arc<ByteCounters>,
     label: &str,
 ) -> Result<()> {
     match result {
         TunnResult::WriteToNetwork(packet) => {
-            let _ = send_udp_packet(socket, peer, packet, label)?;
+            counters
+                .wireguard_encapsulated_packets
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = send_udp_packet(socket, peer, packet, counters, label)?;
             Ok(())
         }
         TunnResult::Done => Ok(()),
         TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => Ok(()),
-        TunnResult::Err(error) => Err(anyhow!("{label} wireguard encapsulate error: {error:?}")),
+        TunnResult::Err(error) => {
+            record_packet_error(counters, format!("wireguard encapsulate error: {error:?}"));
+            Err(anyhow!("{label} wireguard encapsulate error: {error:?}"))
+        }
     }
 }
 
@@ -578,6 +619,7 @@ fn send_udp_packet(
     socket: &UdpSocket,
     peer: &Arc<Mutex<PeerStatus>>,
     packet: &[u8],
+    counters: &Arc<ByteCounters>,
     label: &str,
 ) -> Result<bool> {
     let mut guard = peer
@@ -587,6 +629,10 @@ fn send_udp_packet(
         return Ok(false);
     };
     socket.send_to(packet, target)?;
+    counters.udp_tx_packets.fetch_add(1, Ordering::Relaxed);
+    counters
+        .udp_tx_bytes
+        .fetch_add(packet.len() as u64, Ordering::Relaxed);
     guard.last_activity_unix_secs = now_unix_secs();
     Ok(true)
 }
@@ -711,6 +757,7 @@ fn spawn_status_thread(
             last_egress_at_unix_secs: non_zero_u64(last_egress),
             last_peer_activity_unix_secs: non_zero_u64(last_peer_activity),
             last_activity_unix_secs: non_zero_u64(last_activity),
+            packet_path: packet_path_snapshot(&counters),
             observed_at_unix_secs: now_unix_secs(),
             detail,
         };
@@ -719,6 +766,36 @@ fn spawn_status_thread(
             eprintln!("gateway status render failed: {error}");
         }
     });
+}
+
+fn packet_path_snapshot(counters: &ByteCounters) -> PacketPathTelemetry {
+    PacketPathTelemetry {
+        tun_read_packets: counters.tun_read_packets.load(Ordering::Relaxed),
+        tun_read_bytes: counters.tun_read_bytes.load(Ordering::Relaxed),
+        tun_write_packets: counters.tun_write_packets.load(Ordering::Relaxed),
+        tun_write_bytes: counters.tun_write_bytes.load(Ordering::Relaxed),
+        udp_rx_packets: counters.udp_rx_packets.load(Ordering::Relaxed),
+        udp_rx_bytes: counters.udp_rx_bytes.load(Ordering::Relaxed),
+        udp_tx_packets: counters.udp_tx_packets.load(Ordering::Relaxed),
+        udp_tx_bytes: counters.udp_tx_bytes.load(Ordering::Relaxed),
+        wireguard_encapsulated_packets: counters
+            .wireguard_encapsulated_packets
+            .load(Ordering::Relaxed),
+        wireguard_decapsulated_packets: counters
+            .wireguard_decapsulated_packets
+            .load(Ordering::Relaxed),
+        last_packet_error: counters
+            .last_packet_error
+            .lock()
+            .ok()
+            .and_then(|error| error.clone()),
+    }
+}
+
+fn record_packet_error(counters: &ByteCounters, detail: String) {
+    if let Ok(mut error) = counters.last_packet_error.lock() {
+        *error = Some(detail);
+    }
 }
 
 fn save_gateway_state(

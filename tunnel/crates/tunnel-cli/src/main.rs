@@ -167,6 +167,8 @@ struct DoctorArgs {
     probe_timeout_secs: f64,
     #[arg(long, default_value_t = 15)]
     stale_after_secs: u64,
+    #[arg(long, default_value_t = 6)]
+    post_probe_settle_secs: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -642,26 +644,9 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
     check_process("agent_process", session.agent_pid, &mut checks);
     check_process("gateway_process", session.gateway_pid, &mut checks);
 
-    let agent_status = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
-    let gateway_status = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
     let agent_state = read_optional_json::<AgentRuntimeState>(&session.agent_state_file)?;
     let gateway_state = read_optional_json::<GatewayRuntimeState>(&session.gateway_state_file)?;
     let gateway_config = read_optional_json::<TunnelConfig>(&session.gateway_config)?;
-
-    check_runtime_status(
-        "agent_status",
-        agent_status.as_ref(),
-        &session.agent_status_file,
-        args.stale_after_secs,
-        &mut checks,
-    );
-    check_runtime_status(
-        "gateway_status",
-        gateway_status.as_ref(),
-        &session.gateway_status_file,
-        args.stale_after_secs,
-        &mut checks,
-    );
 
     check_agent_state(agent_state.as_ref(), &session.agent_state_file, &mut checks);
     check_gateway_state(
@@ -676,7 +661,27 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         &session.egress_interface,
         &mut checks,
     )?;
-    check_probe(&args.target, args.probe_timeout_secs, &mut checks)?;
+    let probe_passed = check_probe(&args.target, args.probe_timeout_secs, &mut checks)?;
+    if probe_passed {
+        wait_for_active_status_after_probe(&session, args.post_probe_settle_secs)?;
+    }
+
+    let agent_status = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
+    let gateway_status = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
+    check_runtime_status(
+        "agent_status",
+        agent_status.as_ref(),
+        &session.agent_status_file,
+        args.stale_after_secs,
+        &mut checks,
+    );
+    check_runtime_status(
+        "gateway_status",
+        gateway_status.as_ref(),
+        &session.gateway_status_file,
+        args.stale_after_secs,
+        &mut checks,
+    );
 
     print_doctor_report(args.target, checks)
 }
@@ -1123,21 +1128,52 @@ fn check_gateway_pf_rules(
     Ok(())
 }
 
-fn check_probe(target: &str, timeout_secs: f64, checks: &mut Vec<DoctorCheck>) -> Result<()> {
+fn check_probe(target: &str, timeout_secs: f64, checks: &mut Vec<DoctorCheck>) -> Result<bool> {
     match ping_once(target, timeout_secs)? {
-        Some(rtt_ms) => checks.push(doctor_check(
-            "probe",
-            DoctorState::Pass,
-            format!("{target} replied in {rtt_ms:.3}ms"),
-        )),
-        None => checks.push(doctor_check(
-            "probe",
-            DoctorState::Fail,
-            format!("{target} did not reply within {timeout_secs:.1}s"),
-        )),
+        Some(rtt_ms) => {
+            checks.push(doctor_check(
+                "probe",
+                DoctorState::Pass,
+                format!("{target} replied in {rtt_ms:.3}ms"),
+            ));
+            Ok(true)
+        }
+        None => {
+            checks.push(doctor_check(
+                "probe",
+                DoctorState::Fail,
+                format!("{target} did not reply within {timeout_secs:.1}s"),
+            ));
+            Ok(false)
+        }
     }
+}
 
-    Ok(())
+fn wait_for_active_status_after_probe(session: &SessionManifest, settle_secs: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(settle_secs);
+
+    loop {
+        let agent_status = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
+        let gateway_status = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
+
+        if agent_status
+            .as_ref()
+            .map(is_transport_active)
+            .unwrap_or(false)
+            && gateway_status
+                .as_ref()
+                .map(is_transport_active)
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn pid_is_running(pid: u32) -> Result<bool> {
@@ -1632,15 +1668,13 @@ fn wait_for_connect_ready(args: &ConnectArgs) -> Result<()> {
     loop {
         let agent_status = read_optional_json::<RuntimeStatus>(&args.agent_status_file)?;
         let gateway_status = read_optional_json::<RuntimeStatus>(&args.gateway_status_file)?;
+        let agent_state = read_optional_json::<AgentRuntimeState>(&args.agent_state_file)?;
+        let gateway_state = read_optional_json::<GatewayRuntimeState>(&args.gateway_state_file)?;
 
-        if agent_status
-            .as_ref()
-            .map(is_transport_active)
-            .unwrap_or(false)
-            && gateway_status
-                .as_ref()
-                .map(is_transport_active)
-                .unwrap_or(false)
+        if runtime_status_is_fresh(agent_status.as_ref(), args.ready_timeout_secs)
+            && runtime_status_is_fresh(gateway_status.as_ref(), args.ready_timeout_secs)
+            && agent_state.is_some()
+            && gateway_state.is_some()
         {
             return Ok(());
         }
@@ -1654,6 +1688,14 @@ fn wait_for_connect_ready(args: &ConnectArgs) -> Result<()> {
 
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn runtime_status_is_fresh(status: Option<&RuntimeStatus>, stale_after_secs: u64) -> bool {
+    status
+        .map(|status| {
+            now_unix_secs().saturating_sub(status.observed_at_unix_secs) <= stale_after_secs
+        })
+        .unwrap_or(false)
 }
 
 fn log_stdio(path: &Path, append: bool) -> Result<(Stdio, Stdio)> {

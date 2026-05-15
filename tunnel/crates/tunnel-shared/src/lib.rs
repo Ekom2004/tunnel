@@ -77,8 +77,25 @@ pub struct RuntimeStatus {
     pub last_egress_at_unix_secs: Option<u64>,
     pub last_peer_activity_unix_secs: Option<u64>,
     pub last_activity_unix_secs: Option<u64>,
+    #[serde(default)]
+    pub packet_path: PacketPathTelemetry,
     pub observed_at_unix_secs: u64,
     pub detail: String,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PacketPathTelemetry {
+    pub tun_read_packets: u64,
+    pub tun_read_bytes: u64,
+    pub tun_write_packets: u64,
+    pub tun_write_bytes: u64,
+    pub udp_rx_packets: u64,
+    pub udp_rx_bytes: u64,
+    pub udp_tx_packets: u64,
+    pub udp_tx_bytes: u64,
+    pub wireguard_encapsulated_packets: u64,
+    pub wireguard_decapsulated_packets: u64,
+    pub last_packet_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
