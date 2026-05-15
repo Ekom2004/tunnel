@@ -2,6 +2,7 @@
 
 use std::env;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -11,7 +12,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tunnel_shared::{
-    AgentRuntimeState, GatewayRuntimeState, HealthState, RuntimeStatus, TunnelPhase,
+    now_unix_secs, AgentRuntimeState, GatewayRuntimeState, HealthState, RuntimeStatus,
+    TunnelConfig, TunnelPhase,
 };
 
 #[derive(Debug, Parser)]
@@ -53,6 +55,7 @@ enum CommandKind {
     Disconnect(DisconnectArgs),
     Usage(StatusArgs),
     Restart(RestartArgs),
+    Doctor(DoctorArgs),
     Soak(SoakArgs),
 }
 
@@ -130,6 +133,18 @@ struct RestartArgs {
     component: ComponentSelection,
     #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+struct DoctorArgs {
+    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    session_file: PathBuf,
+    #[arg(long, default_value = "1.1.1.1")]
+    target: String,
+    #[arg(long, default_value_t = 2.0)]
+    probe_timeout_secs: f64,
+    #[arg(long, default_value_t = 15)]
+    stale_after_secs: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -247,6 +262,28 @@ enum FailureDomain {
     GatewayEgressOrReturnPath,
 }
 
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    overall: DoctorState,
+    target: String,
+    checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorCheck {
+    name: String,
+    state: DoctorState,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorState {
+    Pass,
+    Warn,
+    Fail,
+}
+
 #[derive(Debug, Default)]
 struct StatusHistory {
     transitions: Vec<PhaseTransition>,
@@ -281,6 +318,7 @@ fn main() -> Result<()> {
         CommandKind::Disconnect(args) => run_disconnect(args)?,
         CommandKind::Usage(args) => run_usage(args)?,
         CommandKind::Restart(args) => run_restart(args)?,
+        CommandKind::Doctor(args) => run_doctor(args)?,
         CommandKind::Soak(args) => run_soak(args)?,
     }
 
@@ -473,6 +511,73 @@ fn run_restart(args: RestartArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_doctor(args: DoctorArgs) -> Result<()> {
+    let mut checks = Vec::new();
+    let session = read_optional_json::<SessionManifest>(&args.session_file)?;
+
+    let Some(session) = session else {
+        checks.push(doctor_check(
+            "session_file",
+            DoctorState::Fail,
+            format!(
+                "session manifest not found: {}",
+                args.session_file.display()
+            ),
+        ));
+        return print_doctor_report(args.target, checks);
+    };
+
+    checks.push(doctor_check(
+        "session_file",
+        DoctorState::Pass,
+        format!(
+            "session manifest found for tenant={} attachment={}",
+            session.tenant, session.attachment
+        ),
+    ));
+
+    check_process("agent_process", session.agent_pid, &mut checks);
+    check_process("gateway_process", session.gateway_pid, &mut checks);
+
+    let agent_status = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
+    let gateway_status = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
+    let agent_state = read_optional_json::<AgentRuntimeState>(&session.agent_state_file)?;
+    let gateway_state = read_optional_json::<GatewayRuntimeState>(&session.gateway_state_file)?;
+    let gateway_config = read_optional_json::<TunnelConfig>(&session.gateway_config)?;
+
+    check_runtime_status(
+        "agent_status",
+        agent_status.as_ref(),
+        &session.agent_status_file,
+        args.stale_after_secs,
+        &mut checks,
+    );
+    check_runtime_status(
+        "gateway_status",
+        gateway_status.as_ref(),
+        &session.gateway_status_file,
+        args.stale_after_secs,
+        &mut checks,
+    );
+
+    check_agent_state(agent_state.as_ref(), &session.agent_state_file, &mut checks);
+    check_gateway_state(
+        gateway_state.as_ref(),
+        &session.gateway_state_file,
+        &mut checks,
+    );
+    check_route_to_target(&args.target, agent_state.as_ref(), &mut checks)?;
+    check_gateway_pf_rules(
+        gateway_state.as_ref(),
+        gateway_config.as_ref(),
+        &session.egress_interface,
+        &mut checks,
+    )?;
+    check_probe(&args.target, args.probe_timeout_secs, &mut checks)?;
+
+    print_doctor_report(args.target, checks)
+}
+
 fn run_soak(args: SoakArgs) -> Result<()> {
     let mut session = load_manifest(&args.session_file)?;
     let start = Instant::now();
@@ -593,6 +698,430 @@ fn run_soak(args: SoakArgs) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn doctor_check(
+    name: impl Into<String>,
+    state: DoctorState,
+    detail: impl Into<String>,
+) -> DoctorCheck {
+    DoctorCheck {
+        name: name.into(),
+        state,
+        detail: detail.into(),
+    }
+}
+
+fn print_doctor_report(target: String, checks: Vec<DoctorCheck>) -> Result<()> {
+    let overall = if checks.iter().any(|check| check.state == DoctorState::Fail) {
+        DoctorState::Fail
+    } else if checks.iter().any(|check| check.state == DoctorState::Warn) {
+        DoctorState::Warn
+    } else {
+        DoctorState::Pass
+    };
+
+    let report = DoctorReport {
+        overall,
+        target,
+        checks,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn check_process(name: &str, pid: Option<u32>, checks: &mut Vec<DoctorCheck>) {
+    let Some(pid) = pid else {
+        checks.push(doctor_check(
+            name,
+            DoctorState::Fail,
+            "session manifest has no pid",
+        ));
+        return;
+    };
+
+    match pid_is_running(pid) {
+        Ok(true) => checks.push(doctor_check(
+            name,
+            DoctorState::Pass,
+            format!("pid {pid} is running"),
+        )),
+        Ok(false) => checks.push(doctor_check(
+            name,
+            DoctorState::Fail,
+            format!("pid {pid} is not running"),
+        )),
+        Err(error) => checks.push(doctor_check(
+            name,
+            DoctorState::Warn,
+            format!("could not verify pid {pid}: {error:#}"),
+        )),
+    }
+}
+
+fn check_runtime_status(
+    name: &str,
+    status: Option<&RuntimeStatus>,
+    path: &Path,
+    stale_after_secs: u64,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let Some(status) = status else {
+        checks.push(doctor_check(
+            name,
+            DoctorState::Fail,
+            format!("status file not found: {}", path.display()),
+        ));
+        return;
+    };
+
+    let age_secs = now_unix_secs().saturating_sub(status.observed_at_unix_secs);
+    if age_secs > stale_after_secs {
+        checks.push(doctor_check(
+            name,
+            DoctorState::Fail,
+            format!("status is stale: observed {age_secs}s ago"),
+        ));
+        return;
+    }
+
+    if status.state != HealthState::Healthy {
+        checks.push(doctor_check(
+            name,
+            DoctorState::Fail,
+            format!("runtime state is {:?}: {}", status.state, status.detail),
+        ));
+        return;
+    }
+
+    if status.phase != TunnelPhase::Active {
+        checks.push(doctor_check(
+            name,
+            DoctorState::Warn,
+            format!("runtime phase is {:?}: {}", status.phase, status.detail),
+        ));
+        return;
+    }
+
+    checks.push(doctor_check(
+        name,
+        DoctorState::Pass,
+        format!(
+            "healthy active status on {:?}; observed {age_secs}s ago",
+            status.tunnel_interface
+        ),
+    ));
+}
+
+fn check_agent_state(
+    state: Option<&AgentRuntimeState>,
+    path: &Path,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let Some(state) = state else {
+        checks.push(doctor_check(
+            "agent_state",
+            DoctorState::Fail,
+            format!("agent state file not found: {}", path.display()),
+        ));
+        return;
+    };
+
+    if state.destination_cidrs.is_empty() {
+        checks.push(doctor_check(
+            "agent_state",
+            DoctorState::Warn,
+            format!(
+                "agent state exists for {}, but no destination CIDRs are configured",
+                state.tunnel_interface
+            ),
+        ));
+        return;
+    }
+
+    checks.push(doctor_check(
+        "agent_state",
+        DoctorState::Pass,
+        format!(
+            "agent interface {} owns {} route(s)",
+            state.tunnel_interface,
+            state.destination_cidrs.len()
+        ),
+    ));
+}
+
+fn check_gateway_state(
+    state: Option<&GatewayRuntimeState>,
+    path: &Path,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let Some(state) = state else {
+        checks.push(doctor_check(
+            "gateway_state",
+            DoctorState::Fail,
+            format!("gateway state file not found: {}", path.display()),
+        ));
+        return;
+    };
+
+    checks.push(doctor_check(
+        "gateway_state",
+        DoctorState::Pass,
+        format!(
+            "gateway interface {} egress={:?} anchor={:?}",
+            state.tunnel_interface, state.egress_interface, state.nat_anchor_name
+        ),
+    ));
+}
+
+fn check_route_to_target(
+    target: &str,
+    agent_state: Option<&AgentRuntimeState>,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
+    let Some(agent_state) = agent_state else {
+        checks.push(doctor_check(
+            "route_to_target",
+            DoctorState::Warn,
+            "skipped because agent state is missing",
+        ));
+        return Ok(());
+    };
+
+    match route_interface_for_target(target)? {
+        Some(interface) if interface == agent_state.tunnel_interface => {
+            checks.push(doctor_check(
+                "route_to_target",
+                DoctorState::Pass,
+                format!("{target} routes through {}", agent_state.tunnel_interface),
+            ));
+        }
+        Some(interface) => {
+            checks.push(doctor_check(
+                "route_to_target",
+                DoctorState::Fail,
+                format!(
+                    "{target} routes through {interface}, expected {}",
+                    agent_state.tunnel_interface
+                ),
+            ));
+        }
+        None => {
+            checks.push(doctor_check(
+                "route_to_target",
+                DoctorState::Fail,
+                format!("could not determine route interface for {target}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn check_gateway_pf_rules(
+    gateway_state: Option<&GatewayRuntimeState>,
+    gateway_config: Option<&TunnelConfig>,
+    session_egress_interface: &str,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
+    let Some(state) = gateway_state else {
+        checks.push(doctor_check(
+            "gateway_pf_rules",
+            DoctorState::Warn,
+            "skipped because gateway state is missing",
+        ));
+        return Ok(());
+    };
+
+    let Some(rules_path) = state.nat_rules_path.as_ref() else {
+        checks.push(doctor_check(
+            "gateway_pf_rules",
+            DoctorState::Fail,
+            "gateway state has no NAT rules path",
+        ));
+        return Ok(());
+    };
+
+    if let Some(anchor) = state.nat_anchor_name.as_deref() {
+        let old_nested_suffix = format!("/{}", state.tunnel_interface);
+        if anchor.ends_with(&old_nested_suffix) {
+            checks.push(doctor_check(
+                "gateway_pf_anchor",
+                DoctorState::Fail,
+                format!("PF anchor is nested and may not be evaluated by macOS: {anchor}"),
+            ));
+        } else {
+            checks.push(doctor_check(
+                "gateway_pf_anchor",
+                DoctorState::Pass,
+                format!("PF anchor is direct: {anchor}"),
+            ));
+        }
+    } else {
+        checks.push(doctor_check(
+            "gateway_pf_anchor",
+            DoctorState::Warn,
+            "gateway state has no PF anchor name",
+        ));
+    }
+
+    if !rules_path.exists() {
+        checks.push(doctor_check(
+            "gateway_pf_rules",
+            DoctorState::Fail,
+            format!("PF rules file not found: {}", rules_path.display()),
+        ));
+        return Ok(());
+    }
+
+    let rules = fs::read_to_string(rules_path)
+        .with_context(|| format!("failed to read {}", rules_path.display()))?;
+    let egress_interface = state
+        .egress_interface
+        .as_deref()
+        .unwrap_or(session_egress_interface);
+    let mut failures = Vec::new();
+
+    if !rules.contains(&format!("nat on {egress_interface}")) {
+        failures.push(format!("missing NAT on {egress_interface}"));
+    }
+    if !rules.contains(&format!("pass in quick on {}", state.tunnel_interface)) {
+        failures.push(format!(
+            "missing pass-in rule on {}",
+            state.tunnel_interface
+        ));
+    }
+
+    if let Some(expected_subnet) = expected_gateway_tunnel_subnet(gateway_config)? {
+        if !rules.contains(&expected_subnet) {
+            failures.push(format!("missing expected tunnel subnet {expected_subnet}"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if !rules.contains("route-to") {
+        failures.push(String::from("missing macOS route-to egress rule"));
+    }
+
+    if failures.is_empty() {
+        checks.push(doctor_check(
+            "gateway_pf_rules",
+            DoctorState::Pass,
+            format!("PF rules file looks valid: {}", rules_path.display()),
+        ));
+    } else {
+        checks.push(doctor_check(
+            "gateway_pf_rules",
+            DoctorState::Fail,
+            failures.join("; "),
+        ));
+    }
+
+    Ok(())
+}
+
+fn check_probe(target: &str, timeout_secs: f64, checks: &mut Vec<DoctorCheck>) -> Result<()> {
+    match ping_once(target, timeout_secs)? {
+        Some(rtt_ms) => checks.push(doctor_check(
+            "probe",
+            DoctorState::Pass,
+            format!("{target} replied in {rtt_ms:.3}ms"),
+        )),
+        None => checks.push(doctor_check(
+            "probe",
+            DoctorState::Fail,
+            format!("{target} did not reply within {timeout_secs:.1}s"),
+        )),
+    }
+
+    Ok(())
+}
+
+fn pid_is_running(pid: u32) -> Result<bool> {
+    let status = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .with_context(|| format!("failed to check pid {pid}"))?;
+    Ok(status.success())
+}
+
+fn expected_gateway_tunnel_subnet(config: Option<&TunnelConfig>) -> Result<Option<String>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let Some(wireguard) = config.wireguard.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(ipv4_subnet(
+        &wireguard.local_tunnel_address,
+        "255.255.255.0",
+    )?))
+}
+
+fn ipv4_subnet(address: &str, netmask: &str) -> Result<String> {
+    let address: Ipv4Addr = address
+        .parse()
+        .with_context(|| format!("invalid IPv4 address: {address}"))?;
+    let netmask: Ipv4Addr = netmask
+        .parse()
+        .with_context(|| format!("invalid IPv4 netmask: {netmask}"))?;
+
+    let address_u32 = u32::from(address);
+    let mask_u32 = u32::from(netmask);
+    let network = Ipv4Addr::from(address_u32 & mask_u32);
+    let prefix = mask_u32.count_ones();
+
+    Ok(format!("{network}/{prefix}"))
+}
+
+fn route_interface_for_target(target: &str) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("route")
+            .args(["-n", "get", target])
+            .output()
+            .with_context(|| format!("failed to query route for {target}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        return Ok(parse_route_get_field(
+            &String::from_utf8_lossy(&output.stdout),
+            "interface",
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("ip")
+            .args(["route", "get", target])
+            .output()
+            .with_context(|| format!("failed to query route for {target}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut parts = stdout.split_whitespace();
+        while let Some(part) = parts.next() {
+            if part == "dev" {
+                return Ok(parts.next().map(ToOwned::to_owned));
+            }
+        }
+        return Ok(None);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = target;
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn parse_route_get_field(output: &str, field: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once(':')?;
+        (key.trim() == field).then(|| value.trim().to_owned())
+    })
 }
 
 fn observe_status_history(
