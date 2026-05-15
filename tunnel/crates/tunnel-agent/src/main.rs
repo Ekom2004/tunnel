@@ -778,7 +778,7 @@ fn build_agent_route_commands(interface_name: &str, config: &TunnelConfig) -> Ve
 }
 
 fn build_agent_route_cleanup_commands(
-    interface_name: &str,
+    _interface_name: &str,
     destination_cidrs: &[String],
 ) -> Vec<Vec<String>> {
     destination_cidrs
@@ -792,7 +792,7 @@ fn build_agent_route_cleanup_commands(
                     String::from("del"),
                     cidr.clone(),
                     String::from("dev"),
-                    String::from(interface_name),
+                    String::from(_interface_name),
                 ]
             }
 
@@ -804,8 +804,6 @@ fn build_agent_route_cleanup_commands(
                     String::from("delete"),
                     String::from("-net"),
                     cidr.clone(),
-                    String::from("-interface"),
-                    String::from(interface_name),
                 ]
             }
 
@@ -813,7 +811,7 @@ fn build_agent_route_cleanup_commands(
             {
                 vec![
                     String::from("echo"),
-                    format!("manual route cleanup required for {cidr} via {interface_name}"),
+                    format!("manual route cleanup required for {cidr} via {_interface_name}"),
                 ]
             }
         })

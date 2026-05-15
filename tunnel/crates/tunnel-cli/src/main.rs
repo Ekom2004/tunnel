@@ -62,9 +62,9 @@ struct ConnectArgs {
     tenant: String,
     #[arg(long)]
     attachment: String,
-    #[arg(long)]
+    #[arg(long, default_value = "/private/tmp/tunnel-agent-wg.json")]
     agent_config: PathBuf,
-    #[arg(long)]
+    #[arg(long, default_value = "/private/tmp/tunnel-gateway-wg.json")]
     gateway_config: PathBuf,
     #[arg(long, default_value = "/private/tmp/tunnel-agent-state.json")]
     agent_state_file: PathBuf,
@@ -142,6 +142,8 @@ struct SoakArgs {
     count: u32,
     #[arg(long, default_value_t = 1.0)]
     interval_secs: f64,
+    #[arg(long, default_value_t = 2.0)]
+    probe_timeout_secs: f64,
     #[arg(long)]
     bounce_agent_at: Option<u32>,
     #[arg(long)]
@@ -182,6 +184,7 @@ struct SessionManifest {
 #[derive(Debug, Serialize)]
 struct SoakReport {
     target: String,
+    probe_timeout_secs: f64,
     sent: u32,
     received: u32,
     packet_loss_percent: f64,
@@ -203,6 +206,14 @@ struct SoakReport {
     gateway_degraded_samples: u32,
     agent_stale_samples: u32,
     gateway_stale_samples: u32,
+    agent_bytes_before: Option<ByteSnapshot>,
+    agent_bytes_after: Option<ByteSnapshot>,
+    gateway_bytes_before: Option<ByteSnapshot>,
+    gateway_bytes_after: Option<ByteSnapshot>,
+    agent_bytes_delta: Option<ByteDelta>,
+    gateway_bytes_delta: Option<ByteDelta>,
+    transport_active_but_probe_failed: bool,
+    likely_failure_domain: FailureDomain,
     elapsed_secs: f64,
 }
 
@@ -212,6 +223,28 @@ struct PhaseTransition {
     from: Option<TunnelPhase>,
     to: TunnelPhase,
     observed_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ByteSnapshot {
+    ingress_bytes: u64,
+    egress_bytes: u64,
+    observed_at_unix_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ByteDelta {
+    ingress_delta: i64,
+    egress_delta: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FailureDomain {
+    None,
+    ProbeNeverEnteredTunnel,
+    TransportOrPeerLiveness,
+    GatewayEgressOrReturnPath,
 }
 
 #[derive(Debug, Default)]
@@ -443,6 +476,8 @@ fn run_restart(args: RestartArgs) -> Result<()> {
 fn run_soak(args: SoakArgs) -> Result<()> {
     let mut session = load_manifest(&args.session_file)?;
     let start = Instant::now();
+    let agent_before = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
+    let gateway_before = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
     let mut samples = Vec::with_capacity(args.count as usize);
     let mut sent = 0_u32;
     let mut received = 0_u32;
@@ -467,7 +502,7 @@ fn run_soak(args: SoakArgs) -> Result<()> {
         }
 
         sent += 1;
-        if let Some(rtt_ms) = ping_once(&args.target)? {
+        if let Some(rtt_ms) = ping_once(&args.target, args.probe_timeout_secs)? {
             received += 1;
             samples.push(rtt_ms);
         }
@@ -492,9 +527,34 @@ fn run_soak(args: SoakArgs) -> Result<()> {
 
     let mut sorted = samples.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let agent_after = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
+    let gateway_after = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
+    let agent_delta = byte_delta(agent_before.as_ref(), agent_after.as_ref());
+    let gateway_delta = byte_delta(gateway_before.as_ref(), gateway_after.as_ref());
+    let transport_active_but_probe_failed = received == 0
+        && [
+            agent_after
+                .as_ref()
+                .map(is_transport_active)
+                .unwrap_or(false),
+            gateway_after
+                .as_ref()
+                .map(is_transport_active)
+                .unwrap_or(false),
+        ]
+        .into_iter()
+        .all(|active| active);
+    let likely_failure_domain = classify_failure_domain(
+        received,
+        agent_delta.as_ref(),
+        gateway_delta.as_ref(),
+        agent_after.as_ref(),
+        gateway_after.as_ref(),
+    );
 
     let report = SoakReport {
         target: args.target,
+        probe_timeout_secs: args.probe_timeout_secs,
         sent,
         received,
         packet_loss_percent: if sent == 0 {
@@ -520,6 +580,14 @@ fn run_soak(args: SoakArgs) -> Result<()> {
         gateway_degraded_samples: gateway_history.degraded_samples,
         agent_stale_samples: agent_history.stale_samples,
         gateway_stale_samples: gateway_history.stale_samples,
+        agent_bytes_before: agent_before.as_ref().map(runtime_bytes_snapshot),
+        agent_bytes_after: agent_after.as_ref().map(runtime_bytes_snapshot),
+        gateway_bytes_before: gateway_before.as_ref().map(runtime_bytes_snapshot),
+        gateway_bytes_after: gateway_after.as_ref().map(runtime_bytes_snapshot),
+        agent_bytes_delta: agent_delta,
+        gateway_bytes_delta: gateway_delta,
+        transport_active_but_probe_failed,
+        likely_failure_domain,
         elapsed_secs: start.elapsed().as_secs_f64(),
     };
 
@@ -620,16 +688,30 @@ fn restart_component(session: &mut SessionManifest, component: ComponentSelectio
     Ok(())
 }
 
-fn ping_once(target: &str) -> Result<Option<f64>> {
+fn ping_once(target: &str, timeout_secs: f64) -> Result<Option<f64>> {
     #[cfg(target_os = "macos")]
     let output = Command::new("ping")
-        .args(["-n", "-c", "1", target])
+        .args([
+            "-n",
+            "-c",
+            "1",
+            "-W",
+            &timeout_millis_arg(timeout_secs),
+            target,
+        ])
         .output()
         .with_context(|| format!("failed to ping {target}"))?;
 
     #[cfg(target_os = "linux")]
     let output = Command::new("ping")
-        .args(["-n", "-c", "1", "-W", "1", target])
+        .args([
+            "-n",
+            "-c",
+            "1",
+            "-W",
+            &timeout_secs_arg(timeout_secs),
+            target,
+        ])
         .output()
         .with_context(|| format!("failed to ping {target}"))?;
 
@@ -664,6 +746,65 @@ fn average(values: &[f64]) -> Option<f64> {
         return None;
     }
     Some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
+#[cfg(target_os = "linux")]
+fn timeout_secs_arg(timeout_secs: f64) -> String {
+    timeout_secs.ceil().max(1.0).to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn timeout_millis_arg(timeout_secs: f64) -> String {
+    ((timeout_secs * 1000.0).round() as u64).max(1).to_string()
+}
+
+fn runtime_bytes_snapshot(status: &RuntimeStatus) -> ByteSnapshot {
+    ByteSnapshot {
+        ingress_bytes: status.ingress_bytes,
+        egress_bytes: status.egress_bytes,
+        observed_at_unix_secs: status.observed_at_unix_secs,
+    }
+}
+
+fn byte_delta(before: Option<&RuntimeStatus>, after: Option<&RuntimeStatus>) -> Option<ByteDelta> {
+    let (before, after) = (before?, after?);
+    Some(ByteDelta {
+        ingress_delta: after.ingress_bytes as i64 - before.ingress_bytes as i64,
+        egress_delta: after.egress_bytes as i64 - before.egress_bytes as i64,
+    })
+}
+
+fn is_transport_active(status: &RuntimeStatus) -> bool {
+    status.state == HealthState::Healthy && status.phase == TunnelPhase::Active
+}
+
+fn classify_failure_domain(
+    received: u32,
+    agent_delta: Option<&ByteDelta>,
+    gateway_delta: Option<&ByteDelta>,
+    agent_status: Option<&RuntimeStatus>,
+    gateway_status: Option<&RuntimeStatus>,
+) -> FailureDomain {
+    if received > 0 {
+        return FailureDomain::None;
+    }
+
+    let agent_active = agent_status.map(is_transport_active).unwrap_or(false);
+    let gateway_active = gateway_status.map(is_transport_active).unwrap_or(false);
+    let agent_moved = agent_delta
+        .map(|delta| delta.ingress_delta > 0 || delta.egress_delta > 0)
+        .unwrap_or(false);
+    let gateway_moved = gateway_delta
+        .map(|delta| delta.ingress_delta > 0 || delta.egress_delta > 0)
+        .unwrap_or(false);
+
+    match (agent_moved, gateway_moved, agent_active, gateway_active) {
+        (false, false, _, _) => FailureDomain::ProbeNeverEnteredTunnel,
+        (_, _, false, false) | (_, _, false, true) | (_, _, true, false) => {
+            FailureDomain::TransportOrPeerLiveness
+        }
+        _ => FailureDomain::GatewayEgressOrReturnPath,
+    }
 }
 
 fn percentile(values: &[f64], percentile: f64) -> Option<f64> {

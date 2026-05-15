@@ -59,6 +59,8 @@ struct TunArgs {
     tun_mtu: u16,
     #[arg(long)]
     egress_interface: Option<String>,
+    #[arg(long)]
+    egress_gateway: Option<String>,
     #[arg(long, value_enum, default_value_t = SystemCommandMode::Skip)]
     forwarding_mode: SystemCommandMode,
     #[arg(long, value_enum, default_value_t = SystemCommandMode::Skip)]
@@ -208,7 +210,11 @@ fn run_wireguard_gateway(
     let interface_name = device.tun_name()?;
     println!("gateway wireguard tun ready: {interface_name}");
     let previous_forwarding = query_ip_forwarding_enabled().ok();
-    handle_gateway_networking(&cli.tun, &interface_name)?;
+    handle_gateway_networking(
+        &cli.tun,
+        &interface_name,
+        Some(&wireguard.local_tunnel_address),
+    )?;
     save_gateway_state(
         &cli.state_file,
         &cli.tun,
@@ -330,7 +336,7 @@ fn handle_client(stream: TcpStream, cli: &Cli) -> Result<()> {
         let interface_name = device.tun_name()?;
         println!("gateway tun ready: {interface_name}");
         let previous_forwarding = query_ip_forwarding_enabled().ok();
-        handle_gateway_networking(&cli.tun, &interface_name)?;
+        handle_gateway_networking(&cli.tun, &interface_name, None)?;
         save_gateway_state(
             &cli.state_file,
             &cli.tun,
@@ -835,15 +841,24 @@ fn parse_ip(value: &str) -> Result<IpAddr> {
         .with_context(|| format!("invalid IP address: {value}"))
 }
 
-fn handle_gateway_networking(tun_args: &TunArgs, interface_name: &str) -> Result<()> {
+fn handle_gateway_networking(
+    tun_args: &TunArgs,
+    interface_name: &str,
+    local_tunnel_address: Option<&str>,
+) -> Result<()> {
     handle_forwarding(tun_args.forwarding_mode, interface_name)?;
-    handle_nat(tun_args.nat_mode, interface_name, tun_args)
+    handle_nat(
+        tun_args.nat_mode,
+        interface_name,
+        tun_args,
+        local_tunnel_address,
+    )
 }
 
 fn build_nat_anchor_name(interface_name: &str, tun_args: &TunArgs) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
-        return Some(format!("{}/{}", tun_args.pf_anchor_prefix, interface_name));
+        return Some(format!("{}-{}", tun_args.pf_anchor_prefix, interface_name));
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -881,18 +896,24 @@ fn handle_forwarding(mode: SystemCommandMode, interface_name: &str) -> Result<()
     execute_commands(mode, "gateway forwarding", &commands)
 }
 
-fn handle_nat(mode: SystemCommandMode, interface_name: &str, tun_args: &TunArgs) -> Result<()> {
+fn handle_nat(
+    mode: SystemCommandMode,
+    interface_name: &str,
+    tun_args: &TunArgs,
+    local_tunnel_address: Option<&str>,
+) -> Result<()> {
     if mode == SystemCommandMode::Skip {
         return Ok(());
     }
 
     #[cfg(target_os = "macos")]
     {
-        return handle_macos_nat(mode, interface_name, tun_args);
+        return handle_macos_nat(mode, interface_name, tun_args, local_tunnel_address);
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = local_tunnel_address;
         let commands = build_nat_commands(interface_name, tun_args.egress_interface.as_deref())?;
         return execute_commands(mode, "gateway nat", &commands);
     }
@@ -1150,17 +1171,29 @@ fn handle_macos_nat(
     mode: SystemCommandMode,
     interface_name: &str,
     tun_args: &TunArgs,
+    local_tunnel_address: Option<&str>,
 ) -> Result<()> {
     let egress_interface = tun_args
         .egress_interface
         .as_deref()
         .ok_or_else(|| anyhow!("--egress-interface is required when nat-mode is not skip"))?;
-    let subnet = ipv4_subnet(&tun_args.tun_address, &tun_args.tun_netmask)?;
-    let anchor_name = format!("{}/{}", tun_args.pf_anchor_prefix, interface_name);
+    let egress_gateway = match tun_args.egress_gateway.as_deref() {
+        Some(gateway) => Some(gateway.to_owned()),
+        None => query_macos_default_gateway(egress_interface)?,
+    };
+    let subnet_source = local_tunnel_address.unwrap_or(&tun_args.tun_address);
+    let subnet = ipv4_subnet(subnet_source, &tun_args.tun_netmask)?;
+    let anchor_name = build_nat_anchor_name(interface_name, tun_args)
+        .ok_or_else(|| anyhow!("macOS NAT anchor name is unavailable"))?;
     let rules_path = tun_args
         .pf_rules_dir
         .join(format!("tunnel-{interface_name}.pf.conf"));
-    let rules = build_macos_pf_rules(interface_name, egress_interface, &subnet);
+    let rules = build_macos_pf_rules(
+        interface_name,
+        egress_interface,
+        egress_gateway.as_deref(),
+        &subnet,
+    );
 
     match mode {
         SystemCommandMode::Skip => Ok(()),
@@ -1193,6 +1226,9 @@ fn handle_macos_nat(
             )?;
             println!("gateway nat anchor: {anchor_name}");
             println!("gateway nat rules path: {}", rules_path.display());
+            if let Some(gateway) = &egress_gateway {
+                println!("gateway egress route-to: {egress_interface} {gateway}");
+            }
             Ok(())
         }
     }
@@ -1236,11 +1272,53 @@ fn handle_macos_nat_cleanup(mode: SystemCommandMode, state: &GatewayRuntimeState
 }
 
 #[cfg(target_os = "macos")]
-fn build_macos_pf_rules(interface_name: &str, egress_interface: &str, subnet: &str) -> String {
+fn query_macos_default_gateway(egress_interface: &str) -> Result<Option<String>> {
+    let output = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .context("failed to query macOS default route")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to query macOS default route\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let gateway = parse_route_get_field(&stdout, "gateway");
+    let interface = parse_route_get_field(&stdout, "interface");
+
+    if interface.as_deref() == Some(egress_interface) {
+        return Ok(gateway);
+    }
+
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_route_get_field(output: &str, field: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once(':')?;
+        (key.trim() == field).then(|| value.trim().to_owned())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_pf_rules(
+    interface_name: &str,
+    egress_interface: &str,
+    egress_gateway: Option<&str>,
+    subnet: &str,
+) -> String {
+    let route_to = egress_gateway
+        .map(|gateway| format!(" route-to ({egress_interface} {gateway})"))
+        .unwrap_or_default();
+
     format!(
         "nat on {egress_interface} from {subnet} to any -> ({egress_interface})\n\
 pass out quick on {egress_interface} inet from {subnet} to any keep state\n\
-pass in quick on {interface_name} inet from {subnet} to any keep state\n\
+pass in quick on {interface_name}{route_to} inet from {subnet} to any keep state\n\
 pass out quick on {interface_name} inet from any to {subnet} keep state\n"
     )
 }
