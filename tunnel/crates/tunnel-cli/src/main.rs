@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,7 @@ enum CommandKind {
     Usage(StatusArgs),
     Restart(RestartArgs),
     Doctor(DoctorArgs),
+    Logs(LogsArgs),
     Soak(SoakArgs),
 }
 
@@ -79,6 +81,10 @@ struct ConnectArgs {
     gateway_status_file: PathBuf,
     #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-agent.log")]
+    agent_log_file: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-gateway.log")]
+    gateway_log_file: PathBuf,
     #[arg(long, default_value = "en0")]
     egress_interface: String,
     #[arg(long, value_enum, default_value_t = SystemCommandMode::Apply)]
@@ -87,6 +93,8 @@ struct ConnectArgs {
     forwarding_mode: SystemCommandMode,
     #[arg(long, value_enum, default_value_t = SystemCommandMode::Apply)]
     nat_mode: SystemCommandMode,
+    #[arg(long, default_value_t = 12)]
+    ready_timeout_secs: u64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -136,6 +144,20 @@ struct RestartArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct LogsArgs {
+    #[arg(long, value_enum, default_value_t = LogComponent::Both)]
+    component: LogComponent,
+    #[arg(long, default_value_t = 100)]
+    lines: usize,
+    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    session_file: PathBuf,
+    #[arg(long)]
+    agent_log_file: Option<PathBuf>,
+    #[arg(long)]
+    gateway_log_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args, Clone)]
 struct DoctorArgs {
     #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
@@ -178,6 +200,13 @@ enum ComponentSelection {
     Gateway,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+enum LogComponent {
+    Agent,
+    Gateway,
+    Both,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionManifest {
     tenant: String,
@@ -188,6 +217,10 @@ struct SessionManifest {
     agent_status_file: PathBuf,
     gateway_state_file: PathBuf,
     gateway_status_file: PathBuf,
+    #[serde(default = "default_agent_log_file")]
+    agent_log_file: PathBuf,
+    #[serde(default = "default_gateway_log_file")]
+    gateway_log_file: PathBuf,
     egress_interface: String,
     route_mode: SystemCommandMode,
     forwarding_mode: SystemCommandMode,
@@ -319,6 +352,7 @@ fn main() -> Result<()> {
         CommandKind::Usage(args) => run_usage(args)?,
         CommandKind::Restart(args) => run_restart(args)?,
         CommandKind::Doctor(args) => run_doctor(args)?,
+        CommandKind::Logs(args) => run_logs(args)?,
         CommandKind::Soak(args) => run_soak(args)?,
     }
 
@@ -326,8 +360,12 @@ fn main() -> Result<()> {
 }
 
 fn run_connect(args: ConnectArgs) -> Result<()> {
+    preflight_connect_args(&args)?;
+
     let gateway_bin = sibling_binary("tunnel-gateway")?;
     let agent_bin = sibling_binary("tunnel-agent")?;
+    let (gateway_stdout, gateway_stderr) = log_stdio(&args.gateway_log_file, false)?;
+    let (agent_stdout, agent_stderr) = log_stdio(&args.agent_log_file, false)?;
 
     let mut gateway = Command::new(&gateway_bin);
     gateway
@@ -345,14 +383,15 @@ fn run_connect(args: ConnectArgs) -> Result<()> {
         .arg("--status-file")
         .arg(&args.gateway_status_file)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(gateway_stdout)
+        .stderr(gateway_stderr);
 
-    let gateway_child = gateway
+    let mut gateway_child = gateway
         .spawn()
         .with_context(|| format!("failed to spawn {}", gateway_bin.display()))?;
 
     thread::sleep(Duration::from_millis(750));
+    ensure_child_still_running(&mut gateway_child, "gateway", &args.gateway_log_file)?;
 
     let mut agent = Command::new(&agent_bin);
     agent
@@ -366,12 +405,25 @@ fn run_connect(args: ConnectArgs) -> Result<()> {
         .arg("--status-file")
         .arg(&args.agent_status_file)
         .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(agent_stdout)
+        .stderr(agent_stderr);
 
-    let agent_child = agent
+    let mut agent_child = agent
         .spawn()
         .with_context(|| format!("failed to spawn {}", agent_bin.display()))?;
+
+    thread::sleep(Duration::from_millis(750));
+    if let Err(error) = ensure_child_still_running(&mut agent_child, "agent", &args.agent_log_file)
+    {
+        let _ = terminate_pid(Some(gateway_child.id()));
+        return Err(error);
+    }
+
+    if let Err(error) = wait_for_connect_ready(&args) {
+        let _ = terminate_pid(Some(agent_child.id()));
+        let _ = terminate_pid(Some(gateway_child.id()));
+        return Err(error);
+    }
 
     let manifest = SessionManifest {
         tenant: args.tenant.clone(),
@@ -382,6 +434,8 @@ fn run_connect(args: ConnectArgs) -> Result<()> {
         agent_status_file: args.agent_status_file.clone(),
         gateway_state_file: args.gateway_state_file.clone(),
         gateway_status_file: args.gateway_status_file.clone(),
+        agent_log_file: args.agent_log_file.clone(),
+        gateway_log_file: args.gateway_log_file.clone(),
         egress_interface: args.egress_interface.clone(),
         route_mode: args.route_mode,
         forwarding_mode: args.forwarding_mode,
@@ -398,8 +452,11 @@ fn run_connect(args: ConnectArgs) -> Result<()> {
             "attachment": args.attachment,
             "gateway_pid": gateway_child.id(),
             "agent_pid": agent_child.id(),
+            "agent_log_file": args.agent_log_file,
+            "gateway_log_file": args.gateway_log_file,
             "agent_status_file": args.agent_status_file,
             "gateway_status_file": args.gateway_status_file,
+            "ready": true,
             "session_file": args.session_file,
         }))?
     );
@@ -451,6 +508,37 @@ fn run_usage(args: StatusArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_logs(args: LogsArgs) -> Result<()> {
+    let session = read_optional_json::<SessionManifest>(&args.session_file)?;
+    let agent_log_file = args
+        .agent_log_file
+        .or_else(|| {
+            session
+                .as_ref()
+                .map(|session| session.agent_log_file.clone())
+        })
+        .unwrap_or_else(default_agent_log_file);
+    let gateway_log_file = args
+        .gateway_log_file
+        .or_else(|| {
+            session
+                .as_ref()
+                .map(|session| session.gateway_log_file.clone())
+        })
+        .unwrap_or_else(default_gateway_log_file);
+
+    match args.component {
+        LogComponent::Agent => print_log_tail("agent", &agent_log_file, args.lines)?,
+        LogComponent::Gateway => print_log_tail("gateway", &gateway_log_file, args.lines)?,
+        LogComponent::Both => {
+            print_log_tail("gateway", &gateway_log_file, args.lines)?;
+            print_log_tail("agent", &agent_log_file, args.lines)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn run_disconnect(args: DisconnectArgs) -> Result<()> {
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
     if let Some(session) = &session {
@@ -461,35 +549,49 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
     let agent_bin = sibling_binary("tunnel-agent")?;
     let gateway_bin = sibling_binary("tunnel-gateway")?;
 
-    run_cleanup_binary(
-        &agent_bin,
-        &[
-            "--config",
-            path_arg(&args.agent_config)?,
-            "--cleanup-only",
-            "--route-mode",
-            mode_str(args.route_mode),
-            "--state-file",
-            path_arg(&args.agent_state_file)?,
-            "--status-file",
-            path_arg(&args.agent_status_file)?,
-        ],
-    )?;
+    if args.agent_state_file.exists() {
+        run_cleanup_binary(
+            &agent_bin,
+            &[
+                "--config",
+                path_arg(&args.agent_config)?,
+                "--cleanup-only",
+                "--route-mode",
+                mode_str(args.route_mode),
+                "--state-file",
+                path_arg(&args.agent_state_file)?,
+                "--status-file",
+                path_arg(&args.agent_status_file)?,
+            ],
+        )?;
+    } else {
+        eprintln!(
+            "agent cleanup skipped: state file not found: {}",
+            args.agent_state_file.display()
+        );
+    }
 
-    run_cleanup_binary(
-        &gateway_bin,
-        &[
-            "--cleanup-only",
-            "--forwarding-mode",
-            mode_str(args.forwarding_mode),
-            "--nat-mode",
-            mode_str(args.nat_mode),
-            "--state-file",
-            path_arg(&args.gateway_state_file)?,
-            "--status-file",
-            path_arg(&args.gateway_status_file)?,
-        ],
-    )?;
+    if args.gateway_state_file.exists() {
+        run_cleanup_binary(
+            &gateway_bin,
+            &[
+                "--cleanup-only",
+                "--forwarding-mode",
+                mode_str(args.forwarding_mode),
+                "--nat-mode",
+                mode_str(args.nat_mode),
+                "--state-file",
+                path_arg(&args.gateway_state_file)?,
+                "--status-file",
+                path_arg(&args.gateway_status_file)?,
+            ],
+        )?;
+    } else {
+        eprintln!(
+            "gateway cleanup skipped: state file not found: {}",
+            args.gateway_state_file.display()
+        );
+    }
 
     if args.session_file.exists() {
         fs::remove_file(&args.session_file).with_context(|| {
@@ -1170,6 +1272,7 @@ fn restart_component(session: &mut SessionManifest, component: ComponentSelectio
             terminate_pid(session.agent_pid)?;
             thread::sleep(Duration::from_millis(500));
             let agent_bin = sibling_binary("tunnel-agent")?;
+            let (stdout, stderr) = log_stdio(&session.agent_log_file, true)?;
             let child = Command::new(&agent_bin)
                 .arg("--config")
                 .arg(&session.agent_config)
@@ -1181,8 +1284,8 @@ fn restart_component(session: &mut SessionManifest, component: ComponentSelectio
                 .arg("--status-file")
                 .arg(&session.agent_status_file)
                 .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
+                .stdout(stdout)
+                .stderr(stderr)
                 .spawn()
                 .with_context(|| format!("failed to respawn {}", agent_bin.display()))?;
             session.agent_pid = Some(child.id());
@@ -1191,6 +1294,7 @@ fn restart_component(session: &mut SessionManifest, component: ComponentSelectio
             terminate_pid(session.gateway_pid)?;
             thread::sleep(Duration::from_millis(500));
             let gateway_bin = sibling_binary("tunnel-gateway")?;
+            let (stdout, stderr) = log_stdio(&session.gateway_log_file, true)?;
             let child = Command::new(&gateway_bin)
                 .arg("--config")
                 .arg(&session.gateway_config)
@@ -1206,8 +1310,8 @@ fn restart_component(session: &mut SessionManifest, component: ComponentSelectio
                 .arg("--status-file")
                 .arg(&session.gateway_status_file)
                 .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
+                .stdout(stdout)
+                .stderr(stderr)
                 .spawn()
                 .with_context(|| format!("failed to respawn {}", gateway_bin.display()))?;
             session.gateway_pid = Some(child.id());
@@ -1385,6 +1489,121 @@ fn run_cleanup_binary(binary: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn preflight_connect_args(args: &ConnectArgs) -> Result<()> {
+    validate_config_file("agent config", &args.agent_config)?;
+    validate_config_file("gateway config", &args.gateway_config)?;
+    Ok(())
+}
+
+fn validate_config_file(label: &str, path: &Path) -> Result<()> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("{label} not found or unreadable: {}", path.display()))?;
+    let config: TunnelConfig = serde_json::from_str(&contents)
+        .with_context(|| format!("{label} is invalid JSON: {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("{label} failed validation: {}", path.display()))?;
+    Ok(())
+}
+
+fn ensure_child_still_running(child: &mut Child, label: &str, log_path: &Path) -> Result<()> {
+    if let Some(status) = child
+        .try_wait()
+        .with_context(|| format!("failed to inspect {label} process"))?
+    {
+        bail!(
+            "{label} exited during startup with status {status}. inspect logs with: tunnel-cli logs --component {label} --lines 80 or read {}",
+            log_path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn wait_for_connect_ready(args: &ConnectArgs) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(args.ready_timeout_secs);
+
+    loop {
+        let agent_status = read_optional_json::<RuntimeStatus>(&args.agent_status_file)?;
+        let gateway_status = read_optional_json::<RuntimeStatus>(&args.gateway_status_file)?;
+
+        if agent_status
+            .as_ref()
+            .map(is_transport_active)
+            .unwrap_or(false)
+            && gateway_status
+                .as_ref()
+                .map(is_transport_active)
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "tunnel did not become ready within {}s. inspect logs with: tunnel-cli logs --component both --lines 80",
+                args.ready_timeout_secs
+            );
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn log_stdio(path: &Path, append: bool) -> Result<(Stdio, Stdio)> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+    }
+
+    let stdout = open_log_file(path, append)?;
+    let stderr = open_log_file(path, true)?;
+    Ok((Stdio::from(stdout), Stdio::from(stderr)))
+}
+
+fn open_log_file(path: &Path, append: bool) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(append)
+        .write(true)
+        .truncate(!append)
+        .open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))
+}
+
+fn print_log_tail(label: &str, path: &Path, lines: usize) -> Result<()> {
+    println!("==> {label}: {} <==", path.display());
+    if !path.exists() {
+        println!("log file not found");
+        return Ok(());
+    }
+
+    for line in tail_lines(path, lines)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn tail_lines(path: &Path, lines: usize) -> Result<Vec<String>> {
+    if lines == 0 {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut tail = Vec::with_capacity(lines);
+
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        if tail.len() == lines {
+            tail.remove(0);
+        }
+        tail.push(line);
+    }
+
+    Ok(tail)
+}
+
 fn sibling_binary(name: &str) -> Result<PathBuf> {
     let current = env::current_exe().context("failed to resolve current executable")?;
     let dir = current
@@ -1400,6 +1619,14 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
         name,
         current.display()
     );
+}
+
+fn default_agent_log_file() -> PathBuf {
+    PathBuf::from("/private/tmp/tunnel-agent.log")
+}
+
+fn default_gateway_log_file() -> PathBuf {
+    PathBuf::from("/private/tmp/tunnel-gateway.log")
 }
 
 fn read_optional_json<T>(path: &Path) -> Result<Option<T>>
