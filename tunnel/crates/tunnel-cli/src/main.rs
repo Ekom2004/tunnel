@@ -361,6 +361,7 @@ fn main() -> Result<()> {
 
 fn run_connect(args: ConnectArgs) -> Result<()> {
     preflight_connect_args(&args)?;
+    reconcile_before_connect(&args)?;
 
     let gateway_bin = sibling_binary("tunnel-gateway")?;
     let agent_bin = sibling_binary("tunnel-agent")?;
@@ -1140,11 +1141,26 @@ fn check_probe(target: &str, timeout_secs: f64, checks: &mut Vec<DoctorCheck>) -
 }
 
 fn pid_is_running(pid: u32) -> Result<bool> {
-    let status = Command::new("kill")
+    let output = Command::new("kill")
         .args(["-0", &pid.to_string()])
-        .status()
+        .output()
         .with_context(|| format!("failed to check pid {pid}"))?;
-    Ok(status.success())
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Operation not permitted") {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn pid_is_running_optional(pid: Option<u32>) -> Result<bool> {
+    pid.map(pid_is_running)
+        .transpose()
+        .map(|value| value.unwrap_or(false))
 }
 
 fn expected_gateway_tunnel_subnet(config: Option<&TunnelConfig>) -> Result<Option<String>> {
@@ -1492,6 +1508,96 @@ fn run_cleanup_binary(binary: &Path, args: &[&str]) -> Result<()> {
 fn preflight_connect_args(args: &ConnectArgs) -> Result<()> {
     validate_config_file("agent config", &args.agent_config)?;
     validate_config_file("gateway config", &args.gateway_config)?;
+    Ok(())
+}
+
+fn reconcile_before_connect(args: &ConnectArgs) -> Result<()> {
+    let existing_session = read_optional_json::<SessionManifest>(&args.session_file)?;
+
+    if let Some(session) = existing_session {
+        let agent_running = pid_is_running_optional(session.agent_pid)?;
+        let gateway_running = pid_is_running_optional(session.gateway_pid)?;
+
+        if agent_running || gateway_running {
+            bail!(
+                "Tunnel is already running or partially running: agent_pid={:?} running={} gateway_pid={:?} running={}. Run tunnel-cli status or tunnel-cli disconnect first.",
+                session.agent_pid,
+                agent_running,
+                session.gateway_pid,
+                gateway_running
+            );
+        }
+
+        eprintln!(
+            "stale Tunnel session found at {}; reconciling before connect",
+            args.session_file.display()
+        );
+    }
+
+    cleanup_stale_tunnel_state(args)?;
+    remove_stale_file("session", &args.session_file)?;
+
+    Ok(())
+}
+
+fn remove_stale_file(label: &str, path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to remove stale {label} file {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn cleanup_stale_tunnel_state(args: &ConnectArgs) -> Result<()> {
+    let agent_bin = sibling_binary("tunnel-agent")?;
+    let gateway_bin = sibling_binary("tunnel-gateway")?;
+
+    if args.agent_state_file.exists() {
+        eprintln!(
+            "cleaning stale agent state using {}",
+            args.agent_state_file.display()
+        );
+        run_cleanup_binary(
+            &agent_bin,
+            &[
+                "--config",
+                path_arg(&args.agent_config)?,
+                "--cleanup-only",
+                "--route-mode",
+                mode_str(args.route_mode),
+                "--state-file",
+                path_arg(&args.agent_state_file)?,
+                "--status-file",
+                path_arg(&args.agent_status_file)?,
+            ],
+        )?;
+    } else {
+        remove_stale_file("agent status", &args.agent_status_file)?;
+    }
+
+    if args.gateway_state_file.exists() {
+        eprintln!(
+            "cleaning stale gateway state using {}",
+            args.gateway_state_file.display()
+        );
+        run_cleanup_binary(
+            &gateway_bin,
+            &[
+                "--cleanup-only",
+                "--forwarding-mode",
+                mode_str(args.forwarding_mode),
+                "--nat-mode",
+                mode_str(args.nat_mode),
+                "--state-file",
+                path_arg(&args.gateway_state_file)?,
+                "--status-file",
+                path_arg(&args.gateway_status_file)?,
+            ],
+        )?;
+    } else {
+        remove_stale_file("gateway status", &args.gateway_status_file)?;
+    }
+
     Ok(())
 }
 
