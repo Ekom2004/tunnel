@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,8 +13,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tunnel_shared::{
-    now_unix_secs, AgentRuntimeState, GatewayRuntimeState, HealthState, RuntimeStatus,
-    TunnelConfig, TunnelPhase,
+    now_unix_secs, AgentRuntimeState, GatewayRuntimeState, HealthState, PacketPathTelemetry,
+    RuntimeStatus, TunnelConfig, TunnelPhase,
 };
 
 #[derive(Debug, Parser)]
@@ -286,6 +286,21 @@ struct ByteSnapshot {
 struct ByteDelta {
     ingress_delta: i64,
     egress_delta: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PacketPathDelta {
+    tun_read_packets_delta: i64,
+    tun_read_bytes_delta: i64,
+    tun_write_packets_delta: i64,
+    tun_write_bytes_delta: i64,
+    udp_rx_packets_delta: i64,
+    udp_rx_bytes_delta: i64,
+    udp_tx_packets_delta: i64,
+    udp_tx_bytes_delta: i64,
+    wireguard_encapsulated_packets_delta: i64,
+    wireguard_decapsulated_packets_delta: i64,
+    last_packet_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -661,6 +676,10 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         &session.egress_interface,
         &mut checks,
     )?;
+    let agent_packet_before = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?
+        .map(|status| status.packet_path);
+    let gateway_packet_before = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?
+        .map(|status| status.packet_path);
     let probe_passed = check_probe(&args.target, args.probe_timeout_secs, &mut checks)?;
     if probe_passed {
         wait_for_active_status_after_probe(&session, args.post_probe_settle_secs)?;
@@ -668,6 +687,14 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
 
     let agent_status = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
     let gateway_status = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
+    check_packet_path_analysis(
+        probe_passed,
+        agent_packet_before.as_ref(),
+        agent_status.as_ref().map(|status| &status.packet_path),
+        gateway_packet_before.as_ref(),
+        gateway_status.as_ref().map(|status| &status.packet_path),
+        &mut checks,
+    );
     check_runtime_status(
         "agent_status",
         agent_status.as_ref(),
@@ -1149,6 +1176,132 @@ fn check_probe(target: &str, timeout_secs: f64, checks: &mut Vec<DoctorCheck>) -
     }
 }
 
+fn check_packet_path_analysis(
+    probe_passed: bool,
+    agent_before: Option<&PacketPathTelemetry>,
+    agent_after: Option<&PacketPathTelemetry>,
+    gateway_before: Option<&PacketPathTelemetry>,
+    gateway_after: Option<&PacketPathTelemetry>,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let Some(agent_delta) = packet_path_delta(agent_before, agent_after) else {
+        checks.push(doctor_check(
+            "packet_path_analysis",
+            DoctorState::Warn,
+            "agent packet-path telemetry is unavailable",
+        ));
+        return;
+    };
+    let Some(gateway_delta) = packet_path_delta(gateway_before, gateway_after) else {
+        checks.push(doctor_check(
+            "packet_path_analysis",
+            DoctorState::Warn,
+            "gateway packet-path telemetry is unavailable",
+        ));
+        return;
+    };
+
+    if let Some(error) = agent_delta
+        .last_packet_error
+        .as_ref()
+        .or(gateway_delta.last_packet_error.as_ref())
+    {
+        checks.push(doctor_check(
+            "packet_path_analysis",
+            DoctorState::Fail,
+            format!("packet-path error observed: {error}"),
+        ));
+        return;
+    }
+
+    let detail = format!(
+        "agent tun_read_packets_delta={} udp_tx_packets_delta={} wg_encapsulated_delta={}; gateway udp_rx_packets_delta={} wg_decapsulated_delta={} tun_write_packets_delta={}",
+        agent_delta.tun_read_packets_delta,
+        agent_delta.udp_tx_packets_delta,
+        agent_delta.wireguard_encapsulated_packets_delta,
+        gateway_delta.udp_rx_packets_delta,
+        gateway_delta.wireguard_decapsulated_packets_delta,
+        gateway_delta.tun_write_packets_delta
+    );
+
+    if probe_passed {
+        checks.push(doctor_check(
+            "packet_path_analysis",
+            DoctorState::Pass,
+            format!("probe passed; packet path moved successfully. {detail}"),
+        ));
+        return;
+    }
+
+    let (state, reason) = if agent_delta.tun_read_packets_delta <= 0 {
+        (
+            DoctorState::Fail,
+            "traffic did not enter the agent TUN; likely route/capture issue",
+        )
+    } else if agent_delta.wireguard_encapsulated_packets_delta <= 0 {
+        (
+            DoctorState::Fail,
+            "agent read packets but did not encapsulate them; likely WireGuard encapsulation issue",
+        )
+    } else if agent_delta.udp_tx_packets_delta <= 0 {
+        (
+            DoctorState::Fail,
+            "agent encapsulated packets but did not send UDP; likely UDP send/peer endpoint issue",
+        )
+    } else if gateway_delta.udp_rx_packets_delta <= 0 {
+        (
+            DoctorState::Fail,
+            "agent sent UDP but gateway did not receive it; likely UDP path/listener issue",
+        )
+    } else if gateway_delta.wireguard_decapsulated_packets_delta <= 0 {
+        (
+            DoctorState::Fail,
+            "gateway received UDP but did not decapsulate packets; likely WireGuard key/session issue",
+        )
+    } else if gateway_delta.tun_write_packets_delta <= 0 {
+        (
+            DoctorState::Fail,
+            "gateway decapsulated packets but did not write to TUN; likely gateway TUN write issue",
+        )
+    } else {
+        (
+            DoctorState::Fail,
+            "packets reached gateway TUN but probe failed; likely gateway egress/NAT/return-path issue",
+        )
+    };
+
+    checks.push(doctor_check(
+        "packet_path_analysis",
+        state,
+        format!("{reason}. {detail}"),
+    ));
+}
+
+fn packet_path_delta(
+    before: Option<&PacketPathTelemetry>,
+    after: Option<&PacketPathTelemetry>,
+) -> Option<PacketPathDelta> {
+    let (before, after) = (before?, after?);
+    Some(PacketPathDelta {
+        tun_read_packets_delta: after.tun_read_packets as i64 - before.tun_read_packets as i64,
+        tun_read_bytes_delta: after.tun_read_bytes as i64 - before.tun_read_bytes as i64,
+        tun_write_packets_delta: after.tun_write_packets as i64 - before.tun_write_packets as i64,
+        tun_write_bytes_delta: after.tun_write_bytes as i64 - before.tun_write_bytes as i64,
+        udp_rx_packets_delta: after.udp_rx_packets as i64 - before.udp_rx_packets as i64,
+        udp_rx_bytes_delta: after.udp_rx_bytes as i64 - before.udp_rx_bytes as i64,
+        udp_tx_packets_delta: after.udp_tx_packets as i64 - before.udp_tx_packets as i64,
+        udp_tx_bytes_delta: after.udp_tx_bytes as i64 - before.udp_tx_bytes as i64,
+        wireguard_encapsulated_packets_delta: after.wireguard_encapsulated_packets as i64
+            - before.wireguard_encapsulated_packets as i64,
+        wireguard_decapsulated_packets_delta: after.wireguard_decapsulated_packets as i64
+            - before.wireguard_decapsulated_packets as i64,
+        last_packet_error: after
+            .last_packet_error
+            .clone()
+            .or_else(|| before.last_packet_error.clone()),
+    })
+}
+
 fn wait_for_active_status_after_probe(session: &SessionManifest, settle_secs: u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(settle_secs);
 
@@ -1375,36 +1528,39 @@ fn restart_component(session: &mut SessionManifest, component: ComponentSelectio
 
 fn ping_once(target: &str, timeout_secs: f64) -> Result<Option<f64>> {
     #[cfg(target_os = "macos")]
-    let output = Command::new("ping")
-        .args([
-            "-n",
-            "-c",
-            "1",
-            "-W",
-            &timeout_millis_arg(timeout_secs),
-            target,
-        ])
-        .output()
-        .with_context(|| format!("failed to ping {target}"))?;
+    let output = {
+        let timeout_arg = timeout_millis_arg(timeout_secs);
+        let mut command = Command::new("ping");
+        command.args(["-n", "-c", "1", "-W", &timeout_arg, target]);
+        output_with_timeout(
+            &mut command,
+            Duration::from_secs_f64(timeout_secs.max(1.0) + 2.0),
+            &format!("ping {target}"),
+        )?
+    };
 
     #[cfg(target_os = "linux")]
-    let output = Command::new("ping")
-        .args([
-            "-n",
-            "-c",
-            "1",
-            "-W",
-            &timeout_secs_arg(timeout_secs),
-            target,
-        ])
-        .output()
-        .with_context(|| format!("failed to ping {target}"))?;
+    let output = {
+        let timeout_arg = timeout_secs_arg(timeout_secs);
+        let mut command = Command::new("ping");
+        command.args(["-n", "-c", "1", "-W", &timeout_arg, target]);
+        output_with_timeout(
+            &mut command,
+            Duration::from_secs_f64(timeout_secs.max(1.0) + 2.0),
+            &format!("ping {target}"),
+        )?
+    };
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let output = Command::new("ping")
-        .args(["-c", "1", target])
-        .output()
-        .with_context(|| format!("failed to ping {target}"))?;
+    let output = {
+        let mut command = Command::new("ping");
+        command.args(["-c", "1", target]);
+        output_with_timeout(
+            &mut command,
+            Duration::from_secs_f64(timeout_secs.max(1.0) + 2.0),
+            &format!("ping {target}"),
+        )?
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1416,6 +1572,38 @@ fn ping_once(target: &str, timeout_secs: f64) -> Result<Option<f64>> {
     }
 
     Ok(extract_time_ms(&stdout))
+}
+
+fn output_with_timeout(command: &mut Command, timeout: Duration, label: &str) -> Result<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {label}"))?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to poll {label}"))?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect {label} output"));
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("failed to collect timed-out {label} output"))?;
+            eprintln!("{label} timed out after {:.1}s", timeout.as_secs_f64());
+            return Ok(output);
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn extract_time_ms(output: &str) -> Option<f64> {
