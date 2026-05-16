@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{self, Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -68,34 +68,62 @@ struct ConnectArgs {
     tenant: String,
     #[arg(long)]
     attachment: String,
-    #[arg(long, default_value = "/private/tmp/tunnel-agent-wg.json")]
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-agent-wg.json")]
     agent_config: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-gateway-wg.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-gateway-wg.json"
+    )]
     gateway_config: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-agent-state.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-agent-state.json"
+    )]
     agent_state_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-agent-status.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-agent-status.json"
+    )]
     agent_status_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-gateway-state.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-gateway-state.json"
+    )]
     gateway_state_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-gateway-status.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-gateway-status.json"
+    )]
     gateway_status_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-agent.log")]
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-agent.log")]
     agent_log_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-gateway.log")]
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-gateway.log")]
     gateway_log_file: PathBuf,
-    #[arg(long, default_value = "en0")]
+    #[arg(long, hide = true, default_value = "en0")]
     egress_interface: String,
-    #[arg(long, value_enum, default_value_t = SystemCommandMode::Apply)]
+    #[arg(long, hide = true, value_enum, default_value_t = SystemCommandMode::Apply)]
     route_mode: SystemCommandMode,
-    #[arg(long, value_enum, default_value_t = SystemCommandMode::Apply)]
+    #[arg(long, hide = true, value_enum, default_value_t = SystemCommandMode::Apply)]
     forwarding_mode: SystemCommandMode,
-    #[arg(long, value_enum, default_value_t = SystemCommandMode::Apply)]
+    #[arg(long, hide = true, value_enum, default_value_t = SystemCommandMode::Apply)]
     nat_mode: SystemCommandMode,
-    #[arg(long, default_value_t = 12)]
+    #[arg(long, hide = true, default_value_t = 12)]
     ready_timeout_secs: u64,
+    #[arg(long, hide = true)]
+    oneshot: bool,
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-supervisor.log"
+    )]
+    supervisor_log_file: PathBuf,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -148,8 +176,6 @@ struct RestartArgs {
 struct SupervisorArgs {
     #[command(flatten)]
     connect: ConnectArgs,
-    #[arg(long, default_value = "/private/tmp/tunnel-supervisor.log")]
-    supervisor_log_file: PathBuf,
     #[arg(long, default_value_t = 2)]
     monitor_interval_secs: u64,
     #[arg(long, default_value_t = 15)]
@@ -188,7 +214,7 @@ struct DoctorArgs {
     probe_timeout_secs: f64,
     #[arg(long, default_value_t = 15)]
     stale_after_secs: u64,
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = 15)]
     post_probe_settle_secs: u64,
 }
 
@@ -250,6 +276,12 @@ struct SessionManifest {
     nat_mode: SystemCommandMode,
     agent_pid: Option<u32>,
     gateway_pid: Option<u32>,
+    #[serde(default)]
+    supervised: bool,
+    #[serde(default)]
+    supervisor_pid: Option<u32>,
+    #[serde(default = "default_supervisor_log_file")]
+    supervisor_log_file: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -406,6 +438,83 @@ fn main() -> Result<()> {
 }
 
 fn run_connect(args: ConnectArgs) -> Result<()> {
+    if args.oneshot {
+        return run_connect_oneshot(args);
+    }
+
+    run_connect_supervised(args)
+}
+
+fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
+    preflight_connect_args(&args)?;
+
+    if let Some(session) = read_optional_json::<SessionManifest>(&args.session_file)? {
+        let supervisor_running = pid_is_running_optional(session.supervisor_pid)?;
+        let agent_running = pid_is_running_optional(session.agent_pid)?;
+        let gateway_running = pid_is_running_optional(session.gateway_pid)?;
+        if supervisor_running && agent_running && gateway_running {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "tenant": session.tenant,
+                    "attachment": session.attachment,
+                    "supervised": true,
+                    "supervisor_pid": session.supervisor_pid,
+                    "agent_pid": session.agent_pid,
+                    "gateway_pid": session.gateway_pid,
+                    "agent_log_file": session.agent_log_file,
+                    "gateway_log_file": session.gateway_log_file,
+                    "supervisor_log_file": session.supervisor_log_file,
+                    "ready": true,
+                    "session_file": args.session_file,
+                }))?
+            );
+            return Ok(());
+        }
+    }
+
+    let supervisor_log_file = args.supervisor_log_file.clone();
+    let (supervisor_stdout, supervisor_stderr) = log_stdio(&supervisor_log_file, true)?;
+    let current_exe = env::current_exe().context("failed to resolve current executable")?;
+    let mut supervisor = Command::new(&current_exe);
+    supervisor
+        .arg("supervise")
+        .stdin(Stdio::null())
+        .stdout(supervisor_stdout)
+        .stderr(supervisor_stderr);
+    append_connect_args(&mut supervisor, &args);
+    supervisor
+        .arg("--supervisor-log-file")
+        .arg(&supervisor_log_file);
+
+    let child = supervisor
+        .spawn()
+        .with_context(|| format!("failed to spawn supervisor {}", current_exe.display()))?;
+    let supervisor_pid = child.id();
+    wait_for_supervised_connect_ready(&args, supervisor_pid)?;
+
+    let session = load_manifest(&args.session_file)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "tenant": session.tenant,
+            "attachment": session.attachment,
+            "supervised": true,
+            "supervisor_pid": session.supervisor_pid.or(Some(supervisor_pid)),
+            "agent_pid": session.agent_pid,
+            "gateway_pid": session.gateway_pid,
+            "agent_log_file": session.agent_log_file,
+            "gateway_log_file": session.gateway_log_file,
+            "supervisor_log_file": session.supervisor_log_file,
+            "ready": true,
+            "session_file": args.session_file,
+        }))?
+    );
+
+    Ok(())
+}
+
+fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
     preflight_connect_args(&args)?;
     reconcile_before_connect(&args)?;
 
@@ -489,6 +598,9 @@ fn run_connect(args: ConnectArgs) -> Result<()> {
         nat_mode: args.nat_mode,
         agent_pid: Some(agent_child.id()),
         gateway_pid: Some(gateway_child.id()),
+        supervised: false,
+        supervisor_pid: None,
+        supervisor_log_file: args.supervisor_log_file.clone(),
     };
     save_manifest(&args.session_file, &manifest)?;
 
@@ -499,8 +611,11 @@ fn run_connect(args: ConnectArgs) -> Result<()> {
             "attachment": args.attachment,
             "gateway_pid": gateway_child.id(),
             "agent_pid": agent_child.id(),
+            "supervised": false,
+            "supervisor_pid": null,
             "agent_log_file": args.agent_log_file,
             "gateway_log_file": args.gateway_log_file,
+            "supervisor_log_file": args.supervisor_log_file,
             "agent_status_file": args.agent_status_file,
             "gateway_status_file": args.gateway_status_file,
             "ready": true,
@@ -589,6 +704,12 @@ fn run_logs(args: LogsArgs) -> Result<()> {
 fn run_disconnect(args: DisconnectArgs) -> Result<()> {
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
     if let Some(session) = &session {
+        terminate_pid_except_self(session.supervisor_pid)?;
+        wait_for_pid_exit_except_self(
+            session.supervisor_pid,
+            "supervisor",
+            Duration::from_secs(3),
+        )?;
         terminate_pid(session.agent_pid)?;
         terminate_pid(session.gateway_pid)?;
     }
@@ -662,7 +783,7 @@ fn run_restart(args: RestartArgs) -> Result<()> {
 
 fn run_supervisor(args: SupervisorArgs) -> Result<()> {
     preflight_connect_args(&args.connect)?;
-    let mut supervisor_log = open_log_file(&args.supervisor_log_file, true)?;
+    let mut supervisor_log = open_log_file(&args.connect.supervisor_log_file, true)?;
     emit_supervisor_event(
         &mut supervisor_log,
         "supervisor_started",
@@ -790,6 +911,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         agent_status.as_ref(),
         &session.agent_status_file,
         args.stale_after_secs,
+        probe_passed,
         &mut checks,
     );
     check_runtime_status(
@@ -797,6 +919,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         gateway_status.as_ref(),
         &session.gateway_status_file,
         args.stale_after_secs,
+        probe_passed,
         &mut checks,
     );
 
@@ -928,11 +1051,15 @@ fn run_soak(args: SoakArgs) -> Result<()> {
 fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -> Result<()> {
     let existing_session = read_optional_json::<SessionManifest>(&args.connect.session_file)?;
 
-    if let Some(session) = existing_session {
+    if let Some(mut session) = existing_session {
         let agent_running = pid_is_running_optional(session.agent_pid)?;
         let gateway_running = pid_is_running_optional(session.gateway_pid)?;
 
         if agent_running && gateway_running {
+            session.supervised = true;
+            session.supervisor_pid = Some(process::id());
+            session.supervisor_log_file = args.connect.supervisor_log_file.clone();
+            save_manifest(&args.connect.session_file, &session)?;
             emit_supervisor_event(
                 supervisor_log,
                 "session_reused",
@@ -962,8 +1089,14 @@ fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -
         "starting supervised tunnel session",
         None,
     )?;
-    run_connect(args.connect.clone())?;
-    let session = load_manifest(&args.connect.session_file)?;
+    let mut connect_args = args.connect.clone();
+    connect_args.oneshot = true;
+    run_connect_oneshot(connect_args)?;
+    let mut session = load_manifest(&args.connect.session_file)?;
+    session.supervised = true;
+    session.supervisor_pid = Some(process::id());
+    session.supervisor_log_file = args.connect.supervisor_log_file.clone();
+    save_manifest(&args.connect.session_file, &session)?;
     emit_supervisor_event(
         supervisor_log,
         "session_connect_ready",
@@ -1288,6 +1421,7 @@ fn check_runtime_status(
     status: Option<&RuntimeStatus>,
     path: &Path,
     stale_after_secs: u64,
+    probe_passed: bool,
     checks: &mut Vec<DoctorCheck>,
 ) {
     let Some(status) = status else {
@@ -1310,10 +1444,18 @@ fn check_runtime_status(
     }
 
     if status.state != HealthState::Healthy {
+        let state = if probe_passed {
+            DoctorState::Warn
+        } else {
+            DoctorState::Fail
+        };
         checks.push(doctor_check(
             name,
-            DoctorState::Fail,
-            format!("runtime state is {:?}: {}", status.state, status.detail),
+            state,
+            format!(
+                "runtime state is {:?}: {}; probe_passed={probe_passed}",
+                status.state, status.detail
+            ),
         ));
         return;
     }
@@ -2267,6 +2409,52 @@ fn wait_for_connect_ready(args: &ConnectArgs) -> Result<()> {
     }
 }
 
+fn wait_for_supervised_connect_ready(args: &ConnectArgs, supervisor_pid: u32) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(args.ready_timeout_secs);
+
+    loop {
+        if !pid_is_running(supervisor_pid)? {
+            bail!(
+                "tunnel supervisor exited during startup. inspect {}",
+                args.supervisor_log_file.display()
+            );
+        }
+
+        let session = read_optional_json::<SessionManifest>(&args.session_file)?;
+        let agent_status = read_optional_json::<RuntimeStatus>(&args.agent_status_file)?;
+        let gateway_status = read_optional_json::<RuntimeStatus>(&args.gateway_status_file)?;
+        let agent_state = read_optional_json::<AgentRuntimeState>(&args.agent_state_file)?;
+        let gateway_state = read_optional_json::<GatewayRuntimeState>(&args.gateway_state_file)?;
+
+        if session
+            .as_ref()
+            .map(|session| {
+                session.supervised
+                    && session.supervisor_pid == Some(supervisor_pid)
+                    && session.agent_pid.is_some()
+                    && session.gateway_pid.is_some()
+            })
+            .unwrap_or(false)
+            && runtime_status_is_fresh(agent_status.as_ref(), args.ready_timeout_secs)
+            && runtime_status_is_fresh(gateway_status.as_ref(), args.ready_timeout_secs)
+            && agent_state.is_some()
+            && gateway_state.is_some()
+        {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "supervised tunnel did not become ready within {}s. inspect {} or run tunnel-cli logs --component both --lines 80",
+                args.ready_timeout_secs,
+                args.supervisor_log_file.display()
+            );
+        }
+
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn runtime_status_is_fresh(status: Option<&RuntimeStatus>, stale_after_secs: u64) -> bool {
     status
         .map(|status| {
@@ -2354,6 +2542,10 @@ fn default_gateway_log_file() -> PathBuf {
     PathBuf::from("/private/tmp/tunnel-gateway.log")
 }
 
+fn default_supervisor_log_file() -> PathBuf {
+    PathBuf::from("/private/tmp/tunnel-supervisor.log")
+}
+
 fn read_optional_json<T>(path: &Path) -> Result<Option<T>>
 where
     T: serde::de::DeserializeOwned,
@@ -2396,6 +2588,33 @@ fn terminate_pid(pid: Option<u32>) -> Result<()> {
     Ok(())
 }
 
+fn terminate_pid_except_self(pid: Option<u32>) -> Result<()> {
+    if pid == Some(process::id()) {
+        return Ok(());
+    }
+    terminate_pid(pid)
+}
+
+fn wait_for_pid_exit_except_self(pid: Option<u32>, label: &str, timeout: Duration) -> Result<()> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    if pid == process::id() {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_is_running(pid)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    eprintln!("warning: {label} pid {pid} did not exit within {timeout:?}");
+    Ok(())
+}
+
 fn path_arg(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| anyhow!("non-utf8 path is not supported: {}", path.display()))
@@ -2407,4 +2626,40 @@ fn mode_str(mode: SystemCommandMode) -> &'static str {
         SystemCommandMode::Print => "print",
         SystemCommandMode::Apply => "apply",
     }
+}
+
+fn append_connect_args(command: &mut Command, args: &ConnectArgs) {
+    command
+        .arg("--tenant")
+        .arg(&args.tenant)
+        .arg("--attachment")
+        .arg(&args.attachment)
+        .arg("--agent-config")
+        .arg(&args.agent_config)
+        .arg("--gateway-config")
+        .arg(&args.gateway_config)
+        .arg("--agent-state-file")
+        .arg(&args.agent_state_file)
+        .arg("--agent-status-file")
+        .arg(&args.agent_status_file)
+        .arg("--gateway-state-file")
+        .arg(&args.gateway_state_file)
+        .arg("--gateway-status-file")
+        .arg(&args.gateway_status_file)
+        .arg("--session-file")
+        .arg(&args.session_file)
+        .arg("--agent-log-file")
+        .arg(&args.agent_log_file)
+        .arg("--gateway-log-file")
+        .arg(&args.gateway_log_file)
+        .arg("--egress-interface")
+        .arg(&args.egress_interface)
+        .arg("--route-mode")
+        .arg(mode_str(args.route_mode))
+        .arg("--forwarding-mode")
+        .arg(mode_str(args.forwarding_mode))
+        .arg("--nat-mode")
+        .arg(mode_str(args.nat_mode))
+        .arg("--ready-timeout-secs")
+        .arg(args.ready_timeout_secs.to_string());
 }
