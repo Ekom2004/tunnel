@@ -169,6 +169,33 @@ struct ConnectArgs {
     supervisor_log_file: PathBuf,
 }
 
+impl ConnectArgs {
+    fn for_profile(profile: String, profile_file: PathBuf) -> Self {
+        Self {
+            profile: Some(profile),
+            tenant: None,
+            attachment: None,
+            profile_file,
+            agent_config: PathBuf::from("/private/tmp/tunnel-agent-wg.json"),
+            gateway_config: PathBuf::from("/private/tmp/tunnel-gateway-wg.json"),
+            agent_state_file: PathBuf::from("/private/tmp/tunnel-agent-state.json"),
+            agent_status_file: PathBuf::from("/private/tmp/tunnel-agent-status.json"),
+            gateway_state_file: PathBuf::from("/private/tmp/tunnel-gateway-state.json"),
+            gateway_status_file: PathBuf::from("/private/tmp/tunnel-gateway-status.json"),
+            session_file: PathBuf::from("/private/tmp/tunnel-session.json"),
+            agent_log_file: PathBuf::from("/private/tmp/tunnel-agent.log"),
+            gateway_log_file: PathBuf::from("/private/tmp/tunnel-gateway.log"),
+            egress_interface: String::from("en0"),
+            route_mode: SystemCommandMode::Apply,
+            forwarding_mode: SystemCommandMode::Apply,
+            nat_mode: SystemCommandMode::Apply,
+            ready_timeout_secs: 12,
+            oneshot: false,
+            supervisor_log_file: PathBuf::from("/private/tmp/tunnel-supervisor.log"),
+        }
+    }
+}
+
 #[derive(Debug, Args, Clone)]
 struct StatusArgs {
     #[arg(value_name = "PROFILE")]
@@ -565,6 +592,20 @@ struct DoctorCheck {
     detail: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ReadinessReport {
+    ready: bool,
+    profile: Option<String>,
+    checks: Vec<ReadinessCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadinessCheck {
+    name: String,
+    state: DoctorState,
+    detail: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DoctorState {
@@ -750,8 +791,11 @@ fn run_login(args: LoginArgs) -> Result<()> {
     };
     write_profile(profile_args)?;
 
-    let agent_config_ok = validate_config_file("agent config", &args.agent_config).is_ok();
-    let gateway_config_ok = validate_config_file("gateway config", &args.gateway_config).is_ok();
+    let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+        args.profile.clone(),
+        args.profile_file.clone(),
+    ))?;
+    let readiness = build_connect_readiness(&connect_args);
 
     println!(
         "{}",
@@ -760,8 +804,8 @@ fn run_login(args: LoginArgs) -> Result<()> {
             "mode": "local",
             "profile": args.profile,
             "profile_file": args.profile_file,
-            "agent_config_ok": agent_config_ok,
-            "gateway_config_ok": gateway_config_ok,
+            "ready": readiness.ready,
+            "readiness": readiness,
             "next": next,
         }))?
     );
@@ -781,6 +825,115 @@ fn run_profile_init(args: ProfileInitArgs) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+fn build_connect_readiness(args: &ConnectArgs) -> ReadinessReport {
+    let mut checks = Vec::new();
+
+    push_required_string_check(
+        &mut checks,
+        "tenant",
+        args.tenant.as_deref(),
+        "tenant is set",
+        "tenant is missing",
+    );
+    push_required_string_check(
+        &mut checks,
+        "attachment",
+        args.attachment.as_deref(),
+        "attachment is set",
+        "attachment is missing",
+    );
+    push_config_check(&mut checks, "agent_config", &args.agent_config);
+    push_config_check(&mut checks, "gateway_config", &args.gateway_config);
+    push_required_string_check(
+        &mut checks,
+        "egress_interface",
+        Some(args.egress_interface.as_str()),
+        "egress interface is set",
+        "egress interface is empty",
+    );
+    push_mode_check(&mut checks, "route_mode", args.route_mode);
+    push_mode_check(&mut checks, "forwarding_mode", args.forwarding_mode);
+    push_mode_check(&mut checks, "nat_mode", args.nat_mode);
+
+    let ready = checks.iter().all(|check| check.state != DoctorState::Fail);
+    ReadinessReport {
+        ready,
+        profile: args.profile.clone(),
+        checks,
+    }
+}
+
+fn push_required_string_check(
+    checks: &mut Vec<ReadinessCheck>,
+    name: &str,
+    value: Option<&str>,
+    pass_detail: &str,
+    fail_detail: &str,
+) {
+    if value.is_some_and(|value| !value.trim().is_empty()) {
+        checks.push(ReadinessCheck {
+            name: name.to_owned(),
+            state: DoctorState::Pass,
+            detail: pass_detail.to_owned(),
+        });
+    } else {
+        checks.push(ReadinessCheck {
+            name: name.to_owned(),
+            state: DoctorState::Fail,
+            detail: fail_detail.to_owned(),
+        });
+    }
+}
+
+fn push_config_check(checks: &mut Vec<ReadinessCheck>, name: &str, path: &Path) {
+    match validate_config_file(name, path) {
+        Ok(()) => checks.push(ReadinessCheck {
+            name: name.to_owned(),
+            state: DoctorState::Pass,
+            detail: format!("valid config: {}", path.display()),
+        }),
+        Err(error) => checks.push(ReadinessCheck {
+            name: name.to_owned(),
+            state: DoctorState::Fail,
+            detail: error.to_string(),
+        }),
+    }
+}
+
+fn push_mode_check(checks: &mut Vec<ReadinessCheck>, name: &str, mode: SystemCommandMode) {
+    let (state, detail) = if mode == SystemCommandMode::Apply {
+        (DoctorState::Pass, format!("{name} will apply OS state"))
+    } else {
+        (
+            DoctorState::Warn,
+            format!("{name} is {mode:?}; tunnel may not own OS state"),
+        )
+    };
+    checks.push(ReadinessCheck {
+        name: name.to_owned(),
+        state,
+        detail,
+    });
+}
+
+fn bail_if_not_ready(readiness: &ReadinessReport) -> Result<()> {
+    if readiness.ready {
+        return Ok(());
+    }
+
+    let failures = readiness
+        .checks
+        .iter()
+        .filter(|check| check.state == DoctorState::Fail)
+        .map(|check| format!("{}: {}", check.name, check.detail))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let profile = readiness.profile.as_deref().unwrap_or("selected profile");
+    bail!(
+        "tunnel profile {profile:?} is not ready: {failures}. Run tunnel-cli login {profile} --force after fixing the missing config."
+    );
 }
 
 fn write_profile(args: ProfileInitArgs) -> Result<()> {
@@ -3740,8 +3893,8 @@ fn run_command_vec(label: &str, command: Vec<String>) -> Result<()> {
 }
 
 fn preflight_connect_args(args: &ConnectArgs) -> Result<()> {
-    validate_config_file("agent config", &args.agent_config)?;
-    validate_config_file("gateway config", &args.gateway_config)?;
+    let readiness = build_connect_readiness(args);
+    bail_if_not_ready(&readiness)?;
     Ok(())
 }
 
