@@ -252,6 +252,8 @@ struct RepairTestArgs {
     poll_interval_secs: f64,
     #[arg(long, default_value_t = 10)]
     post_repair_probe_attempts: u32,
+    #[arg(long, value_enum, default_value_t = RepairTestMode::Process)]
+    mode: RepairTestMode,
     #[arg(long)]
     component: Option<ComponentSelection>,
 }
@@ -274,6 +276,13 @@ enum LogComponent {
     Agent,
     Gateway,
     Both,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+enum RepairTestMode {
+    Process,
+    State,
+    All,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1145,21 +1154,73 @@ fn run_repair_test(args: RepairTestArgs) -> Result<()> {
         }
     }
 
+    if matches!(args.mode, RepairTestMode::State | RepairTestMode::All) {
+        let old_pid = load_manifest(&args.session_file)?.supervisor_pid;
+        terminate_pid_except_self(old_pid)?;
+        wait_for_pid_exit_except_self(old_pid, "supervisor", Duration::from_secs(5))?;
+        let started_at = Instant::now();
+        match spawn_supervisor_for_connect(&connect_args_from_session(
+            &load_manifest(&args.session_file)?,
+            &args.session_file,
+        )) {
+            Ok((new_pid, _new_session)) => {
+                checks.push(RepairTestCheck {
+                    component: String::from("supervisor_refresh"),
+                    state: DoctorState::Pass,
+                    old_pid,
+                    new_pid: Some(new_pid),
+                    recovery_secs: Some(started_at.elapsed().as_secs_f64()),
+                    probe_rtt_ms: None,
+                    detail: String::from("refreshed supervisor before OS-state repair test"),
+                });
+            }
+            Err(error) => {
+                let session = load_manifest(&args.session_file)?;
+                checks.push(RepairTestCheck {
+                    component: String::from("supervisor_refresh"),
+                    state: DoctorState::Fail,
+                    old_pid,
+                    new_pid: old_pid,
+                    recovery_secs: None,
+                    probe_rtt_ms: None,
+                    detail: format!("failed to refresh supervisor before state test: {error:#}"),
+                });
+                return print_repair_test_report(args.target, session, checks);
+            }
+        }
+    }
+
     let components: Vec<ComponentSelection> = args
         .component
         .map(|component| vec![component])
         .unwrap_or_else(|| vec![ComponentSelection::Agent, ComponentSelection::Gateway]);
 
-    for component in components {
-        checks.push(run_component_repair_test(
-            &args.session_file,
-            component,
-            &args.target,
-            args.probe_timeout_secs,
-            Duration::from_secs(args.recovery_timeout_secs),
-            Duration::from_secs_f64(args.poll_interval_secs.max(0.1)),
-            args.post_repair_probe_attempts,
-        )?);
+    if matches!(args.mode, RepairTestMode::Process | RepairTestMode::All) {
+        for component in &components {
+            checks.push(run_component_repair_test(
+                &args.session_file,
+                *component,
+                &args.target,
+                args.probe_timeout_secs,
+                Duration::from_secs(args.recovery_timeout_secs),
+                Duration::from_secs_f64(args.poll_interval_secs.max(0.1)),
+                args.post_repair_probe_attempts,
+            )?);
+        }
+    }
+
+    if matches!(args.mode, RepairTestMode::State | RepairTestMode::All) {
+        for component in &components {
+            checks.push(run_component_state_repair_test(
+                &args.session_file,
+                *component,
+                &args.target,
+                args.probe_timeout_secs,
+                Duration::from_secs(args.recovery_timeout_secs),
+                Duration::from_secs_f64(args.poll_interval_secs.max(0.1)),
+                args.post_repair_probe_attempts,
+            )?);
+        }
     }
 
     let session = load_manifest(&args.session_file)?;
@@ -1251,6 +1312,81 @@ fn run_component_repair_test(
                     recovery_timeout.as_secs_f64(),
                     status.as_ref().map(|status| &status.phase),
                     status.as_ref().map(|status| &status.state)
+                ),
+            });
+        }
+
+        thread::sleep(poll_interval);
+    }
+}
+
+fn run_component_state_repair_test(
+    session_file: &Path,
+    component: ComponentSelection,
+    target: &str,
+    probe_timeout_secs: f64,
+    recovery_timeout: Duration,
+    poll_interval: Duration,
+    post_repair_probe_attempts: u32,
+) -> Result<RepairTestCheck> {
+    let session = load_manifest(session_file)?;
+    let pid = component_pid(&session, component);
+    let started_at = Instant::now();
+
+    match component {
+        ComponentSelection::Agent => inject_agent_route_drift(&session)?,
+        ComponentSelection::Gateway => inject_gateway_os_state_drift(&session)?,
+    }
+
+    let deadline = started_at + recovery_timeout;
+    loop {
+        let session = load_manifest(session_file)?;
+        let repaired = match component {
+            ComponentSelection::Agent => agent_routes_are_healthy(&session)?,
+            ComponentSelection::Gateway => gateway_os_state_is_healthy(&session)?,
+        };
+
+        if repaired {
+            let probe_rtt_ms = wait_for_probe_success(
+                target,
+                probe_timeout_secs,
+                post_repair_probe_attempts.max(1),
+                poll_interval,
+            )?;
+            let state = if probe_rtt_ms.is_some() {
+                DoctorState::Pass
+            } else {
+                DoctorState::Fail
+            };
+            return Ok(RepairTestCheck {
+                component: format!("{}_state", component_label(component)),
+                state,
+                old_pid: pid,
+                new_pid: component_pid(&session, component),
+                recovery_secs: Some(started_at.elapsed().as_secs_f64()),
+                probe_rtt_ms,
+                detail: if state == DoctorState::Pass {
+                    format!("{} OS state repaired in place", component_label(component))
+                } else {
+                    format!(
+                        "{} OS state repaired, but probe to {target} failed",
+                        component_label(component)
+                    )
+                },
+            });
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(RepairTestCheck {
+                component: format!("{}_state", component_label(component)),
+                state: DoctorState::Fail,
+                old_pid: pid,
+                new_pid: component_pid(&session, component),
+                recovery_secs: None,
+                probe_rtt_ms: None,
+                detail: format!(
+                    "timed out after {:.1}s waiting for OS state repair",
+                    recovery_timeout.as_secs_f64()
                 ),
             });
         }
@@ -1408,6 +1544,31 @@ fn supervise_component(
         );
     }
 
+    match repair_component_os_state(session, component, supervisor_log) {
+        Ok(true) => {
+            emit_supervisor_event(
+                supervisor_log,
+                "component_os_state_repaired",
+                Some(component),
+                format!("{} OS state repaired in place", component_label(component)),
+                Some(session),
+            )?;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            emit_supervisor_event(
+                supervisor_log,
+                "component_os_state_repair_failed",
+                Some(component),
+                format!(
+                    "{} OS state repair failed: {error:#}",
+                    component_label(component)
+                ),
+                Some(session),
+            )?;
+        }
+    }
+
     if status.state != HealthState::Healthy || status.phase != TunnelPhase::Active {
         emit_supervisor_event(
             supervisor_log,
@@ -1548,6 +1709,235 @@ fn restart_supervised_component(
     )?;
 
     Ok(true)
+}
+
+fn repair_component_os_state(
+    session: &SessionManifest,
+    component: ComponentSelection,
+    supervisor_log: &mut File,
+) -> Result<bool> {
+    match component {
+        ComponentSelection::Agent => repair_agent_routes(session, supervisor_log),
+        ComponentSelection::Gateway => repair_gateway_os_state(session, supervisor_log),
+    }
+}
+
+fn repair_agent_routes(session: &SessionManifest, supervisor_log: &mut File) -> Result<bool> {
+    let Some(state) = read_optional_json::<AgentRuntimeState>(&session.agent_state_file)? else {
+        return Ok(false);
+    };
+    let mut repaired = false;
+
+    for cidr in &state.destination_cidrs {
+        let target = cidr_route_probe_target(cidr);
+        match route_interface_for_target(&target)? {
+            Some(interface) if interface == state.tunnel_interface => {}
+            observed_interface => {
+                apply_agent_route(cidr, &state.tunnel_interface, observed_interface.as_deref())?;
+                emit_supervisor_event(
+                    supervisor_log,
+                    "agent_route_repaired",
+                    Some(ComponentSelection::Agent),
+                    format!(
+                        "route {cidr} repaired to interface {}; previous_interface={observed_interface:?}",
+                        state.tunnel_interface
+                    ),
+                    Some(session),
+                )?;
+                repaired = true;
+            }
+        }
+    }
+
+    Ok(repaired)
+}
+
+fn agent_routes_are_healthy(session: &SessionManifest) -> Result<bool> {
+    let Some(state) = read_optional_json::<AgentRuntimeState>(&session.agent_state_file)? else {
+        return Ok(false);
+    };
+
+    for cidr in &state.destination_cidrs {
+        let target = cidr_route_probe_target(cidr);
+        if route_interface_for_target(&target)? != Some(state.tunnel_interface.clone()) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn inject_agent_route_drift(session: &SessionManifest) -> Result<()> {
+    let Some(state) = read_optional_json::<AgentRuntimeState>(&session.agent_state_file)? else {
+        bail!("agent state file is missing");
+    };
+
+    for cidr in &state.destination_cidrs {
+        let _ = delete_agent_route(cidr, &state.tunnel_interface);
+    }
+
+    Ok(())
+}
+
+fn delete_agent_route(cidr: &str, interface_name: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = interface_name;
+        return run_command_vec(
+            "agent route drift injection",
+            vec![
+                String::from("route"),
+                String::from("-n"),
+                String::from("delete"),
+                String::from("-net"),
+                cidr.to_owned(),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return run_command_vec(
+            "agent route drift injection",
+            vec![
+                String::from("ip"),
+                String::from("route"),
+                String::from("del"),
+                cidr.to_owned(),
+                String::from("dev"),
+                interface_name.to_owned(),
+            ],
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (cidr, interface_name);
+        Ok(())
+    }
+}
+
+fn repair_gateway_os_state(session: &SessionManifest, supervisor_log: &mut File) -> Result<bool> {
+    let Some(state) = read_optional_json::<GatewayRuntimeState>(&session.gateway_state_file)?
+    else {
+        return Ok(false);
+    };
+    let gateway_config = read_optional_json::<TunnelConfig>(&session.gateway_config)?;
+    let mut repaired = false;
+
+    if !ip_forwarding_enabled()? {
+        enable_ip_forwarding()?;
+        emit_supervisor_event(
+            supervisor_log,
+            "gateway_forwarding_repaired",
+            Some(ComponentSelection::Gateway),
+            "IP forwarding was disabled and has been re-enabled",
+            Some(session),
+        )?;
+        repaired = true;
+    }
+
+    if repair_gateway_pf_rules_if_needed(&state, gateway_config.as_ref(), session)? {
+        emit_supervisor_event(
+            supervisor_log,
+            "gateway_pf_repaired",
+            Some(ComponentSelection::Gateway),
+            "PF/NAT rules were missing or stale and have been re-applied",
+            Some(session),
+        )?;
+        repaired = true;
+    }
+
+    Ok(repaired)
+}
+
+fn gateway_os_state_is_healthy(session: &SessionManifest) -> Result<bool> {
+    let Some(state) = read_optional_json::<GatewayRuntimeState>(&session.gateway_state_file)?
+    else {
+        return Ok(false);
+    };
+    let gateway_config = read_optional_json::<TunnelConfig>(&session.gateway_config)?;
+    let forwarding_ok = ip_forwarding_enabled()?;
+    let anchor_ok = state
+        .nat_anchor_name
+        .as_deref()
+        .map(gateway_pf_anchor_has_rules)
+        .transpose()?
+        .unwrap_or(false);
+    let rules_ok = if let Some(path) = state.nat_rules_path.as_ref() {
+        if path.exists() {
+            let rules = fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            gateway_pf_rules_text_is_valid(
+                &rules,
+                &state.tunnel_interface,
+                state
+                    .egress_interface
+                    .as_deref()
+                    .unwrap_or(&session.egress_interface),
+                expected_gateway_tunnel_subnet(gateway_config.as_ref())?.as_deref(),
+            )
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    Ok(forwarding_ok && anchor_ok && rules_ok)
+}
+
+fn inject_gateway_os_state_drift(session: &SessionManifest) -> Result<()> {
+    let Some(state) = read_optional_json::<GatewayRuntimeState>(&session.gateway_state_file)?
+    else {
+        bail!("gateway state file is missing");
+    };
+
+    if let Some(anchor_name) = state.nat_anchor_name.as_deref() {
+        let _ = run_command_vec(
+            "gateway PF drift injection",
+            vec![
+                String::from("pfctl"),
+                String::from("-a"),
+                anchor_name.to_owned(),
+                String::from("-F"),
+                String::from("all"),
+            ],
+        );
+    }
+
+    disable_ip_forwarding()
+}
+
+fn disable_ip_forwarding() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return run_command_vec(
+            "gateway forwarding drift injection",
+            vec![
+                String::from("sysctl"),
+                String::from("-w"),
+                String::from("net.inet.ip.forwarding=0"),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return run_command_vec(
+            "gateway forwarding drift injection",
+            vec![
+                String::from("sysctl"),
+                String::from("-w"),
+                String::from("net.ipv4.ip_forward=0"),
+            ],
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(())
+    }
 }
 
 fn emit_supervisor_event(
@@ -1960,6 +2350,301 @@ fn check_gateway_pf_rules(
     }
 
     Ok(())
+}
+
+fn cidr_route_probe_target(cidr: &str) -> String {
+    cidr.split('/').next().unwrap_or(cidr).to_owned()
+}
+
+fn apply_agent_route(
+    cidr: &str,
+    interface_name: &str,
+    observed_interface: Option<&str>,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = observed_interface;
+        let add_result = run_command_vec(
+            "agent route repair",
+            vec![
+                String::from("route"),
+                String::from("-n"),
+                String::from("add"),
+                String::from("-net"),
+                cidr.to_owned(),
+                String::from("-interface"),
+                interface_name.to_owned(),
+            ],
+        );
+        if add_result.is_ok() {
+            return Ok(());
+        }
+
+        return run_command_vec(
+            "agent route repair",
+            vec![
+                String::from("route"),
+                String::from("-n"),
+                String::from("change"),
+                String::from("-net"),
+                cidr.to_owned(),
+                String::from("-interface"),
+                interface_name.to_owned(),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = observed_interface;
+        return run_command_vec(
+            "agent route repair",
+            vec![
+                String::from("ip"),
+                String::from("route"),
+                String::from("replace"),
+                cidr.to_owned(),
+                String::from("dev"),
+                interface_name.to_owned(),
+            ],
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (cidr, interface_name, observed_interface);
+        Ok(())
+    }
+}
+
+fn ip_forwarding_enabled() -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("sysctl")
+            .args(["-n", "net.inet.ip.forwarding"])
+            .output()
+            .context("failed to query net.inet.ip.forwarding")?;
+        if !output.status.success() {
+            bail!(
+                "failed to query net.inet.ip.forwarding: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout).trim() == "1");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("sysctl")
+            .args(["-n", "net.ipv4.ip_forward"])
+            .output()
+            .context("failed to query net.ipv4.ip_forward")?;
+        if !output.status.success() {
+            bail!(
+                "failed to query net.ipv4.ip_forward: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return Ok(String::from_utf8_lossy(&output.stdout).trim() == "1");
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(true)
+    }
+}
+
+fn enable_ip_forwarding() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return run_command_vec(
+            "gateway forwarding repair",
+            vec![
+                String::from("sysctl"),
+                String::from("-w"),
+                String::from("net.inet.ip.forwarding=1"),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return run_command_vec(
+            "gateway forwarding repair",
+            vec![
+                String::from("sysctl"),
+                String::from("-w"),
+                String::from("net.ipv4.ip_forward=1"),
+            ],
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Ok(())
+    }
+}
+
+fn repair_gateway_pf_rules_if_needed(
+    state: &GatewayRuntimeState,
+    gateway_config: Option<&TunnelConfig>,
+    session: &SessionManifest,
+) -> Result<bool> {
+    let Some(anchor_name) = state.nat_anchor_name.as_deref() else {
+        return Ok(false);
+    };
+    let Some(rules_path) = state.nat_rules_path.as_ref() else {
+        return Ok(false);
+    };
+
+    let egress_interface = state
+        .egress_interface
+        .as_deref()
+        .unwrap_or(&session.egress_interface);
+    let expected_subnet = expected_gateway_tunnel_subnet(gateway_config)?;
+    let mut needs_repair = !rules_path.exists();
+
+    if !needs_repair {
+        let rules = fs::read_to_string(rules_path)
+            .with_context(|| format!("failed to read {}", rules_path.display()))?;
+        needs_repair = !gateway_pf_rules_text_is_valid(
+            &rules,
+            &state.tunnel_interface,
+            egress_interface,
+            expected_subnet.as_deref(),
+        );
+    }
+
+    if !gateway_pf_anchor_has_rules(anchor_name)? {
+        needs_repair = true;
+    }
+
+    if !needs_repair {
+        return Ok(false);
+    }
+
+    let rules = build_gateway_pf_rules(
+        &state.tunnel_interface,
+        egress_interface,
+        expected_subnet.as_deref(),
+    )?;
+    if let Some(parent) = rules_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(rules_path, rules)
+        .with_context(|| format!("failed to write {}", rules_path.display()))?;
+    run_command_vec(
+        "gateway nat repair",
+        vec![String::from("pfctl"), String::from("-E")],
+    )?;
+    run_command_vec(
+        "gateway nat repair",
+        vec![
+            String::from("pfctl"),
+            String::from("-a"),
+            anchor_name.to_owned(),
+            String::from("-f"),
+            rules_path.to_string_lossy().into_owned(),
+        ],
+    )?;
+
+    Ok(true)
+}
+
+fn gateway_pf_rules_text_is_valid(
+    rules: &str,
+    tunnel_interface: &str,
+    egress_interface: &str,
+    expected_subnet: Option<&str>,
+) -> bool {
+    rules.contains(&format!("nat on {egress_interface}"))
+        && rules.contains(&format!("pass in quick on {tunnel_interface}"))
+        && expected_subnet
+            .map(|subnet| rules.contains(subnet))
+            .unwrap_or(true)
+        && {
+            #[cfg(target_os = "macos")]
+            {
+                rules.contains("route-to")
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                true
+            }
+        }
+}
+
+fn gateway_pf_anchor_has_rules(anchor_name: &str) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("pfctl")
+            .args(["-a", anchor_name, "-s", "rules"])
+            .output()
+            .context("failed to inspect PF anchor")?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        return Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = anchor_name;
+        Ok(true)
+    }
+}
+
+fn build_gateway_pf_rules(
+    tunnel_interface: &str,
+    egress_interface: &str,
+    expected_subnet: Option<&str>,
+) -> Result<String> {
+    let subnet =
+        expected_subnet.ok_or_else(|| anyhow!("gateway config missing expected tunnel subnet"))?;
+    let egress_gateway = query_macos_default_gateway(egress_interface)?;
+    let route_to = egress_gateway
+        .as_deref()
+        .map(|gateway| format!(" route-to ({egress_interface} {gateway})"))
+        .unwrap_or_default();
+
+    Ok(format!(
+        "nat on {egress_interface} from {subnet} to any -> ({egress_interface})\n\
+pass out quick on {egress_interface} inet from {subnet} to any keep state\n\
+pass in quick on {tunnel_interface}{route_to} inet from {subnet} to any keep state\n\
+pass out quick on {tunnel_interface} inet from any to {subnet} keep state\n"
+    ))
+}
+
+fn query_macos_default_gateway(egress_interface: &str) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("route")
+            .args(["-n", "get", "default"])
+            .output()
+            .context("failed to query macOS default route")?;
+        if !output.status.success() {
+            bail!(
+                "failed to query macOS default route\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let gateway = parse_route_get_field(&stdout, "gateway");
+        let interface = parse_route_get_field(&stdout, "interface");
+        if interface.as_deref() == Some(egress_interface) {
+            return Ok(gateway);
+        }
+        Ok(None)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = egress_interface;
+        Ok(None)
+    }
 }
 
 fn check_probe(target: &str, timeout_secs: f64, checks: &mut Vec<DoctorCheck>) -> Result<bool> {
@@ -2533,6 +3218,25 @@ fn run_cleanup_binary(binary: &Path, args: &[&str]) -> Result<()> {
         bail!("cleanup command failed for {}", binary.display());
     }
 
+    Ok(())
+}
+
+fn run_command_vec(label: &str, command: Vec<String>) -> Result<()> {
+    let rendered = command.join(" ");
+    let Some((binary, args)) = command.split_first() else {
+        bail!("{label} command is empty");
+    };
+    let output = Command::new(binary)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute {label} command: {rendered}"))?;
+    if !output.status.success() {
+        bail!(
+            "{label} command failed: {rendered}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     Ok(())
 }
 
