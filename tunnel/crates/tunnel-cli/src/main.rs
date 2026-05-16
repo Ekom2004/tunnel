@@ -66,10 +66,19 @@ enum CommandKind {
     Supervise(SupervisorArgs),
     Doctor(DoctorArgs),
     Logs(LogsArgs),
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
     #[command(hide = true)]
     Soak(SoakArgs),
     #[command(hide = true)]
     RepairTest(RepairTestArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    Init(ProfileInitArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -281,6 +290,26 @@ struct DoctorArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct ProfileInitArgs {
+    #[arg(value_name = "PROFILE", default_value = "local-dev")]
+    profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, default_value = "local-tenant")]
+    tenant: String,
+    #[arg(long)]
+    attachment: Option<String>,
+    #[arg(long, default_value = "/private/tmp/tunnel-agent-wg.json")]
+    agent_config: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-gateway-wg.json")]
+    gateway_config: PathBuf,
+    #[arg(long, default_value = "en0")]
+    egress_interface: String,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
 struct SoakArgs {
     #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
@@ -481,13 +510,13 @@ struct RepairTestCheck {
     detail: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ProfileConfig {
     default: Option<String>,
     profiles: Vec<TunnelProfile>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TunnelProfile {
     name: String,
     tenant: String,
@@ -568,6 +597,9 @@ fn main() -> Result<()> {
         CommandKind::Supervise(args) => run_supervisor(args)?,
         CommandKind::Doctor(args) => run_doctor(args)?,
         CommandKind::Logs(args) => run_logs(args)?,
+        CommandKind::Profile {
+            command: ProfileCommand::Init(args),
+        } => run_profile_init(args)?,
         CommandKind::Soak(args) => run_soak(args)?,
         CommandKind::RepairTest(args) => run_repair_test(args)?,
     }
@@ -682,6 +714,81 @@ fn required_connect_value<'a>(value: Option<&'a String>, label: &str) -> Result<
     value
         .map(String::as_str)
         .ok_or_else(|| anyhow!("resolved connect args missing {label}"))
+}
+
+fn run_profile_init(args: ProfileInitArgs) -> Result<()> {
+    let attachment = args
+        .attachment
+        .clone()
+        .unwrap_or_else(|| args.profile.clone());
+    let profile = TunnelProfile {
+        name: args.profile.clone(),
+        tenant: args.tenant.clone(),
+        attachment,
+        agent_config: Some(args.agent_config.clone()),
+        gateway_config: Some(args.gateway_config.clone()),
+        agent_state_file: Some(PathBuf::from("/private/tmp/tunnel-agent-state.json")),
+        agent_status_file: Some(PathBuf::from("/private/tmp/tunnel-agent-status.json")),
+        gateway_state_file: Some(PathBuf::from("/private/tmp/tunnel-gateway-state.json")),
+        gateway_status_file: Some(PathBuf::from("/private/tmp/tunnel-gateway-status.json")),
+        session_file: Some(PathBuf::from("/private/tmp/tunnel-session.json")),
+        agent_log_file: Some(PathBuf::from("/private/tmp/tunnel-agent.log")),
+        gateway_log_file: Some(PathBuf::from("/private/tmp/tunnel-gateway.log")),
+        supervisor_log_file: Some(PathBuf::from("/private/tmp/tunnel-supervisor.log")),
+        egress_interface: Some(args.egress_interface.clone()),
+        route_mode: Some(SystemCommandMode::Apply),
+        forwarding_mode: Some(SystemCommandMode::Apply),
+        nat_mode: Some(SystemCommandMode::Apply),
+        ready_timeout_secs: Some(12),
+    };
+    let mut config = if args.profile_file.exists() {
+        load_profile_config(&args.profile_file)?
+    } else {
+        ProfileConfig {
+            default: None,
+            profiles: Vec::new(),
+        }
+    };
+
+    if config
+        .profiles
+        .iter()
+        .any(|existing| existing.name == profile.name)
+        && !args.force
+    {
+        bail!(
+            "profile {:?} already exists in {}. rerun with --force to overwrite",
+            profile.name,
+            args.profile_file.display()
+        );
+    }
+
+    config
+        .profiles
+        .retain(|existing| existing.name != profile.name);
+    config.profiles.push(profile);
+    config.default = Some(args.profile.clone());
+    config
+        .profiles
+        .sort_by(|left, right| left.name.cmp(&right.name));
+
+    if let Some(parent) = args.profile_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&args.profile_file, serde_json::to_string_pretty(&config)?)
+        .with_context(|| format!("failed to write {}", args.profile_file.display()))?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "profile": args.profile,
+            "profile_file": args.profile_file,
+            "default": config.default,
+            "created": true,
+        }))?
+    );
+    Ok(())
 }
 
 fn resolve_status_args(mut args: StatusArgs) -> Result<StatusArgs> {
