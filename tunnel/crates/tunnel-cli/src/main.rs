@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandKind {
-    Login,
+    Login(LoginArgs),
     #[command(hide = true)]
     TenantCreate {
         name: String,
@@ -79,6 +79,26 @@ enum CommandKind {
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
     Init(ProfileInitArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct LoginArgs {
+    #[arg(value_name = "PROFILE", default_value = "local-dev")]
+    profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, default_value = "local-tenant")]
+    tenant: String,
+    #[arg(long)]
+    attachment: Option<String>,
+    #[arg(long, default_value = "/private/tmp/tunnel-agent-wg.json")]
+    agent_config: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-gateway-wg.json")]
+    gateway_config: PathBuf,
+    #[arg(long, default_value = "en0")]
+    egress_interface: String,
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -574,7 +594,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        CommandKind::Login => println!("login flow not implemented yet"),
+        CommandKind::Login(args) => run_login(args)?,
         CommandKind::TenantCreate { name } => println!("tenant create not implemented yet: {name}"),
         CommandKind::AttachmentRegister {
             provider,
@@ -716,7 +736,54 @@ fn required_connect_value<'a>(value: Option<&'a String>, label: &str) -> Result<
         .ok_or_else(|| anyhow!("resolved connect args missing {label}"))
 }
 
+fn run_login(args: LoginArgs) -> Result<()> {
+    let next = format!("tunnel-cli connect {}", args.profile);
+    let profile_args = ProfileInitArgs {
+        profile: args.profile.clone(),
+        profile_file: args.profile_file.clone(),
+        tenant: args.tenant.clone(),
+        attachment: args.attachment.clone(),
+        agent_config: args.agent_config.clone(),
+        gateway_config: args.gateway_config.clone(),
+        egress_interface: args.egress_interface.clone(),
+        force: args.force,
+    };
+    write_profile(profile_args)?;
+
+    let agent_config_ok = validate_config_file("agent config", &args.agent_config).is_ok();
+    let gateway_config_ok = validate_config_file("gateway config", &args.gateway_config).is_ok();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "logged_in": true,
+            "mode": "local",
+            "profile": args.profile,
+            "profile_file": args.profile_file,
+            "agent_config_ok": agent_config_ok,
+            "gateway_config_ok": gateway_config_ok,
+            "next": next,
+        }))?
+    );
+    Ok(())
+}
+
 fn run_profile_init(args: ProfileInitArgs) -> Result<()> {
+    write_profile(args.clone())?;
+    let profile = args.profile.clone();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "profile": profile,
+            "profile_file": args.profile_file,
+            "default": args.profile,
+            "created": true,
+        }))?
+    );
+    Ok(())
+}
+
+fn write_profile(args: ProfileInitArgs) -> Result<()> {
     let attachment = args
         .attachment
         .clone()
@@ -779,15 +846,6 @@ fn run_profile_init(args: ProfileInitArgs) -> Result<()> {
     fs::write(&args.profile_file, serde_json::to_string_pretty(&config)?)
         .with_context(|| format!("failed to write {}", args.profile_file.display()))?;
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "profile": args.profile,
-            "profile_file": args.profile_file,
-            "default": config.default,
-            "created": true,
-        }))?
-    );
     Ok(())
 }
 
