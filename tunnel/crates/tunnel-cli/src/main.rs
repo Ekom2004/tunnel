@@ -142,39 +142,79 @@ struct ConnectArgs {
 
 #[derive(Debug, Args, Clone)]
 struct StatusArgs {
-    #[arg(long)]
+    #[arg(value_name = "PROFILE")]
+    profile: Option<String>,
+    #[arg(long, hide = true)]
     tenant: Option<String>,
-    #[arg(long, default_value = "/private/tmp/tunnel-agent-state.json")]
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-agent-state.json"
+    )]
     agent_state_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-agent-status.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-agent-status.json"
+    )]
     agent_status_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-gateway-state.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-gateway-state.json"
+    )]
     gateway_state_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-gateway-status.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-gateway-status.json"
+    )]
     gateway_status_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
 }
 
 #[derive(Debug, Args, Clone)]
 struct DisconnectArgs {
-    #[arg(long, default_value = "/private/tmp/tunnel-agent-wg.json")]
+    #[arg(value_name = "PROFILE")]
+    profile: Option<String>,
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-agent-wg.json")]
     agent_config: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-agent-state.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-agent-state.json"
+    )]
     agent_state_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-agent-status.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-agent-status.json"
+    )]
     agent_status_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-gateway-state.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-gateway-state.json"
+    )]
     gateway_state_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-gateway-status.json")]
+    #[arg(
+        long,
+        hide = true,
+        default_value = "/private/tmp/tunnel-gateway-status.json"
+    )]
     gateway_status_file: PathBuf,
-    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
-    #[arg(long, value_enum, default_value_t = SystemCommandMode::Apply)]
+    #[arg(long, hide = true, value_enum, default_value_t = SystemCommandMode::Apply)]
     route_mode: SystemCommandMode,
-    #[arg(long, value_enum, default_value_t = SystemCommandMode::Apply)]
+    #[arg(long, hide = true, value_enum, default_value_t = SystemCommandMode::Apply)]
     forwarding_mode: SystemCommandMode,
-    #[arg(long, value_enum, default_value_t = SystemCommandMode::Apply)]
+    #[arg(long, hide = true, value_enum, default_value_t = SystemCommandMode::Apply)]
     nat_mode: SystemCommandMode,
 }
 
@@ -206,21 +246,29 @@ struct SupervisorArgs {
 
 #[derive(Debug, Args, Clone)]
 struct LogsArgs {
+    #[arg(value_name = "PROFILE")]
+    profile: Option<String>,
     #[arg(long, value_enum, default_value_t = LogComponent::Both)]
     component: LogComponent,
     #[arg(long, default_value_t = 100)]
     lines: usize,
-    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     agent_log_file: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     gateway_log_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Clone)]
 struct DoctorArgs {
-    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    #[arg(value_name = "PROFILE")]
+    profile: Option<String>,
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
     #[arg(long, default_value = "1.1.1.1")]
     target: String,
@@ -636,6 +684,129 @@ fn required_connect_value<'a>(value: Option<&'a String>, label: &str) -> Result<
         .ok_or_else(|| anyhow!("resolved connect args missing {label}"))
 }
 
+fn resolve_status_args(mut args: StatusArgs) -> Result<StatusArgs> {
+    if let Some(profile) = load_profile_for_command(args.profile.as_ref(), &args.profile_file)? {
+        args.tenant.get_or_insert_with(|| profile.tenant.clone());
+        apply_status_profile(&mut args, &profile);
+    } else if let Some(profile_name) = args.profile.clone() {
+        args.tenant
+            .get_or_insert_with(|| String::from("local-tenant"));
+        let _ = profile_name;
+    }
+    Ok(args)
+}
+
+fn resolve_disconnect_args(mut args: DisconnectArgs) -> Result<DisconnectArgs> {
+    if let Some(profile) = load_profile_for_command(args.profile.as_ref(), &args.profile_file)? {
+        apply_disconnect_profile(&mut args, &profile);
+    }
+    Ok(args)
+}
+
+fn resolve_logs_args(mut args: LogsArgs) -> Result<LogsArgs> {
+    if let Some(profile) = load_profile_for_command(args.profile.as_ref(), &args.profile_file)? {
+        args.session_file = profile
+            .session_file
+            .clone()
+            .unwrap_or_else(|| args.session_file.clone());
+        if args.agent_log_file.is_none() {
+            args.agent_log_file = profile.agent_log_file.clone();
+        }
+        if args.gateway_log_file.is_none() {
+            args.gateway_log_file = profile.gateway_log_file.clone();
+        }
+    }
+    Ok(args)
+}
+
+fn resolve_doctor_args(mut args: DoctorArgs) -> Result<DoctorArgs> {
+    if let Some(profile) = load_profile_for_command(args.profile.as_ref(), &args.profile_file)? {
+        args.session_file = profile
+            .session_file
+            .clone()
+            .unwrap_or_else(|| args.session_file.clone());
+    }
+    Ok(args)
+}
+
+fn load_profile_for_command(
+    profile_name: Option<&String>,
+    profile_file: &Path,
+) -> Result<Option<TunnelProfile>> {
+    if !profile_file.exists() {
+        return Ok(None);
+    }
+
+    let config = load_profile_config(profile_file)?;
+    let selected = profile_name
+        .cloned()
+        .or_else(|| config.default.clone())
+        .or_else(|| (config.profiles.len() == 1).then(|| config.profiles[0].name.clone()));
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+
+    config
+        .profiles
+        .into_iter()
+        .find(|profile| profile.name == selected)
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow!(
+                "profile {selected:?} not found in {}",
+                profile_file.display()
+            )
+        })
+}
+
+fn apply_status_profile(args: &mut StatusArgs, profile: &TunnelProfile) {
+    if let Some(value) = &profile.agent_state_file {
+        args.agent_state_file = value.clone();
+    }
+    if let Some(value) = &profile.agent_status_file {
+        args.agent_status_file = value.clone();
+    }
+    if let Some(value) = &profile.gateway_state_file {
+        args.gateway_state_file = value.clone();
+    }
+    if let Some(value) = &profile.gateway_status_file {
+        args.gateway_status_file = value.clone();
+    }
+    if let Some(value) = &profile.session_file {
+        args.session_file = value.clone();
+    }
+}
+
+fn apply_disconnect_profile(args: &mut DisconnectArgs, profile: &TunnelProfile) {
+    if let Some(value) = &profile.agent_config {
+        args.agent_config = value.clone();
+    }
+    if let Some(value) = &profile.agent_state_file {
+        args.agent_state_file = value.clone();
+    }
+    if let Some(value) = &profile.agent_status_file {
+        args.agent_status_file = value.clone();
+    }
+    if let Some(value) = &profile.gateway_state_file {
+        args.gateway_state_file = value.clone();
+    }
+    if let Some(value) = &profile.gateway_status_file {
+        args.gateway_status_file = value.clone();
+    }
+    if let Some(value) = &profile.session_file {
+        args.session_file = value.clone();
+    }
+    if let Some(value) = profile.route_mode {
+        args.route_mode = value;
+    }
+    if let Some(value) = profile.forwarding_mode {
+        args.forwarding_mode = value;
+    }
+    if let Some(value) = profile.nat_mode {
+        args.nat_mode = value;
+    }
+}
+
 fn run_connect(args: ConnectArgs) -> Result<()> {
     let args = resolve_connect_args(args)?;
     if args.oneshot {
@@ -833,6 +1004,7 @@ fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
 }
 
 fn run_status(args: StatusArgs) -> Result<()> {
+    let args = resolve_status_args(args)?;
     let agent_status = read_optional_json::<RuntimeStatus>(&args.agent_status_file)?;
     let gateway_status = read_optional_json::<RuntimeStatus>(&args.gateway_status_file)?;
     let agent_state = read_optional_json::<AgentRuntimeState>(&args.agent_state_file)?;
@@ -854,6 +1026,7 @@ fn run_status(args: StatusArgs) -> Result<()> {
 }
 
 fn run_usage(args: StatusArgs) -> Result<()> {
+    let args = resolve_status_args(args)?;
     let agent_status = read_optional_json::<RuntimeStatus>(&args.agent_status_file)?;
     let gateway_status = read_optional_json::<RuntimeStatus>(&args.gateway_status_file)?;
 
@@ -877,6 +1050,7 @@ fn run_usage(args: StatusArgs) -> Result<()> {
 }
 
 fn run_logs(args: LogsArgs) -> Result<()> {
+    let args = resolve_logs_args(args)?;
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
     let agent_log_file = args
         .agent_log_file
@@ -908,6 +1082,7 @@ fn run_logs(args: LogsArgs) -> Result<()> {
 }
 
 fn run_disconnect(args: DisconnectArgs) -> Result<()> {
+    let args = resolve_disconnect_args(args)?;
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
     if let Some(session) = &session {
         terminate_pid_except_self(session.supervisor_pid)?;
@@ -1051,6 +1226,7 @@ fn run_supervisor(args: SupervisorArgs) -> Result<()> {
 }
 
 fn run_doctor(args: DoctorArgs) -> Result<()> {
+    let args = resolve_doctor_args(args)?;
     let mut checks = Vec::new();
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
 
@@ -2142,6 +2318,8 @@ fn component_label(component: ComponentSelection) -> &'static str {
 
 fn disconnect_args_from_connect(args: &ConnectArgs) -> DisconnectArgs {
     DisconnectArgs {
+        profile: args.profile.clone(),
+        profile_file: args.profile_file.clone(),
         agent_config: args.agent_config.clone(),
         agent_state_file: args.agent_state_file.clone(),
         agent_status_file: args.agent_status_file.clone(),
