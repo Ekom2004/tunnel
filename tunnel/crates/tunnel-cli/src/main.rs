@@ -28,9 +28,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum CommandKind {
     Login,
+    #[command(hide = true)]
     TenantCreate {
         name: String,
     },
+    #[command(hide = true)]
     AttachmentRegister {
         #[arg(long)]
         provider: String,
@@ -39,12 +41,14 @@ enum CommandKind {
         #[arg(long)]
         name: String,
     },
+    #[command(hide = true)]
     AgentEnroll {
         #[arg(long)]
         tenant: String,
         #[arg(long)]
         token: String,
     },
+    #[command(hide = true)]
     PolicyApply {
         #[arg(long)]
         tenant: String,
@@ -54,11 +58,15 @@ enum CommandKind {
     Connect(ConnectArgs),
     Status(StatusArgs),
     Disconnect(DisconnectArgs),
+    #[command(hide = true)]
     Usage(StatusArgs),
+    #[command(hide = true)]
     Restart(RestartArgs),
+    #[command(hide = true)]
     Supervise(SupervisorArgs),
     Doctor(DoctorArgs),
     Logs(LogsArgs),
+    #[command(hide = true)]
     Soak(SoakArgs),
     #[command(hide = true)]
     RepairTest(RepairTestArgs),
