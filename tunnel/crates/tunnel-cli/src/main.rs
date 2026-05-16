@@ -60,6 +60,8 @@ enum CommandKind {
     Doctor(DoctorArgs),
     Logs(LogsArgs),
     Soak(SoakArgs),
+    #[command(hide = true)]
+    RepairTest(RepairTestArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -236,6 +238,24 @@ struct SoakArgs {
     bounce_gateway_at: Option<u32>,
 }
 
+#[derive(Debug, Args, Clone)]
+struct RepairTestArgs {
+    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    session_file: PathBuf,
+    #[arg(long, default_value = "1.1.1.1")]
+    target: String,
+    #[arg(long, default_value_t = 2.0)]
+    probe_timeout_secs: f64,
+    #[arg(long, default_value_t = 45)]
+    recovery_timeout_secs: u64,
+    #[arg(long, default_value_t = 1.0)]
+    poll_interval_secs: f64,
+    #[arg(long, default_value_t = 10)]
+    post_repair_probe_attempts: u32,
+    #[arg(long)]
+    component: Option<ComponentSelection>,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 enum SystemCommandMode {
     Skip,
@@ -373,6 +393,26 @@ struct DoctorReport {
 }
 
 #[derive(Debug, Serialize)]
+struct RepairTestReport {
+    overall: DoctorState,
+    target: String,
+    supervised: bool,
+    supervisor_pid: Option<u32>,
+    checks: Vec<RepairTestCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct RepairTestCheck {
+    component: String,
+    state: DoctorState,
+    old_pid: Option<u32>,
+    new_pid: Option<u32>,
+    recovery_secs: Option<f64>,
+    probe_rtt_ms: Option<f64>,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
 struct DoctorCheck {
     name: String,
     state: DoctorState,
@@ -432,6 +472,7 @@ fn main() -> Result<()> {
         CommandKind::Doctor(args) => run_doctor(args)?,
         CommandKind::Logs(args) => run_logs(args)?,
         CommandKind::Soak(args) => run_soak(args)?,
+        CommandKind::RepairTest(args) => run_repair_test(args)?,
     }
 
     Ok(())
@@ -473,27 +514,7 @@ fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
         }
     }
 
-    let supervisor_log_file = args.supervisor_log_file.clone();
-    let (supervisor_stdout, supervisor_stderr) = log_stdio(&supervisor_log_file, true)?;
-    let current_exe = env::current_exe().context("failed to resolve current executable")?;
-    let mut supervisor = Command::new(&current_exe);
-    supervisor
-        .arg("supervise")
-        .stdin(Stdio::null())
-        .stdout(supervisor_stdout)
-        .stderr(supervisor_stderr);
-    append_connect_args(&mut supervisor, &args);
-    supervisor
-        .arg("--supervisor-log-file")
-        .arg(&supervisor_log_file);
-
-    let child = supervisor
-        .spawn()
-        .with_context(|| format!("failed to spawn supervisor {}", current_exe.display()))?;
-    let supervisor_pid = child.id();
-    wait_for_supervised_connect_ready(&args, supervisor_pid)?;
-
-    let session = load_manifest(&args.session_file)?;
+    let (supervisor_pid, session) = spawn_supervisor_for_connect(&args)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -512,6 +533,30 @@ fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn spawn_supervisor_for_connect(args: &ConnectArgs) -> Result<(u32, SessionManifest)> {
+    let supervisor_log_file = args.supervisor_log_file.clone();
+    let (supervisor_stdout, supervisor_stderr) = log_stdio(&supervisor_log_file, true)?;
+    let current_exe = env::current_exe().context("failed to resolve current executable")?;
+    let mut supervisor = Command::new(&current_exe);
+    supervisor
+        .arg("supervise")
+        .stdin(Stdio::null())
+        .stdout(supervisor_stdout)
+        .stderr(supervisor_stderr);
+    append_connect_args(&mut supervisor, args);
+    supervisor
+        .arg("--supervisor-log-file")
+        .arg(&supervisor_log_file);
+
+    let child = supervisor
+        .spawn()
+        .with_context(|| format!("failed to spawn supervisor {}", current_exe.display()))?;
+    let supervisor_pid = child.id();
+    wait_for_supervised_connect_ready(args, supervisor_pid)?;
+
+    Ok((supervisor_pid, load_manifest(&args.session_file)?))
 }
 
 fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
@@ -1048,6 +1093,218 @@ fn run_soak(args: SoakArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_repair_test(args: RepairTestArgs) -> Result<()> {
+    let session = load_manifest(&args.session_file)?;
+    let mut checks = Vec::new();
+
+    if !session.supervised {
+        checks.push(RepairTestCheck {
+            component: String::from("supervisor"),
+            state: DoctorState::Fail,
+            old_pid: session.supervisor_pid,
+            new_pid: session.supervisor_pid,
+            recovery_secs: None,
+            probe_rtt_ms: None,
+            detail: String::from("session is not supervised"),
+        });
+        return print_repair_test_report(args.target, session, checks);
+    }
+
+    if !pid_is_running_optional(session.supervisor_pid)? {
+        let old_pid = session.supervisor_pid;
+        let started_at = Instant::now();
+        match spawn_supervisor_for_connect(&connect_args_from_session(&session, &args.session_file))
+        {
+            Ok((new_pid, _new_session)) => {
+                checks.push(RepairTestCheck {
+                    component: String::from("supervisor"),
+                    state: DoctorState::Pass,
+                    old_pid,
+                    new_pid: Some(new_pid),
+                    recovery_secs: Some(started_at.elapsed().as_secs_f64()),
+                    probe_rtt_ms: None,
+                    detail: String::from(
+                        "supervisor was not running; started replacement supervisor",
+                    ),
+                });
+            }
+            Err(error) => {
+                checks.push(RepairTestCheck {
+                    component: String::from("supervisor"),
+                    state: DoctorState::Fail,
+                    old_pid,
+                    new_pid: old_pid,
+                    recovery_secs: None,
+                    probe_rtt_ms: None,
+                    detail: format!(
+                        "supervisor process is not running and restart failed: {error:#}"
+                    ),
+                });
+                return print_repair_test_report(args.target, session, checks);
+            }
+        }
+    }
+
+    let components: Vec<ComponentSelection> = args
+        .component
+        .map(|component| vec![component])
+        .unwrap_or_else(|| vec![ComponentSelection::Agent, ComponentSelection::Gateway]);
+
+    for component in components {
+        checks.push(run_component_repair_test(
+            &args.session_file,
+            component,
+            &args.target,
+            args.probe_timeout_secs,
+            Duration::from_secs(args.recovery_timeout_secs),
+            Duration::from_secs_f64(args.poll_interval_secs.max(0.1)),
+            args.post_repair_probe_attempts,
+        )?);
+    }
+
+    let session = load_manifest(&args.session_file)?;
+    print_repair_test_report(args.target, session, checks)
+}
+
+fn run_component_repair_test(
+    session_file: &Path,
+    component: ComponentSelection,
+    target: &str,
+    probe_timeout_secs: f64,
+    recovery_timeout: Duration,
+    poll_interval: Duration,
+    post_repair_probe_attempts: u32,
+) -> Result<RepairTestCheck> {
+    let session = load_manifest(session_file)?;
+    let old_pid = component_pid(&session, component);
+    if old_pid.is_none() {
+        return Ok(RepairTestCheck {
+            component: component_label(component).to_owned(),
+            state: DoctorState::Fail,
+            old_pid,
+            new_pid: None,
+            recovery_secs: None,
+            probe_rtt_ms: None,
+            detail: String::from("session manifest has no component pid"),
+        });
+    }
+
+    terminate_pid(old_pid)?;
+    wait_for_pid_exit_except_self(old_pid, component_label(component), Duration::from_secs(5))?;
+
+    let started_at = Instant::now();
+    let deadline = started_at + recovery_timeout;
+    loop {
+        let session = load_manifest(session_file)?;
+        let new_pid = component_pid(&session, component);
+        let pid_changed = new_pid.is_some() && new_pid != old_pid;
+        let pid_running = pid_is_running_optional(new_pid)?;
+        let status =
+            read_optional_json::<RuntimeStatus>(component_status_file(&session, component))?;
+        let status_active = status.as_ref().map(is_transport_active).unwrap_or(false);
+
+        if pid_changed && pid_running && status_active {
+            let recovery_secs = started_at.elapsed().as_secs_f64();
+            let probe_rtt_ms = wait_for_probe_success(
+                target,
+                probe_timeout_secs,
+                post_repair_probe_attempts.max(1),
+                poll_interval,
+            )?;
+            let state = if probe_rtt_ms.is_some() {
+                DoctorState::Pass
+            } else {
+                DoctorState::Fail
+            };
+            return Ok(RepairTestCheck {
+                component: component_label(component).to_owned(),
+                state,
+                old_pid,
+                new_pid,
+                recovery_secs: Some(recovery_secs),
+                probe_rtt_ms,
+                detail: if state == DoctorState::Pass {
+                    format!(
+                        "{} recovered with replacement pid {:?}",
+                        component_label(component),
+                        new_pid
+                    )
+                } else {
+                    format!(
+                        "{} recovered process/status, but probe to {target} failed",
+                        component_label(component)
+                    )
+                },
+            });
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(RepairTestCheck {
+                component: component_label(component).to_owned(),
+                state: DoctorState::Fail,
+                old_pid,
+                new_pid,
+                recovery_secs: None,
+                probe_rtt_ms: None,
+                detail: format!(
+                    "timed out after {:.1}s waiting for replacement pid and active status; pid_changed={pid_changed} pid_running={pid_running} status_phase={:?} status_state={:?}",
+                    recovery_timeout.as_secs_f64(),
+                    status.as_ref().map(|status| &status.phase),
+                    status.as_ref().map(|status| &status.state)
+                ),
+            });
+        }
+
+        thread::sleep(poll_interval);
+    }
+}
+
+fn print_repair_test_report(
+    target: String,
+    session: SessionManifest,
+    checks: Vec<RepairTestCheck>,
+) -> Result<()> {
+    let overall = if checks.iter().any(|check| check.state == DoctorState::Fail) {
+        DoctorState::Fail
+    } else if checks.iter().any(|check| check.state == DoctorState::Warn) {
+        DoctorState::Warn
+    } else {
+        DoctorState::Pass
+    };
+    let failed = overall == DoctorState::Fail;
+    let report = RepairTestReport {
+        overall,
+        target,
+        supervised: session.supervised,
+        supervisor_pid: session.supervisor_pid,
+        checks,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if failed {
+        bail!("repair test failed");
+    }
+    Ok(())
+}
+
+fn wait_for_probe_success(
+    target: &str,
+    probe_timeout_secs: f64,
+    attempts: u32,
+    interval: Duration,
+) -> Result<Option<f64>> {
+    for attempt in 1..=attempts {
+        if let Some(rtt_ms) = ping_once(target, probe_timeout_secs)? {
+            return Ok(Some(rtt_ms));
+        }
+
+        if attempt != attempts {
+            thread::sleep(interval);
+        }
+    }
+
+    Ok(None)
+}
+
 fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -> Result<()> {
     let existing_session = read_optional_json::<SessionManifest>(&args.connect.session_file)?;
 
@@ -1151,26 +1408,22 @@ fn supervise_component(
         );
     }
 
-    if status.state != HealthState::Healthy {
-        return observe_unhealthy_component(
-            session,
-            component,
-            state,
-            args,
+    if status.state != HealthState::Healthy || status.phase != TunnelPhase::Active {
+        emit_supervisor_event(
             supervisor_log,
-            format!("runtime state is {:?}: {}", status.state, status.detail),
-        );
-    }
-
-    if matches!(status.phase, TunnelPhase::Stale) {
-        return observe_unhealthy_component(
-            session,
-            component,
-            state,
-            args,
-            supervisor_log,
-            format!("runtime phase is {:?}: {}", status.phase, status.detail),
-        );
+            "component_runtime_observed",
+            Some(component),
+            format!(
+                "{} runtime is {:?}/{:?}: {}; process is still running, so supervisor will not restart on dataplane idleness alone",
+                component_label(component),
+                status.state,
+                status.phase,
+                status.detail
+            ),
+            Some(session),
+        )?;
+        state.unhealthy_samples = 0;
+        return Ok(false);
     }
 
     if state.unhealthy_samples > 0 {
@@ -1354,6 +1607,29 @@ fn disconnect_args_from_connect(args: &ConnectArgs) -> DisconnectArgs {
         route_mode: args.route_mode,
         forwarding_mode: args.forwarding_mode,
         nat_mode: args.nat_mode,
+    }
+}
+
+fn connect_args_from_session(session: &SessionManifest, session_file: &Path) -> ConnectArgs {
+    ConnectArgs {
+        tenant: session.tenant.clone(),
+        attachment: session.attachment.clone(),
+        agent_config: session.agent_config.clone(),
+        gateway_config: session.gateway_config.clone(),
+        agent_state_file: session.agent_state_file.clone(),
+        agent_status_file: session.agent_status_file.clone(),
+        gateway_state_file: session.gateway_state_file.clone(),
+        gateway_status_file: session.gateway_status_file.clone(),
+        session_file: session_file.to_path_buf(),
+        agent_log_file: session.agent_log_file.clone(),
+        gateway_log_file: session.gateway_log_file.clone(),
+        egress_interface: session.egress_interface.clone(),
+        route_mode: session.route_mode,
+        forwarding_mode: session.forwarding_mode,
+        nat_mode: session.nat_mode,
+        ready_timeout_secs: 12,
+        oneshot: false,
+        supervisor_log_file: session.supervisor_log_file.clone(),
     }
 }
 
