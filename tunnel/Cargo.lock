@@ -983,7 +983,9 @@ name = "tunnel-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boringtun",
  "clap",
+ "rand",
  "serde",
  "serde_json",
  "tunnel-shared",

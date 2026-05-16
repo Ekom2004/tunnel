@@ -10,11 +10,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tunnel_shared::{
-    now_unix_secs, AgentRuntimeState, GatewayRuntimeState, HealthState, PacketPathTelemetry,
-    RuntimeStatus, TunnelConfig, TunnelPhase,
+    encode_key_32, now_unix_secs, AgentRuntimeState, GatewayEndpoint, GatewayRuntimeState,
+    HealthState, PacketPathTelemetry, RoutePolicy, RuntimeStatus, SocketEndpoint, TrafficClass,
+    TunnelConfig, TunnelPhase, WireGuardConfig, WireGuardRole,
 };
 
 #[derive(Debug, Parser)]
@@ -606,6 +609,28 @@ struct ReadinessCheck {
     detail: String,
 }
 
+#[derive(Debug, Serialize)]
+struct GeneratedConfigReport {
+    agent_config: ConfigBootstrapAction,
+    gateway_config: ConfigBootstrapAction,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigBootstrapAction {
+    path: PathBuf,
+    action: ConfigBootstrapActionKind,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConfigBootstrapActionKind {
+    Created,
+    Overwritten,
+    Reused,
+    PreservedInvalid,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DoctorState {
@@ -779,6 +804,7 @@ fn required_connect_value<'a>(value: Option<&'a String>, label: &str) -> Result<
 
 fn run_login(args: LoginArgs) -> Result<()> {
     let next = format!("tunnel-cli connect {}", args.profile);
+    let generated_configs = ensure_local_configs_for_login(&args)?;
     let profile_args = ProfileInitArgs {
         profile: args.profile.clone(),
         profile_file: args.profile_file.clone(),
@@ -787,7 +813,7 @@ fn run_login(args: LoginArgs) -> Result<()> {
         agent_config: args.agent_config.clone(),
         gateway_config: args.gateway_config.clone(),
         egress_interface: args.egress_interface.clone(),
-        force: args.force,
+        force: true,
     };
     write_profile(profile_args)?;
 
@@ -804,6 +830,7 @@ fn run_login(args: LoginArgs) -> Result<()> {
             "mode": "local",
             "profile": args.profile,
             "profile_file": args.profile_file,
+            "generated_configs": generated_configs,
             "ready": readiness.ready,
             "readiness": readiness,
             "next": next,
@@ -825,6 +852,192 @@ fn run_profile_init(args: ProfileInitArgs) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+fn ensure_local_configs_for_login(args: &LoginArgs) -> Result<GeneratedConfigReport> {
+    let agent_valid = validate_config_file("agent_config", &args.agent_config);
+    let gateway_valid = validate_config_file("gateway_config", &args.gateway_config);
+    let should_generate =
+        args.force || !args.agent_config.exists() || !args.gateway_config.exists();
+
+    if should_generate {
+        let (agent_config, gateway_config) = build_local_wireguard_config_pair(args);
+        agent_config
+            .validate()
+            .context("generated agent config is invalid")?;
+        gateway_config
+            .validate()
+            .context("generated gateway config is invalid")?;
+
+        let agent_action = write_generated_config(
+            "agent_config",
+            &args.agent_config,
+            &agent_config,
+            args.force,
+            agent_valid.is_ok(),
+        )?;
+        let gateway_action = write_generated_config(
+            "gateway_config",
+            &args.gateway_config,
+            &gateway_config,
+            args.force,
+            gateway_valid.is_ok(),
+        )?;
+
+        return Ok(GeneratedConfigReport {
+            agent_config: agent_action,
+            gateway_config: gateway_action,
+        });
+    }
+
+    Ok(GeneratedConfigReport {
+        agent_config: existing_config_action("agent_config", &args.agent_config, agent_valid),
+        gateway_config: existing_config_action(
+            "gateway_config",
+            &args.gateway_config,
+            gateway_valid,
+        ),
+    })
+}
+
+fn write_generated_config(
+    label: &str,
+    path: &Path,
+    config: &TunnelConfig,
+    force: bool,
+    existing_valid: bool,
+) -> Result<ConfigBootstrapAction> {
+    let existed = path.exists();
+    if existed && existing_valid && !force {
+        return Ok(ConfigBootstrapAction {
+            path: path.to_path_buf(),
+            action: ConfigBootstrapActionKind::Reused,
+            detail: format!("existing valid {label} reused"),
+        });
+    }
+    if existed && !force {
+        return Ok(ConfigBootstrapAction {
+            path: path.to_path_buf(),
+            action: ConfigBootstrapActionKind::PreservedInvalid,
+            detail: format!(
+                "existing invalid {label} preserved; rerun login with --force to replace it"
+            ),
+        });
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_string_pretty(config)?)
+        .with_context(|| format!("failed to write generated {label} {}", path.display()))?;
+
+    Ok(ConfigBootstrapAction {
+        path: path.to_path_buf(),
+        action: if existed {
+            ConfigBootstrapActionKind::Overwritten
+        } else {
+            ConfigBootstrapActionKind::Created
+        },
+        detail: if existed {
+            format!("existing {label} overwritten")
+        } else {
+            format!("missing {label} generated")
+        },
+    })
+}
+
+fn existing_config_action(
+    label: &str,
+    path: &Path,
+    validation: Result<()>,
+) -> ConfigBootstrapAction {
+    match validation {
+        Ok(()) => ConfigBootstrapAction {
+            path: path.to_path_buf(),
+            action: ConfigBootstrapActionKind::Reused,
+            detail: format!("existing valid {label} reused"),
+        },
+        Err(error) => ConfigBootstrapAction {
+            path: path.to_path_buf(),
+            action: ConfigBootstrapActionKind::PreservedInvalid,
+            detail: format!("{error}; rerun login with --force to replace it"),
+        },
+    }
+}
+
+fn build_local_wireguard_config_pair(args: &LoginArgs) -> (TunnelConfig, TunnelConfig) {
+    let tunnel_id = String::from("local-tunnel");
+    let gateway_host = String::from("127.0.0.1");
+    let gateway_port = 7000;
+    let route_policy = RoutePolicy {
+        traffic_class: TrafficClass::BulkExport,
+        destination_cidrs: vec![String::from("1.1.1.0/24")],
+        routing_mark: 100,
+    };
+    let (agent_private, agent_public) = generate_wireguard_keypair();
+    let (gateway_private, gateway_public) = generate_wireguard_keypair();
+
+    let agent_config = TunnelConfig {
+        tenant_id: args.tenant.clone(),
+        tunnel_id: tunnel_id.clone(),
+        gateway: GatewayEndpoint {
+            host: gateway_host.clone(),
+            port: gateway_port,
+        },
+        route_policy: route_policy.clone(),
+        heartbeat_interval_secs: 5,
+        max_chunk_bytes: 4096,
+        wireguard: Some(WireGuardConfig {
+            local_bind_host: String::from("0.0.0.0"),
+            local_bind_port: 0,
+            peer_endpoint: Some(SocketEndpoint {
+                host: gateway_host.clone(),
+                port: gateway_port,
+            }),
+            local_tunnel_address: String::from("10.201.0.2"),
+            peer_tunnel_address: String::from("10.201.0.1"),
+            private_key_base64: encode_key_32(&agent_private),
+            peer_public_key_base64: encode_key_32(&gateway_public),
+            preshared_key_base64: None,
+            persistent_keepalive_secs: Some(25),
+            role: WireGuardRole::Agent,
+        }),
+    };
+
+    let gateway_config = TunnelConfig {
+        tenant_id: args.tenant.clone(),
+        tunnel_id,
+        gateway: GatewayEndpoint {
+            host: gateway_host,
+            port: gateway_port,
+        },
+        route_policy,
+        heartbeat_interval_secs: 5,
+        max_chunk_bytes: 4096,
+        wireguard: Some(WireGuardConfig {
+            local_bind_host: String::from("0.0.0.0"),
+            local_bind_port: gateway_port,
+            peer_endpoint: None,
+            local_tunnel_address: String::from("10.201.0.1"),
+            peer_tunnel_address: String::from("10.201.0.2"),
+            private_key_base64: encode_key_32(&gateway_private),
+            peer_public_key_base64: encode_key_32(&agent_public),
+            preshared_key_base64: None,
+            persistent_keepalive_secs: None,
+            role: WireGuardRole::Gateway,
+        }),
+    };
+
+    (agent_config, gateway_config)
+}
+
+fn generate_wireguard_keypair() -> ([u8; 32], [u8; 32]) {
+    let mut bytes = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let secret = StaticSecret::from(bytes);
+    let public = PublicKey::from(&secret);
+    (secret.to_bytes(), *public.as_bytes())
 }
 
 fn build_connect_readiness(args: &ConnectArgs) -> ReadinessReport {
