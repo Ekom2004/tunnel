@@ -74,10 +74,14 @@ enum CommandKind {
 
 #[derive(Debug, Args, Clone)]
 struct ConnectArgs {
-    #[arg(long)]
-    tenant: String,
-    #[arg(long)]
-    attachment: String,
+    #[arg(value_name = "PROFILE")]
+    profile: Option<String>,
+    #[arg(long, hide = true)]
+    tenant: Option<String>,
+    #[arg(long, hide = true)]
+    attachment: Option<String>,
+    #[arg(long, hide = true, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
     #[arg(long, hide = true, default_value = "/private/tmp/tunnel-agent-wg.json")]
     agent_config: PathBuf,
     #[arg(
@@ -429,6 +433,34 @@ struct RepairTestCheck {
     detail: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProfileConfig {
+    default: Option<String>,
+    profiles: Vec<TunnelProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TunnelProfile {
+    name: String,
+    tenant: String,
+    attachment: String,
+    agent_config: Option<PathBuf>,
+    gateway_config: Option<PathBuf>,
+    agent_state_file: Option<PathBuf>,
+    agent_status_file: Option<PathBuf>,
+    gateway_state_file: Option<PathBuf>,
+    gateway_status_file: Option<PathBuf>,
+    session_file: Option<PathBuf>,
+    agent_log_file: Option<PathBuf>,
+    gateway_log_file: Option<PathBuf>,
+    supervisor_log_file: Option<PathBuf>,
+    egress_interface: Option<String>,
+    route_mode: Option<SystemCommandMode>,
+    forwarding_mode: Option<SystemCommandMode>,
+    nat_mode: Option<SystemCommandMode>,
+    ready_timeout_secs: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 struct DoctorCheck {
     name: String,
@@ -495,7 +527,117 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_connect_args(mut args: ConnectArgs) -> Result<ConnectArgs> {
+    if args.tenant.is_some() && args.attachment.is_some() {
+        return Ok(args);
+    }
+
+    if args.profile_file.exists() {
+        let config = load_profile_config(&args.profile_file)?;
+        let profile_name = args
+            .profile
+            .clone()
+            .or_else(|| config.default.clone())
+            .or_else(|| (config.profiles.len() == 1).then(|| config.profiles[0].name.clone()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "no profile selected and no default profile configured in {}",
+                    args.profile_file.display()
+                )
+            })?;
+        let profile = config
+            .profiles
+            .iter()
+            .find(|profile| profile.name == profile_name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "profile {profile_name:?} not found in {}",
+                    args.profile_file.display()
+                )
+            })?;
+        apply_profile(&mut args, profile);
+        return Ok(args);
+    }
+
+    if let Some(profile) = args.profile.clone() {
+        args.tenant
+            .get_or_insert_with(|| String::from("local-tenant"));
+        args.attachment.get_or_insert(profile);
+        return Ok(args);
+    }
+
+    bail!(
+        "connect requires a profile, or hidden --tenant/--attachment values. Example: tunnel-cli connect local-dev"
+    );
+}
+
+fn load_profile_config(path: &Path) -> Result<ProfileConfig> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn apply_profile(args: &mut ConnectArgs, profile: &TunnelProfile) {
+    args.profile.get_or_insert_with(|| profile.name.clone());
+    args.tenant.get_or_insert_with(|| profile.tenant.clone());
+    args.attachment
+        .get_or_insert_with(|| profile.attachment.clone());
+
+    if let Some(value) = &profile.agent_config {
+        args.agent_config = value.clone();
+    }
+    if let Some(value) = &profile.gateway_config {
+        args.gateway_config = value.clone();
+    }
+    if let Some(value) = &profile.agent_state_file {
+        args.agent_state_file = value.clone();
+    }
+    if let Some(value) = &profile.agent_status_file {
+        args.agent_status_file = value.clone();
+    }
+    if let Some(value) = &profile.gateway_state_file {
+        args.gateway_state_file = value.clone();
+    }
+    if let Some(value) = &profile.gateway_status_file {
+        args.gateway_status_file = value.clone();
+    }
+    if let Some(value) = &profile.session_file {
+        args.session_file = value.clone();
+    }
+    if let Some(value) = &profile.agent_log_file {
+        args.agent_log_file = value.clone();
+    }
+    if let Some(value) = &profile.gateway_log_file {
+        args.gateway_log_file = value.clone();
+    }
+    if let Some(value) = &profile.supervisor_log_file {
+        args.supervisor_log_file = value.clone();
+    }
+    if let Some(value) = &profile.egress_interface {
+        args.egress_interface = value.clone();
+    }
+    if let Some(value) = profile.route_mode {
+        args.route_mode = value;
+    }
+    if let Some(value) = profile.forwarding_mode {
+        args.forwarding_mode = value;
+    }
+    if let Some(value) = profile.nat_mode {
+        args.nat_mode = value;
+    }
+    if let Some(value) = profile.ready_timeout_secs {
+        args.ready_timeout_secs = value;
+    }
+}
+
+fn required_connect_value<'a>(value: Option<&'a String>, label: &str) -> Result<&'a str> {
+    value
+        .map(String::as_str)
+        .ok_or_else(|| anyhow!("resolved connect args missing {label}"))
+}
+
 fn run_connect(args: ConnectArgs) -> Result<()> {
+    let args = resolve_connect_args(args)?;
     if args.oneshot {
         return run_connect_oneshot(args);
     }
@@ -579,6 +721,8 @@ fn spawn_supervisor_for_connect(args: &ConnectArgs) -> Result<(u32, SessionManif
 fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
     preflight_connect_args(&args)?;
     reconcile_before_connect(&args)?;
+    let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
+    let attachment = required_connect_value(args.attachment.as_ref(), "attachment")?.to_owned();
 
     let gateway_bin = sibling_binary("tunnel-gateway")?;
     let agent_bin = sibling_binary("tunnel-agent")?;
@@ -644,8 +788,8 @@ fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
     }
 
     let manifest = SessionManifest {
-        tenant: args.tenant.clone(),
-        attachment: args.attachment.clone(),
+        tenant: tenant.clone(),
+        attachment: attachment.clone(),
         agent_config: args.agent_config.clone(),
         gateway_config: args.gateway_config.clone(),
         agent_state_file: args.agent_state_file.clone(),
@@ -669,8 +813,8 @@ fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "tenant": args.tenant,
-            "attachment": args.attachment,
+            "tenant": tenant,
+            "attachment": attachment,
             "gateway_pid": gateway_child.id(),
             "agent_pid": agent_child.id(),
             "supervised": false,
@@ -844,6 +988,8 @@ fn run_restart(args: RestartArgs) -> Result<()> {
 }
 
 fn run_supervisor(args: SupervisorArgs) -> Result<()> {
+    let mut args = args;
+    args.connect = resolve_connect_args(args.connect)?;
     preflight_connect_args(&args.connect)?;
     let mut supervisor_log = open_log_file(&args.connect.supervisor_log_file, true)?;
     emit_supervisor_event(
@@ -2010,8 +2156,10 @@ fn disconnect_args_from_connect(args: &ConnectArgs) -> DisconnectArgs {
 
 fn connect_args_from_session(session: &SessionManifest, session_file: &Path) -> ConnectArgs {
     ConnectArgs {
-        tenant: session.tenant.clone(),
-        attachment: session.attachment.clone(),
+        profile: Some(session.attachment.clone()),
+        tenant: Some(session.tenant.clone()),
+        attachment: Some(session.attachment.clone()),
+        profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
         agent_config: session.agent_config.clone(),
         gateway_config: session.gateway_config.clone(),
         agent_state_file: session.agent_state_file.clone(),
@@ -3617,11 +3765,19 @@ fn mode_str(mode: SystemCommandMode) -> &'static str {
 }
 
 fn append_connect_args(command: &mut Command, args: &ConnectArgs) {
+    if let Some(profile) = &args.profile {
+        command.arg(profile);
+    }
+    if let Some(tenant) = &args.tenant {
+        command.arg("--tenant").arg(tenant);
+    }
+    if let Some(attachment) = &args.attachment {
+        command.arg("--attachment").arg(attachment);
+    }
+
     command
-        .arg("--tenant")
-        .arg(&args.tenant)
-        .arg("--attachment")
-        .arg(&args.attachment)
+        .arg("--profile-file")
+        .arg(&args.profile_file)
         .arg("--agent-config")
         .arg(&args.agent_config)
         .arg("--gateway-config")
