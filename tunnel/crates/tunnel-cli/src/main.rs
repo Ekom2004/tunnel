@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -56,6 +56,7 @@ enum CommandKind {
     Disconnect(DisconnectArgs),
     Usage(StatusArgs),
     Restart(RestartArgs),
+    Supervise(SupervisorArgs),
     Doctor(DoctorArgs),
     Logs(LogsArgs),
     Soak(SoakArgs),
@@ -141,6 +142,26 @@ struct RestartArgs {
     component: ComponentSelection,
     #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
     session_file: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+struct SupervisorArgs {
+    #[command(flatten)]
+    connect: ConnectArgs,
+    #[arg(long, default_value = "/private/tmp/tunnel-supervisor.log")]
+    supervisor_log_file: PathBuf,
+    #[arg(long, default_value_t = 2)]
+    monitor_interval_secs: u64,
+    #[arg(long, default_value_t = 15)]
+    stale_after_secs: u64,
+    #[arg(long, default_value_t = 3)]
+    unhealthy_grace_samples: u32,
+    #[arg(long, default_value_t = 5)]
+    restart_cooldown_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    max_restarts_per_component: u32,
+    #[arg(long)]
+    max_iterations: Option<u64>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -344,6 +365,13 @@ struct StatusHistory {
     recovered_after_secs: Option<f64>,
 }
 
+#[derive(Debug, Default)]
+struct ComponentSupervisorState {
+    unhealthy_samples: u32,
+    restart_count: u32,
+    last_restart: Option<Instant>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -368,6 +396,7 @@ fn main() -> Result<()> {
         CommandKind::Disconnect(args) => run_disconnect(args)?,
         CommandKind::Usage(args) => run_usage(args)?,
         CommandKind::Restart(args) => run_restart(args)?,
+        CommandKind::Supervise(args) => run_supervisor(args)?,
         CommandKind::Doctor(args) => run_doctor(args)?,
         CommandKind::Logs(args) => run_logs(args)?,
         CommandKind::Soak(args) => run_soak(args)?,
@@ -631,6 +660,67 @@ fn run_restart(args: RestartArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_supervisor(args: SupervisorArgs) -> Result<()> {
+    preflight_connect_args(&args.connect)?;
+    let mut supervisor_log = open_log_file(&args.supervisor_log_file, true)?;
+    emit_supervisor_event(
+        &mut supervisor_log,
+        "supervisor_started",
+        None,
+        "starting tunnel supervisor",
+        None,
+    )?;
+
+    ensure_supervised_session(&args, &mut supervisor_log)?;
+    let mut session = load_manifest(&args.connect.session_file)?;
+    emit_supervisor_event(
+        &mut supervisor_log,
+        "session_loaded",
+        None,
+        "supervisor loaded active session manifest",
+        Some(&session),
+    )?;
+
+    let mut agent_state = ComponentSupervisorState::default();
+    let mut gateway_state = ComponentSupervisorState::default();
+    let mut iteration = 0_u64;
+
+    loop {
+        iteration += 1;
+
+        let agent_changed = supervise_component(
+            &mut session,
+            ComponentSelection::Agent,
+            &mut agent_state,
+            &args,
+            &mut supervisor_log,
+        )?;
+        let gateway_changed = supervise_component(
+            &mut session,
+            ComponentSelection::Gateway,
+            &mut gateway_state,
+            &args,
+            &mut supervisor_log,
+        )?;
+        if agent_changed || gateway_changed {
+            save_manifest(&args.connect.session_file, &session)?;
+        }
+
+        if args.max_iterations == Some(iteration) {
+            emit_supervisor_event(
+                &mut supervisor_log,
+                "supervisor_stopped",
+                None,
+                format!("reached max_iterations={iteration}"),
+                Some(&session),
+            )?;
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_secs(args.monitor_interval_secs.max(1)));
+    }
+}
+
 fn run_doctor(args: DoctorArgs) -> Result<()> {
     let mut checks = Vec::new();
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
@@ -833,6 +923,305 @@ fn run_soak(args: SoakArgs) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -> Result<()> {
+    let existing_session = read_optional_json::<SessionManifest>(&args.connect.session_file)?;
+
+    if let Some(session) = existing_session {
+        let agent_running = pid_is_running_optional(session.agent_pid)?;
+        let gateway_running = pid_is_running_optional(session.gateway_pid)?;
+
+        if agent_running && gateway_running {
+            emit_supervisor_event(
+                supervisor_log,
+                "session_reused",
+                None,
+                "existing tunnel session is already running",
+                Some(&session),
+            )?;
+            return Ok(());
+        }
+
+        emit_supervisor_event(
+            supervisor_log,
+            "session_reconcile_started",
+            None,
+            format!(
+                "existing session is not fully running: agent_running={agent_running} gateway_running={gateway_running}"
+            ),
+            Some(&session),
+        )?;
+        run_disconnect(disconnect_args_from_connect(&args.connect))?;
+    }
+
+    emit_supervisor_event(
+        supervisor_log,
+        "session_connect_started",
+        None,
+        "starting supervised tunnel session",
+        None,
+    )?;
+    run_connect(args.connect.clone())?;
+    let session = load_manifest(&args.connect.session_file)?;
+    emit_supervisor_event(
+        supervisor_log,
+        "session_connect_ready",
+        None,
+        "supervised tunnel session is ready",
+        Some(&session),
+    )?;
+
+    Ok(())
+}
+
+fn supervise_component(
+    session: &mut SessionManifest,
+    component: ComponentSelection,
+    state: &mut ComponentSupervisorState,
+    args: &SupervisorArgs,
+    supervisor_log: &mut File,
+) -> Result<bool> {
+    let pid = component_pid(session, component);
+    if !pid_is_running_optional(pid)? {
+        return restart_supervised_component(
+            session,
+            component,
+            state,
+            args,
+            supervisor_log,
+            format!("process is not running: pid={pid:?}"),
+        );
+    }
+
+    let status_path = component_status_file(session, component);
+    let Some(status) = read_optional_json::<RuntimeStatus>(status_path)? else {
+        return observe_unhealthy_component(
+            session,
+            component,
+            state,
+            args,
+            supervisor_log,
+            format!("status file not found: {}", status_path.display()),
+        );
+    };
+
+    let age_secs = now_unix_secs().saturating_sub(status.observed_at_unix_secs);
+    if age_secs > args.stale_after_secs {
+        return observe_unhealthy_component(
+            session,
+            component,
+            state,
+            args,
+            supervisor_log,
+            format!("status is stale: observed {age_secs}s ago"),
+        );
+    }
+
+    if status.state != HealthState::Healthy {
+        return observe_unhealthy_component(
+            session,
+            component,
+            state,
+            args,
+            supervisor_log,
+            format!("runtime state is {:?}: {}", status.state, status.detail),
+        );
+    }
+
+    if matches!(status.phase, TunnelPhase::Stale) {
+        return observe_unhealthy_component(
+            session,
+            component,
+            state,
+            args,
+            supervisor_log,
+            format!("runtime phase is {:?}: {}", status.phase, status.detail),
+        );
+    }
+
+    if state.unhealthy_samples > 0 {
+        emit_supervisor_event(
+            supervisor_log,
+            "component_recovered_without_restart",
+            Some(component),
+            format!(
+                "{} recovered after {} unhealthy sample(s)",
+                component_label(component),
+                state.unhealthy_samples
+            ),
+            Some(session),
+        )?;
+    }
+    state.unhealthy_samples = 0;
+
+    Ok(false)
+}
+
+fn observe_unhealthy_component(
+    session: &mut SessionManifest,
+    component: ComponentSelection,
+    state: &mut ComponentSupervisorState,
+    args: &SupervisorArgs,
+    supervisor_log: &mut File,
+    reason: String,
+) -> Result<bool> {
+    state.unhealthy_samples += 1;
+    emit_supervisor_event(
+        supervisor_log,
+        "component_unhealthy_sample",
+        Some(component),
+        format!(
+            "{reason}; sample={}/{}",
+            state.unhealthy_samples, args.unhealthy_grace_samples
+        ),
+        Some(session),
+    )?;
+
+    if state.unhealthy_samples >= args.unhealthy_grace_samples.max(1) {
+        return restart_supervised_component(
+            session,
+            component,
+            state,
+            args,
+            supervisor_log,
+            reason,
+        );
+    }
+
+    Ok(false)
+}
+
+fn restart_supervised_component(
+    session: &mut SessionManifest,
+    component: ComponentSelection,
+    state: &mut ComponentSupervisorState,
+    args: &SupervisorArgs,
+    supervisor_log: &mut File,
+    reason: String,
+) -> Result<bool> {
+    if state.restart_count >= args.max_restarts_per_component {
+        emit_supervisor_event(
+            supervisor_log,
+            "component_restart_limit_reached",
+            Some(component),
+            format!(
+                "{} restart limit reached after {} restart(s): {reason}",
+                component_label(component),
+                state.restart_count
+            ),
+            Some(session),
+        )?;
+        bail!(
+            "{} restart limit reached after {} restart(s)",
+            component_label(component),
+            state.restart_count
+        );
+    }
+
+    if let Some(last_restart) = state.last_restart {
+        let elapsed = last_restart.elapsed();
+        let cooldown = Duration::from_secs(args.restart_cooldown_secs);
+        if elapsed < cooldown {
+            emit_supervisor_event(
+                supervisor_log,
+                "component_restart_suppressed",
+                Some(component),
+                format!(
+                    "{} restart suppressed by cooldown; {:.1}s remaining: {reason}",
+                    component_label(component),
+                    (cooldown - elapsed).as_secs_f64()
+                ),
+                Some(session),
+            )?;
+            return Ok(false);
+        }
+    }
+
+    emit_supervisor_event(
+        supervisor_log,
+        "component_restart_started",
+        Some(component),
+        format!("restarting {}: {reason}", component_label(component)),
+        Some(session),
+    )?;
+    restart_component(session, component)?;
+    state.restart_count += 1;
+    state.unhealthy_samples = 0;
+    state.last_restart = Some(Instant::now());
+    emit_supervisor_event(
+        supervisor_log,
+        "component_restart_complete",
+        Some(component),
+        format!(
+            "restarted {}; restart_count={}",
+            component_label(component),
+            state.restart_count
+        ),
+        Some(session),
+    )?;
+
+    Ok(true)
+}
+
+fn emit_supervisor_event(
+    log: &mut File,
+    event: &str,
+    component: Option<ComponentSelection>,
+    detail: impl Into<String>,
+    session: Option<&SessionManifest>,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "type": "supervisor_event",
+        "event": event,
+        "component": component.map(component_label),
+        "detail": detail.into(),
+        "observed_at_unix_secs": now_unix_secs(),
+        "tenant": session.map(|session| session.tenant.as_str()),
+        "attachment": session.map(|session| session.attachment.as_str()),
+        "agent_pid": session.and_then(|session| session.agent_pid),
+        "gateway_pid": session.and_then(|session| session.gateway_pid),
+    });
+    let line = serde_json::to_string(&payload)?;
+    writeln!(log, "{line}").context("failed to write supervisor event")?;
+    log.flush().context("failed to flush supervisor event")?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn component_pid(session: &SessionManifest, component: ComponentSelection) -> Option<u32> {
+    match component {
+        ComponentSelection::Agent => session.agent_pid,
+        ComponentSelection::Gateway => session.gateway_pid,
+    }
+}
+
+fn component_status_file(session: &SessionManifest, component: ComponentSelection) -> &Path {
+    match component {
+        ComponentSelection::Agent => &session.agent_status_file,
+        ComponentSelection::Gateway => &session.gateway_status_file,
+    }
+}
+
+fn component_label(component: ComponentSelection) -> &'static str {
+    match component {
+        ComponentSelection::Agent => "agent",
+        ComponentSelection::Gateway => "gateway",
+    }
+}
+
+fn disconnect_args_from_connect(args: &ConnectArgs) -> DisconnectArgs {
+    DisconnectArgs {
+        agent_config: args.agent_config.clone(),
+        agent_state_file: args.agent_state_file.clone(),
+        agent_status_file: args.agent_status_file.clone(),
+        gateway_state_file: args.gateway_state_file.clone(),
+        gateway_status_file: args.gateway_status_file.clone(),
+        session_file: args.session_file.clone(),
+        route_mode: args.route_mode,
+        forwarding_mode: args.forwarding_mode,
+        nat_mode: args.nat_mode,
+    }
 }
 
 fn doctor_check(
