@@ -101,6 +101,16 @@ struct LoginArgs {
     agent_config: PathBuf,
     #[arg(long, default_value = "/private/tmp/tunnel-gateway-wg.json")]
     gateway_config: PathBuf,
+    #[arg(long, default_value = "127.0.0.1")]
+    gateway_host: String,
+    #[arg(long, default_value_t = 7000)]
+    gateway_port: u16,
+    #[arg(long, default_value = "1.1.1.0/24")]
+    destination_cidr: String,
+    #[arg(long, default_value = "10.201.0.2")]
+    agent_tunnel_address: String,
+    #[arg(long, default_value = "10.201.0.1")]
+    gateway_tunnel_address: String,
     #[arg(long, default_value = "en0")]
     egress_interface: String,
     #[arg(long)]
@@ -924,9 +934,11 @@ fn run_login(args: LoginArgs) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "logged_in": true,
-            "mode": "local",
+            "mode": if args.gateway_host == "127.0.0.1" { "local" } else { "remote" },
             "profile": args.profile,
             "profile_file": args.profile_file,
+            "gateway_host": args.gateway_host,
+            "gateway_port": args.gateway_port,
             "generated_configs": generated_configs,
             "ready": readiness.ready,
             "readiness": readiness,
@@ -1065,11 +1077,11 @@ fn existing_config_action(
 
 fn build_local_wireguard_config_pair(args: &LoginArgs) -> (TunnelConfig, TunnelConfig) {
     let tunnel_id = String::from("local-tunnel");
-    let gateway_host = String::from("127.0.0.1");
-    let gateway_port = 7000;
+    let gateway_host = args.gateway_host.clone();
+    let gateway_port = args.gateway_port;
     let route_policy = RoutePolicy {
         traffic_class: TrafficClass::BulkExport,
-        destination_cidrs: vec![String::from("1.1.1.0/24")],
+        destination_cidrs: vec![args.destination_cidr.clone()],
         routing_mark: 100,
     };
     let (agent_private, agent_public) = generate_wireguard_keypair();
@@ -1092,8 +1104,8 @@ fn build_local_wireguard_config_pair(args: &LoginArgs) -> (TunnelConfig, TunnelC
                 host: gateway_host.clone(),
                 port: gateway_port,
             }),
-            local_tunnel_address: String::from("10.201.0.2"),
-            peer_tunnel_address: String::from("10.201.0.1"),
+            local_tunnel_address: args.agent_tunnel_address.clone(),
+            peer_tunnel_address: args.gateway_tunnel_address.clone(),
             private_key_base64: encode_key_32(&agent_private),
             peer_public_key_base64: encode_key_32(&gateway_public),
             preshared_key_base64: None,
@@ -1116,8 +1128,8 @@ fn build_local_wireguard_config_pair(args: &LoginArgs) -> (TunnelConfig, TunnelC
             local_bind_host: String::from("0.0.0.0"),
             local_bind_port: gateway_port,
             peer_endpoint: None,
-            local_tunnel_address: String::from("10.201.0.1"),
-            peer_tunnel_address: String::from("10.201.0.2"),
+            local_tunnel_address: args.gateway_tunnel_address.clone(),
+            peer_tunnel_address: args.agent_tunnel_address.clone(),
             private_key_base64: encode_key_32(&gateway_private),
             peer_public_key_base64: encode_key_32(&agent_public),
             preshared_key_base64: None,
@@ -1881,6 +1893,11 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
         attachment: Some(args.profile.clone()),
         agent_config: PathBuf::from("/private/tmp/tunnel-agent-wg.json"),
         gateway_config: PathBuf::from("/private/tmp/tunnel-gateway-wg.json"),
+        gateway_host: String::from("127.0.0.1"),
+        gateway_port: 7000,
+        destination_cidr: String::from("1.1.1.0/24"),
+        agent_tunnel_address: String::from("10.201.0.2"),
+        gateway_tunnel_address: String::from("10.201.0.1"),
         egress_interface: String::from("en0"),
         force: false,
     };
@@ -5059,6 +5076,46 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn login_generation_supports_remote_gateway_host() -> Result<()> {
+        let root = test_root("remote-gateway")?;
+        let mut args = test_login_args(&root, true);
+        args.gateway_host = String::from("203.0.113.10");
+        args.gateway_port = 7182;
+        args.destination_cidr = String::from("8.8.8.0/24");
+
+        ensure_local_configs_for_login(&args)?;
+        let agent_config: TunnelConfig =
+            serde_json::from_str(&fs::read_to_string(&args.agent_config)?)?;
+        let gateway_config: TunnelConfig =
+            serde_json::from_str(&fs::read_to_string(&args.gateway_config)?)?;
+
+        assert_eq!(agent_config.gateway.host, "203.0.113.10");
+        assert_eq!(agent_config.gateway.port, 7182);
+        assert_eq!(
+            agent_config
+                .wireguard
+                .as_ref()
+                .and_then(|wireguard| wireguard.peer_endpoint.as_ref())
+                .map(|endpoint| (endpoint.host.as_str(), endpoint.port)),
+            Some(("203.0.113.10", 7182))
+        );
+        assert_eq!(
+            agent_config.route_policy.destination_cidrs,
+            vec![String::from("8.8.8.0/24")]
+        );
+        assert_eq!(gateway_config.gateway.host, "203.0.113.10");
+        assert_eq!(
+            gateway_config
+                .wireguard
+                .as_ref()
+                .map(|wireguard| wireguard.local_bind_port),
+            Some(7182)
+        );
+        remove_test_root(root);
+        Ok(())
+    }
+
     fn test_login_args(root: &Path, force: bool) -> LoginArgs {
         LoginArgs {
             profile: String::from("test-dev"),
@@ -5067,6 +5124,11 @@ mod tests {
             attachment: Some(String::from("test-attachment")),
             agent_config: root.join("agent.json"),
             gateway_config: root.join("gateway.json"),
+            gateway_host: String::from("127.0.0.1"),
+            gateway_port: 7000,
+            destination_cidr: String::from("1.1.1.0/24"),
+            agent_tunnel_address: String::from("10.201.0.2"),
+            gateway_tunnel_address: String::from("10.201.0.1"),
             egress_interface: String::from("en0"),
             force,
         }
