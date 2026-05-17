@@ -119,6 +119,10 @@ struct LoginArgs {
     gateway_tunnel_address: String,
     #[arg(long, default_value = "en0")]
     egress_interface: String,
+    #[arg(long, hide = true, value_enum)]
+    mode: Option<ProfileMode>,
+    #[arg(long, hide = true, value_enum)]
+    local_component: Option<ComponentSelection>,
     #[arg(long)]
     force: bool,
 }
@@ -195,6 +199,10 @@ struct ConnectArgs {
         default_value = "/private/tmp/tunnel-supervisor.log"
     )]
     supervisor_log_file: PathBuf,
+    #[arg(long, hide = true, value_enum, default_value_t = ProfileMode::Local)]
+    mode: ProfileMode,
+    #[arg(long, hide = true, value_enum)]
+    local_component: Option<ComponentSelection>,
 }
 
 impl ConnectArgs {
@@ -223,6 +231,8 @@ impl ConnectArgs {
             warmup_settle_secs: 15,
             oneshot: false,
             supervisor_log_file: PathBuf::from("/private/tmp/tunnel-supervisor.log"),
+            mode: ProfileMode::Local,
+            local_component: None,
         }
     }
 }
@@ -401,6 +411,10 @@ struct ProfileInitArgs {
     gateway_config: PathBuf,
     #[arg(long, default_value = "en0")]
     egress_interface: String,
+    #[arg(long, hide = true, value_enum, default_value_t = ProfileMode::Local)]
+    mode: ProfileMode,
+    #[arg(long, hide = true, value_enum)]
+    local_component: Option<ComponentSelection>,
     #[arg(long)]
     force: bool,
 }
@@ -481,6 +495,18 @@ enum SystemCommandMode {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+enum ProfileMode {
+    Local,
+    Remote,
+}
+
+impl Default for ProfileMode {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 enum ComponentSelection {
     Agent,
     Gateway,
@@ -520,6 +546,10 @@ struct SessionManifest {
     nat_mode: SystemCommandMode,
     agent_pid: Option<u32>,
     gateway_pid: Option<u32>,
+    #[serde(default)]
+    mode: ProfileMode,
+    #[serde(default)]
+    local_component: Option<ComponentSelection>,
     #[serde(default)]
     supervised: bool,
     #[serde(default)]
@@ -649,6 +679,9 @@ struct ConnectWarmupReport {
 struct ConnectReport {
     tenant: String,
     attachment: String,
+    mode: ProfileMode,
+    local_component: Option<ComponentSelection>,
+    remote_component: Option<ComponentSelection>,
     supervised: bool,
     supervisor_pid: Option<u32>,
     agent_pid: Option<u32>,
@@ -657,8 +690,9 @@ struct ConnectReport {
     gateway_log_file: PathBuf,
     supervisor_log_file: PathBuf,
     ready: bool,
-    warmup: ConnectWarmupReport,
+    warmup: Option<ConnectWarmupReport>,
     session_file: PathBuf,
+    detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -740,6 +774,10 @@ struct TunnelProfile {
     forwarding_mode: Option<SystemCommandMode>,
     nat_mode: Option<SystemCommandMode>,
     ready_timeout_secs: Option<u64>,
+    #[serde(default)]
+    mode: ProfileMode,
+    #[serde(default)]
+    local_component: Option<ComponentSelection>,
 }
 
 #[derive(Debug, Serialize)]
@@ -952,6 +990,8 @@ fn apply_profile(args: &mut ConnectArgs, profile: &TunnelProfile) {
     if let Some(value) = profile.ready_timeout_secs {
         args.ready_timeout_secs = value;
     }
+    args.mode = profile.mode;
+    args.local_component = profile.local_component;
 }
 
 fn required_connect_value<'a>(value: Option<&'a String>, label: &str) -> Result<&'a str> {
@@ -963,6 +1003,8 @@ fn required_connect_value<'a>(value: Option<&'a String>, label: &str) -> Result<
 fn run_login(args: LoginArgs) -> Result<()> {
     let next = format!("tunnel-cli connect {}", args.profile);
     let generated_configs = ensure_local_configs_for_login(&args)?;
+    let mode = resolved_login_mode(&args);
+    let local_component = resolved_login_local_component(&args, mode)?;
     let profile_args = ProfileInitArgs {
         profile: args.profile.clone(),
         profile_file: args.profile_file.clone(),
@@ -971,6 +1013,8 @@ fn run_login(args: LoginArgs) -> Result<()> {
         agent_config: args.agent_config.clone(),
         gateway_config: args.gateway_config.clone(),
         egress_interface: args.egress_interface.clone(),
+        mode,
+        local_component,
         force: true,
     };
     write_profile(profile_args)?;
@@ -985,7 +1029,9 @@ fn run_login(args: LoginArgs) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "logged_in": true,
-            "mode": if args.gateway_host == "127.0.0.1" { "local" } else { "remote" },
+            "mode": mode,
+            "local_component": local_component,
+            "remote_component": remote_component_for(mode, local_component),
             "profile": args.profile,
             "profile_file": args.profile_file,
             "gateway_host": args.gateway_host,
@@ -997,6 +1043,28 @@ fn run_login(args: LoginArgs) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+fn resolved_login_mode(args: &LoginArgs) -> ProfileMode {
+    args.mode.unwrap_or_else(|| {
+        if args.gateway_host == "127.0.0.1" {
+            ProfileMode::Local
+        } else {
+            ProfileMode::Remote
+        }
+    })
+}
+
+fn resolved_login_local_component(
+    args: &LoginArgs,
+    mode: ProfileMode,
+) -> Result<Option<ComponentSelection>> {
+    match mode {
+        ProfileMode::Local => Ok(args.local_component),
+        ProfileMode::Remote => Ok(Some(
+            args.local_component.unwrap_or(ComponentSelection::Agent),
+        )),
+    }
 }
 
 fn run_profile_init(args: ProfileInitArgs) -> Result<()> {
@@ -1217,8 +1285,40 @@ fn build_connect_readiness(args: &ConnectArgs) -> ReadinessReport {
         "attachment is set",
         "attachment is missing",
     );
-    push_config_check(&mut checks, "agent_config", &args.agent_config);
-    push_config_check(&mut checks, "gateway_config", &args.gateway_config);
+    checks.push(ReadinessCheck {
+        name: String::from("mode"),
+        state: DoctorState::Pass,
+        detail: format!("profile mode is {:?}", args.mode),
+    });
+    match args.mode {
+        ProfileMode::Local => {
+            push_config_check(&mut checks, "agent_config", &args.agent_config);
+            push_config_check(&mut checks, "gateway_config", &args.gateway_config);
+        }
+        ProfileMode::Remote => {
+            if let Some(local_component) = args.local_component {
+                checks.push(ReadinessCheck {
+                    name: String::from("local_component"),
+                    state: DoctorState::Pass,
+                    detail: format!("local component is {}", component_label(local_component)),
+                });
+                match local_component {
+                    ComponentSelection::Agent => {
+                        push_config_check(&mut checks, "agent_config", &args.agent_config)
+                    }
+                    ComponentSelection::Gateway => {
+                        push_config_check(&mut checks, "gateway_config", &args.gateway_config)
+                    }
+                }
+            } else {
+                checks.push(ReadinessCheck {
+                    name: String::from("local_component"),
+                    state: DoctorState::Fail,
+                    detail: String::from("remote profile requires local_component"),
+                });
+            }
+        }
+    }
     push_required_string_check(
         &mut checks,
         "egress_interface",
@@ -1333,6 +1433,8 @@ fn write_profile(args: ProfileInitArgs) -> Result<()> {
         forwarding_mode: Some(SystemCommandMode::Apply),
         nat_mode: Some(SystemCommandMode::Apply),
         ready_timeout_secs: Some(12),
+        mode: args.mode,
+        local_component: args.local_component,
     };
     let mut config = if args.profile_file.exists() {
         load_profile_config(&args.profile_file)?
@@ -1504,7 +1606,10 @@ fn run_connect(args: ConnectArgs) -> Result<()> {
         return run_connect_oneshot(args);
     }
 
-    let report = connect_supervised(args)?;
+    let report = match args.mode {
+        ProfileMode::Local => connect_supervised(args)?,
+        ProfileMode::Remote => connect_remote_side(args)?,
+    };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -1537,6 +1642,9 @@ fn connect_report_from_session(
     ConnectReport {
         tenant: session.tenant,
         attachment: session.attachment,
+        mode: session.mode,
+        local_component: session.local_component,
+        remote_component: remote_component_for(session.mode, session.local_component),
         supervised: true,
         supervisor_pid: session.supervisor_pid,
         agent_pid: session.agent_pid,
@@ -1545,9 +1653,74 @@ fn connect_report_from_session(
         gateway_log_file: session.gateway_log_file,
         supervisor_log_file: session.supervisor_log_file,
         ready: true,
-        warmup,
+        warmup: Some(warmup),
         session_file: args.session_file.clone(),
+        detail: String::from("local supervised tunnel is active"),
     }
+}
+
+fn connect_remote_side(args: ConnectArgs) -> Result<ConnectReport> {
+    let local_component = args
+        .local_component
+        .ok_or_else(|| anyhow!("remote profile requires local_component=agent or gateway"))?;
+    preflight_side_args(&args, local_component)?;
+    cleanup_remote_side_state(&args, local_component)?;
+
+    let side_report = match local_component {
+        ComponentSelection::Agent => run_agent_side(args.clone())?,
+        ComponentSelection::Gateway => run_gateway_side(args.clone())?,
+    };
+    let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
+    let attachment = required_connect_value(args.attachment.as_ref(), "attachment")?.to_owned();
+    let remote_component = remote_component_for(ProfileMode::Remote, Some(local_component))
+        .ok_or_else(|| anyhow!("remote profile has no remote component"))?;
+    let session = SessionManifest {
+        tenant,
+        attachment,
+        agent_config: args.agent_config.clone(),
+        gateway_config: args.gateway_config.clone(),
+        agent_state_file: args.agent_state_file.clone(),
+        agent_status_file: args.agent_status_file.clone(),
+        gateway_state_file: args.gateway_state_file.clone(),
+        gateway_status_file: args.gateway_status_file.clone(),
+        agent_log_file: args.agent_log_file.clone(),
+        gateway_log_file: args.gateway_log_file.clone(),
+        egress_interface: args.egress_interface.clone(),
+        route_mode: args.route_mode,
+        forwarding_mode: args.forwarding_mode,
+        nat_mode: args.nat_mode,
+        agent_pid: (local_component == ComponentSelection::Agent).then_some(side_report.pid),
+        gateway_pid: (local_component == ComponentSelection::Gateway).then_some(side_report.pid),
+        mode: ProfileMode::Remote,
+        local_component: Some(local_component),
+        supervised: false,
+        supervisor_pid: None,
+        supervisor_log_file: args.supervisor_log_file.clone(),
+    };
+    save_manifest(&args.session_file, &session)?;
+
+    Ok(ConnectReport {
+        tenant: session.tenant,
+        attachment: session.attachment,
+        mode: session.mode,
+        local_component: session.local_component,
+        remote_component: Some(remote_component),
+        supervised: false,
+        supervisor_pid: None,
+        agent_pid: session.agent_pid,
+        gateway_pid: session.gateway_pid,
+        agent_log_file: session.agent_log_file,
+        gateway_log_file: session.gateway_log_file,
+        supervisor_log_file: session.supervisor_log_file,
+        ready: true,
+        warmup: None,
+        session_file: args.session_file,
+        detail: format!(
+            "remote profile started local {}; remote {} must already be running on its host",
+            component_label(local_component),
+            component_label(remote_component)
+        ),
+    })
 }
 
 fn spawn_supervisor_for_connect(args: &ConnectArgs) -> Result<(u32, SessionManifest)> {
@@ -1624,6 +1797,11 @@ fn warm_connect_session(
 }
 
 fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
+    if args.mode != ProfileMode::Local {
+        bail!(
+            "oneshot connect only owns local profiles; remote profiles use side-specific lifecycle"
+        );
+    }
     preflight_connect_args(&args)?;
     reconcile_before_connect(&args)?;
     let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
@@ -1709,6 +1887,8 @@ fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
         nat_mode: args.nat_mode,
         agent_pid: Some(agent_child.id()),
         gateway_pid: Some(gateway_child.id()),
+        mode: ProfileMode::Local,
+        local_component: None,
         supervised: false,
         supervisor_pid: None,
         supervisor_log_file: args.supervisor_log_file.clone(),
@@ -1932,17 +2112,29 @@ fn disconnect_tunnel(args: DisconnectArgs) -> Result<DisconnectReport> {
     let supervisor_pid = session.as_ref().and_then(|session| session.supervisor_pid);
     let agent_pid = session.as_ref().and_then(|session| session.agent_pid);
     let gateway_pid = session.as_ref().and_then(|session| session.gateway_pid);
+    let owns_agent = session
+        .as_ref()
+        .map(|session| component_is_locally_owned(session, ComponentSelection::Agent))
+        .unwrap_or(true);
+    let owns_gateway = session
+        .as_ref()
+        .map(|session| component_is_locally_owned(session, ComponentSelection::Gateway))
+        .unwrap_or(true);
 
     if let Some(session) = &session {
         terminate_pid_hard_except_self(session.supervisor_pid, "supervisor")?;
-        terminate_pid_hard(session.agent_pid, "agent")?;
-        terminate_pid_hard(session.gateway_pid, "gateway")?;
+        if owns_agent {
+            terminate_pid_hard(session.agent_pid, "agent")?;
+        }
+        if owns_gateway {
+            terminate_pid_hard(session.gateway_pid, "gateway")?;
+        }
     }
 
     let agent_bin = sibling_binary("tunnel-agent")?;
     let gateway_bin = sibling_binary("tunnel-gateway")?;
 
-    if args.agent_state_file.exists() {
+    if owns_agent && args.agent_state_file.exists() {
         run_cleanup_binary_quiet(
             &agent_bin,
             &[
@@ -1959,7 +2151,7 @@ fn disconnect_tunnel(args: DisconnectArgs) -> Result<DisconnectReport> {
         )?;
     }
 
-    if args.gateway_state_file.exists() {
+    if owns_gateway && args.gateway_state_file.exists() {
         run_cleanup_binary_quiet(
             &gateway_bin,
             &[
@@ -1976,8 +2168,12 @@ fn disconnect_tunnel(args: DisconnectArgs) -> Result<DisconnectReport> {
         )?;
     }
 
-    remove_stale_file("agent status", &args.agent_status_file)?;
-    remove_stale_file("gateway status", &args.gateway_status_file)?;
+    if owns_agent {
+        remove_stale_file("agent status", &args.agent_status_file)?;
+    }
+    if owns_gateway {
+        remove_stale_file("gateway status", &args.gateway_status_file)?;
+    }
 
     let mut session_removed = !args.session_file.exists();
     if args.session_file.exists() {
@@ -1991,12 +2187,12 @@ fn disconnect_tunnel(args: DisconnectArgs) -> Result<DisconnectReport> {
     }
 
     let supervisor_stopped = !pid_is_running_optional(supervisor_pid)?;
-    let agent_stopped = !pid_is_running_optional(agent_pid)?;
-    let gateway_stopped = !pid_is_running_optional(gateway_pid)?;
-    let agent_state_removed = !args.agent_state_file.exists();
-    let agent_status_removed = !args.agent_status_file.exists();
-    let gateway_state_removed = !args.gateway_state_file.exists();
-    let gateway_status_removed = !args.gateway_status_file.exists();
+    let agent_stopped = !owns_agent || !pid_is_running_optional(agent_pid)?;
+    let gateway_stopped = !owns_gateway || !pid_is_running_optional(gateway_pid)?;
+    let agent_state_removed = !owns_agent || !args.agent_state_file.exists();
+    let agent_status_removed = !owns_agent || !args.agent_status_file.exists();
+    let gateway_state_removed = !owns_gateway || !args.gateway_state_file.exists();
+    let gateway_status_removed = !owns_gateway || !args.gateway_status_file.exists();
     let agent_cleaned = agent_state_removed && agent_status_removed;
     let gateway_cleaned = gateway_state_removed && gateway_status_removed;
     let disconnected = supervisor_stopped
@@ -2048,6 +2244,8 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
         agent_tunnel_address: String::from("10.201.0.2"),
         gateway_tunnel_address: String::from("10.201.0.1"),
         egress_interface: String::from("en0"),
+        mode: None,
+        local_component: None,
         force: false,
     };
 
@@ -2065,6 +2263,8 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
         agent_config: login_args.agent_config.clone(),
         gateway_config: login_args.gateway_config.clone(),
         egress_interface: login_args.egress_interface.clone(),
+        mode: ProfileMode::Local,
+        local_component: None,
         force: true,
     })?;
 
@@ -2087,8 +2287,10 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
         &mut checks,
         "connect_ready",
         connect_report.ready
-            && connect_report.warmup.agent_active
-            && connect_report.warmup.gateway_active,
+            && connect_report
+                .warmup
+                .as_ref()
+                .is_some_and(|warmup| warmup.agent_active && warmup.gateway_active),
         "connect warmed the packet path and both runtimes are active",
         "connect did not produce an active warmed tunnel",
     );
@@ -2146,7 +2348,9 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
         status_healthy,
         disconnect_clean: disconnect_report.disconnected,
         second_disconnect_clean: second_disconnect_report.disconnected,
-        warmup: connect_report.warmup,
+        warmup: connect_report
+            .warmup
+            .expect("local lifecycle connect always returns warmup"),
         checks,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2352,6 +2556,9 @@ fn run_restart(args: RestartArgs) -> Result<()> {
 fn run_supervisor(args: SupervisorArgs) -> Result<()> {
     let mut args = args;
     args.connect = resolve_connect_args(args.connect)?;
+    if args.connect.mode != ProfileMode::Local {
+        bail!("supervisor only owns local profiles; remote profiles use side-specific lifecycle");
+    }
     preflight_connect_args(&args.connect)?;
     let mut supervisor_log = open_log_file(&args.connect.supervisor_log_file, true)?;
     emit_supervisor_event(
@@ -2438,61 +2645,99 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         ),
     ));
 
-    check_process("agent_process", session.agent_pid, &mut checks);
-    check_process("gateway_process", session.gateway_pid, &mut checks);
+    check_component_process(&session, ComponentSelection::Agent, &mut checks);
+    check_component_process(&session, ComponentSelection::Gateway, &mut checks);
 
     let agent_state = read_optional_json::<AgentRuntimeState>(&session.agent_state_file)?;
     let gateway_state = read_optional_json::<GatewayRuntimeState>(&session.gateway_state_file)?;
     let gateway_config = read_optional_json::<TunnelConfig>(&session.gateway_config)?;
 
-    check_agent_state(agent_state.as_ref(), &session.agent_state_file, &mut checks);
-    check_gateway_state(
-        gateway_state.as_ref(),
-        &session.gateway_state_file,
-        &mut checks,
-    );
-    check_route_to_target(&args.target, agent_state.as_ref(), &mut checks)?;
-    check_gateway_pf_rules(
-        gateway_state.as_ref(),
-        gateway_config.as_ref(),
-        &session.egress_interface,
-        &mut checks,
-    )?;
+    if component_is_locally_owned(&session, ComponentSelection::Agent) {
+        check_agent_state(agent_state.as_ref(), &session.agent_state_file, &mut checks);
+        check_route_to_target(&args.target, agent_state.as_ref(), &mut checks)?;
+    } else {
+        push_remote_skip(&mut checks, "agent_state", ComponentSelection::Agent);
+        push_remote_skip(&mut checks, "route_to_target", ComponentSelection::Agent);
+    }
+
+    if component_is_locally_owned(&session, ComponentSelection::Gateway) {
+        check_gateway_state(
+            gateway_state.as_ref(),
+            &session.gateway_state_file,
+            &mut checks,
+        );
+        check_gateway_pf_rules(
+            gateway_state.as_ref(),
+            gateway_config.as_ref(),
+            &session.egress_interface,
+            &mut checks,
+        )?;
+    } else {
+        push_remote_skip(&mut checks, "gateway_state", ComponentSelection::Gateway);
+        push_remote_skip(&mut checks, "gateway_pf_rules", ComponentSelection::Gateway);
+    }
     let agent_packet_before = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?
         .map(|status| status.packet_path);
     let gateway_packet_before = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?
         .map(|status| status.packet_path);
-    let probe_passed = check_probe(&args.target, args.probe_timeout_secs, &mut checks)?;
+    let should_probe = session.mode == ProfileMode::Local
+        || session.local_component == Some(ComponentSelection::Agent);
+    let probe_passed = if should_probe {
+        check_probe(&args.target, args.probe_timeout_secs, &mut checks)?
+    } else {
+        checks.push(doctor_check(
+            "probe",
+            DoctorState::Warn,
+            "skipped because this remote host owns the gateway side, not the agent route side",
+        ));
+        false
+    };
     if probe_passed {
         wait_for_active_status_after_probe(&session, args.post_probe_settle_secs)?;
     }
 
     let agent_status = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
     let gateway_status = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
-    check_packet_path_analysis(
-        probe_passed,
-        agent_packet_before.as_ref(),
-        agent_status.as_ref().map(|status| &status.packet_path),
-        gateway_packet_before.as_ref(),
-        gateway_status.as_ref().map(|status| &status.packet_path),
-        &mut checks,
-    );
-    check_runtime_status(
-        "agent_status",
-        agent_status.as_ref(),
-        &session.agent_status_file,
-        args.stale_after_secs,
-        probe_passed,
-        &mut checks,
-    );
-    check_runtime_status(
-        "gateway_status",
-        gateway_status.as_ref(),
-        &session.gateway_status_file,
-        args.stale_after_secs,
-        probe_passed,
-        &mut checks,
-    );
+    if should_probe {
+        check_packet_path_analysis(
+            probe_passed,
+            agent_packet_before.as_ref(),
+            agent_status.as_ref().map(|status| &status.packet_path),
+            gateway_packet_before.as_ref(),
+            gateway_status.as_ref().map(|status| &status.packet_path),
+            &mut checks,
+        );
+    } else {
+        checks.push(doctor_check(
+            "packet_path_analysis",
+            DoctorState::Warn,
+            "skipped because this remote host cannot generate agent-side routed probe traffic",
+        ));
+    }
+    if component_is_locally_owned(&session, ComponentSelection::Agent) {
+        check_runtime_status(
+            "agent_status",
+            agent_status.as_ref(),
+            &session.agent_status_file,
+            args.stale_after_secs,
+            probe_passed,
+            &mut checks,
+        );
+    } else {
+        push_remote_skip(&mut checks, "agent_status", ComponentSelection::Agent);
+    }
+    if component_is_locally_owned(&session, ComponentSelection::Gateway) {
+        check_runtime_status(
+            "gateway_status",
+            gateway_status.as_ref(),
+            &session.gateway_status_file,
+            args.stale_after_secs,
+            probe_passed,
+            &mut checks,
+        );
+    } else {
+        push_remote_skip(&mut checks, "gateway_status", ComponentSelection::Gateway);
+    }
 
     print_doctor_report(args.target, checks)
 }
@@ -3503,6 +3748,24 @@ fn component_label(component: ComponentSelection) -> &'static str {
     }
 }
 
+fn remote_component_for(
+    mode: ProfileMode,
+    local_component: Option<ComponentSelection>,
+) -> Option<ComponentSelection> {
+    if mode != ProfileMode::Remote {
+        return None;
+    }
+
+    match local_component? {
+        ComponentSelection::Agent => Some(ComponentSelection::Gateway),
+        ComponentSelection::Gateway => Some(ComponentSelection::Agent),
+    }
+}
+
+fn component_is_locally_owned(session: &SessionManifest, component: ComponentSelection) -> bool {
+    session.mode == ProfileMode::Local || session.local_component == Some(component)
+}
+
 fn disconnect_args_from_connect(args: &ConnectArgs) -> DisconnectArgs {
     DisconnectArgs {
         profile: args.profile.clone(),
@@ -3544,6 +3807,8 @@ fn connect_args_from_session(session: &SessionManifest, session_file: &Path) -> 
         warmup_settle_secs: 15,
         oneshot: false,
         supervisor_log_file: session.supervisor_log_file.clone(),
+        mode: session.mode,
+        local_component: session.local_component,
     }
 }
 
@@ -3577,6 +3842,27 @@ fn print_doctor_report(target: String, checks: Vec<DoctorCheck>) -> Result<()> {
     Ok(())
 }
 
+fn check_component_process(
+    session: &SessionManifest,
+    component: ComponentSelection,
+    checks: &mut Vec<DoctorCheck>,
+) {
+    let name = format!("{}_process", component_label(component));
+    if !component_is_locally_owned(session, component) {
+        checks.push(doctor_check(
+            name,
+            DoctorState::Warn,
+            format!(
+                "remote {} process is owned by the other host",
+                component_label(component)
+            ),
+        ));
+        return;
+    }
+
+    check_process(&name, component_pid(session, component), checks);
+}
+
 fn check_process(name: &str, pid: Option<u32>, checks: &mut Vec<DoctorCheck>) {
     let Some(pid) = pid else {
         checks.push(doctor_check(
@@ -3604,6 +3890,17 @@ fn check_process(name: &str, pid: Option<u32>, checks: &mut Vec<DoctorCheck>) {
             format!("could not verify pid {pid}: {error:#}"),
         )),
     }
+}
+
+fn push_remote_skip(checks: &mut Vec<DoctorCheck>, name: &str, component: ComponentSelection) {
+    checks.push(doctor_check(
+        name,
+        DoctorState::Warn,
+        format!(
+            "skipped because remote {} state is owned by the other host",
+            component_label(component)
+        ),
+    ));
 }
 
 fn check_runtime_status(
@@ -4907,6 +5204,56 @@ fn cleanup_stale_tunnel_state(args: &ConnectArgs) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_remote_side_state(args: &ConnectArgs, component: ComponentSelection) -> Result<()> {
+    match component {
+        ComponentSelection::Agent => {
+            let agent_bin = sibling_binary("tunnel-agent")?;
+            if args.agent_state_file.exists() {
+                run_cleanup_binary_quiet(
+                    &agent_bin,
+                    &[
+                        "--config",
+                        path_arg(&args.agent_config)?,
+                        "--cleanup-only",
+                        "--route-mode",
+                        mode_str(args.route_mode),
+                        "--state-file",
+                        path_arg(&args.agent_state_file)?,
+                        "--status-file",
+                        path_arg(&args.agent_status_file)?,
+                    ],
+                )?;
+            } else {
+                remove_stale_file("agent status", &args.agent_status_file)?;
+            }
+        }
+        ComponentSelection::Gateway => {
+            let gateway_bin = sibling_binary("tunnel-gateway")?;
+            if args.gateway_state_file.exists() {
+                run_cleanup_binary_quiet(
+                    &gateway_bin,
+                    &[
+                        "--cleanup-only",
+                        "--forwarding-mode",
+                        mode_str(args.forwarding_mode),
+                        "--nat-mode",
+                        mode_str(args.nat_mode),
+                        "--state-file",
+                        path_arg(&args.gateway_state_file)?,
+                        "--status-file",
+                        path_arg(&args.gateway_status_file)?,
+                    ],
+                )?;
+            } else {
+                remove_stale_file("gateway status", &args.gateway_status_file)?;
+            }
+        }
+    }
+
+    remove_stale_file("session", &args.session_file)?;
+    Ok(())
+}
+
 fn validate_config_file(label: &str, path: &Path) -> Result<()> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("{label} not found or unreadable: {}", path.display()))?;
@@ -5223,6 +5570,13 @@ fn mode_str(mode: SystemCommandMode) -> &'static str {
     }
 }
 
+fn profile_mode_str(mode: ProfileMode) -> &'static str {
+    match mode {
+        ProfileMode::Local => "local",
+        ProfileMode::Remote => "remote",
+    }
+}
+
 fn append_connect_args(command: &mut Command, args: &ConnectArgs) {
     if let Some(profile) = &args.profile {
         command.arg(profile);
@@ -5270,7 +5624,15 @@ fn append_connect_args(command: &mut Command, args: &ConnectArgs) {
         .arg("--warmup-probe-timeout-secs")
         .arg(args.warmup_probe_timeout_secs.to_string())
         .arg("--warmup-settle-secs")
-        .arg(args.warmup_settle_secs.to_string());
+        .arg(args.warmup_settle_secs.to_string())
+        .arg("--mode")
+        .arg(profile_mode_str(args.mode));
+
+    if let Some(local_component) = args.local_component {
+        command
+            .arg("--local-component")
+            .arg(component_label(local_component));
+    }
 }
 
 #[cfg(test)]
@@ -5435,6 +5797,42 @@ mod tests {
     }
 
     #[test]
+    fn remote_profile_readiness_only_requires_local_component_config() -> Result<()> {
+        let root = test_root("remote-profile-readiness")?;
+        let args = test_login_args(&root, true);
+        ensure_local_configs_for_login(&args)?;
+        write_profile(ProfileInitArgs {
+            profile: args.profile.clone(),
+            profile_file: args.profile_file.clone(),
+            tenant: args.tenant.clone(),
+            attachment: args.attachment.clone(),
+            agent_config: args.agent_config.clone(),
+            gateway_config: args.gateway_config.clone(),
+            egress_interface: args.egress_interface.clone(),
+            mode: ProfileMode::Remote,
+            local_component: Some(ComponentSelection::Gateway),
+            force: true,
+        })?;
+
+        fs::remove_file(&args.agent_config)?;
+        let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+            args.profile.clone(),
+            args.profile_file.clone(),
+        ))?;
+        let readiness = build_connect_readiness(&connect_args);
+
+        assert!(readiness.ready);
+        assert_eq!(connect_args.mode, ProfileMode::Remote);
+        assert_eq!(
+            connect_args.local_component,
+            Some(ComponentSelection::Gateway)
+        );
+        assert!(preflight_connect_args(&connect_args).is_ok());
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
     fn login_generation_supports_remote_gateway_host() -> Result<()> {
         let root = test_root("remote-gateway")?;
         let mut args = test_login_args(&root, true);
@@ -5488,6 +5886,8 @@ mod tests {
             agent_tunnel_address: String::from("10.201.0.2"),
             gateway_tunnel_address: String::from("10.201.0.1"),
             egress_interface: String::from("en0"),
+            mode: None,
+            local_component: None,
             force,
         }
     }
@@ -5501,6 +5901,8 @@ mod tests {
             agent_config: args.agent_config.clone(),
             gateway_config: args.gateway_config.clone(),
             egress_interface: args.egress_interface.clone(),
+            mode: ProfileMode::Local,
+            local_component: None,
             force: true,
         })
     }
