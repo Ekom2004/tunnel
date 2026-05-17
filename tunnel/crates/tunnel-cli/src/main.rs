@@ -15,9 +15,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tunnel_shared::{
-    encode_key_32, now_unix_secs, AgentRuntimeState, GatewayEndpoint, GatewayRuntimeState,
-    HealthState, PacketPathTelemetry, RoutePolicy, RuntimeStatus, SocketEndpoint, TrafficClass,
-    TunnelConfig, TunnelPhase, WireGuardConfig, WireGuardRole,
+    encode_key_32, now_unix_secs, AgentRuntimeState, ComponentKind, GatewayEndpoint,
+    GatewayRuntimeState, HealthState, PacketPathTelemetry, RoutePolicy, RuntimeStatus,
+    SocketEndpoint, TrafficClass, TransportKind, TunnelConfig, TunnelPhase, WireGuardConfig,
+    WireGuardRole,
 };
 
 #[derive(Debug, Parser)]
@@ -80,6 +81,8 @@ enum CommandKind {
     RepairTest(RepairTestArgs),
     #[command(hide = true)]
     LifecycleTest(LifecycleTestArgs),
+    #[command(hide = true)]
+    RemoteLifecycleTest(RemoteLifecycleTestArgs),
     #[command(hide = true)]
     RemoteCheck(RemoteCheckArgs),
     #[command(hide = true)]
@@ -468,6 +471,21 @@ struct LifecycleTestArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct RemoteLifecycleTestArgs {
+    #[arg(value_name = "PROFILE", default_value = "remote-dev")]
+    profile: String,
+    #[arg(
+        long,
+        default_value = "/private/tmp/tunnel-remote-lifecycle-profiles.json"
+    )]
+    profile_file: PathBuf,
+    #[arg(long, default_value = "203.0.113.10")]
+    gateway_host: String,
+    #[arg(long, default_value_t = 7000)]
+    gateway_port: u16,
+}
+
+#[derive(Debug, Args, Clone)]
 struct RemoteCheckArgs {
     #[arg(value_name = "PROFILE", default_value = "local-dev")]
     profile: String,
@@ -748,6 +766,19 @@ struct RemoteCheckReport {
     checks: Vec<DoctorCheck>,
 }
 
+#[derive(Debug, Serialize)]
+struct RemoteLifecycleTestReport {
+    overall: DoctorState,
+    agent_profile: String,
+    gateway_profile: String,
+    agent_readiness_ready: bool,
+    gateway_readiness_ready: bool,
+    gateway_doctor_non_failing: bool,
+    gateway_disconnect_clean: bool,
+    remote_agent_state_preserved: bool,
+    checks: Vec<DoctorCheck>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ProfileConfig {
     default: Option<String>,
@@ -881,6 +912,7 @@ fn main() -> Result<()> {
         CommandKind::Soak(args) => run_soak(args)?,
         CommandKind::RepairTest(args) => run_repair_test(args)?,
         CommandKind::LifecycleTest(args) => run_lifecycle_test(args)?,
+        CommandKind::RemoteLifecycleTest(args) => run_remote_lifecycle_test(args)?,
         CommandKind::RemoteCheck(args) => run_remote_check(args)?,
         CommandKind::GatewayRun(args) => run_side(args, ComponentSelection::Gateway)?,
         CommandKind::AgentRun(args) => run_side(args, ComponentSelection::Agent)?,
@@ -2362,6 +2394,365 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_remote_lifecycle_test(args: RemoteLifecycleTestArgs) -> Result<()> {
+    let mut checks = Vec::new();
+    let root = remote_lifecycle_test_root(&args);
+    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
+
+    let agent_profile = format!("{}-agent", args.profile);
+    let gateway_profile = format!("{}-gateway", args.profile);
+    let agent_paths = RemoteLifecyclePaths::new(&root, &agent_profile);
+    let gateway_paths = RemoteLifecyclePaths::new(&root, &gateway_profile);
+
+    prepare_remote_lifecycle_side(
+        &args,
+        &agent_profile,
+        &agent_paths,
+        ComponentSelection::Agent,
+    )?;
+    prepare_remote_lifecycle_side(
+        &args,
+        &gateway_profile,
+        &gateway_paths,
+        ComponentSelection::Gateway,
+    )?;
+    write_remote_lifecycle_profiles(
+        &args,
+        &agent_profile,
+        &agent_paths,
+        &gateway_profile,
+        &gateway_paths,
+    )?;
+
+    remove_stale_file("remote gateway config", &agent_paths.gateway_config)?;
+    remove_stale_file("remote agent config", &gateway_paths.agent_config)?;
+
+    let agent_connect = resolve_connect_args(ConnectArgs::for_profile(
+        agent_profile.clone(),
+        args.profile_file.clone(),
+    ))?;
+    let gateway_connect = resolve_connect_args(ConnectArgs::for_profile(
+        gateway_profile.clone(),
+        args.profile_file.clone(),
+    ))?;
+    let agent_readiness = build_connect_readiness(&agent_connect);
+    let gateway_readiness = build_connect_readiness(&gateway_connect);
+    push_lifecycle_check(
+        &mut checks,
+        "remote_agent_profile_ready",
+        agent_readiness.ready && agent_connect.local_component == Some(ComponentSelection::Agent),
+        "remote agent profile is ready with only agent-owned config",
+        "remote agent profile is not ready",
+    );
+    push_lifecycle_check(
+        &mut checks,
+        "remote_gateway_profile_ready",
+        gateway_readiness.ready
+            && gateway_connect.local_component == Some(ComponentSelection::Gateway),
+        "remote gateway profile is ready with only gateway-owned config",
+        "remote gateway profile is not ready",
+    );
+
+    write_gateway_doctor_fixture(&gateway_connect)?;
+    let doctor_report = build_doctor_report(DoctorArgs {
+        profile: Some(gateway_profile.clone()),
+        profile_file: args.profile_file.clone(),
+        session_file: gateway_connect.session_file.clone(),
+        target: String::from("1.1.1.1"),
+        probe_timeout_secs: 0.2,
+        stale_after_secs: 60,
+        post_probe_settle_secs: 1,
+    })?;
+    let gateway_doctor_non_failing = doctor_report.overall != DoctorState::Fail
+        && doctor_report
+            .checks
+            .iter()
+            .all(|check| check.state != DoctorState::Fail);
+    push_lifecycle_check(
+        &mut checks,
+        "remote_gateway_doctor_non_failing",
+        gateway_doctor_non_failing,
+        "doctor treats remote-owned agent state as non-failing",
+        "doctor failed because of remote-owned agent state",
+    );
+
+    remove_stale_file("gateway state", &gateway_connect.gateway_state_file)?;
+    remove_stale_file("gateway status", &gateway_connect.gateway_status_file)?;
+    write_remote_agent_owned_files(&gateway_connect)?;
+    write_remote_lifecycle_session(&gateway_connect, None)?;
+    let disconnect_report = disconnect_tunnel(resolve_disconnect_args(
+        DisconnectArgs::for_profile(gateway_profile.clone(), args.profile_file.clone()),
+    )?)?;
+    let remote_agent_state_preserved = gateway_connect.agent_state_file.exists()
+        && gateway_connect.agent_status_file.exists()
+        && !gateway_connect.session_file.exists();
+    push_lifecycle_check(
+        &mut checks,
+        "remote_gateway_disconnect_clean",
+        disconnect_report.disconnected,
+        "disconnect cleaned local gateway lifecycle state",
+        "disconnect did not clean local gateway lifecycle state",
+    );
+    push_lifecycle_check(
+        &mut checks,
+        "remote_agent_state_preserved",
+        remote_agent_state_preserved,
+        "disconnect preserved remote-owned agent state",
+        "disconnect removed or damaged remote-owned agent state",
+    );
+
+    let overall = if checks.iter().any(|check| check.state == DoctorState::Fail) {
+        DoctorState::Fail
+    } else {
+        DoctorState::Pass
+    };
+    let report = RemoteLifecycleTestReport {
+        overall,
+        agent_profile,
+        gateway_profile,
+        agent_readiness_ready: agent_readiness.ready,
+        gateway_readiness_ready: gateway_readiness.ready,
+        gateway_doctor_non_failing,
+        gateway_disconnect_clean: disconnect_report.disconnected,
+        remote_agent_state_preserved,
+        checks,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    let _ = fs::remove_dir_all(&root);
+    if report.overall != DoctorState::Pass {
+        bail!("remote lifecycle test failed");
+    }
+
+    Ok(())
+}
+
+struct RemoteLifecyclePaths {
+    agent_config: PathBuf,
+    gateway_config: PathBuf,
+    agent_state_file: PathBuf,
+    agent_status_file: PathBuf,
+    gateway_state_file: PathBuf,
+    gateway_status_file: PathBuf,
+    session_file: PathBuf,
+    agent_log_file: PathBuf,
+    gateway_log_file: PathBuf,
+    supervisor_log_file: PathBuf,
+}
+
+impl RemoteLifecyclePaths {
+    fn new(root: &Path, profile: &str) -> Self {
+        Self {
+            agent_config: root.join(format!("{profile}-agent.json")),
+            gateway_config: root.join(format!("{profile}-gateway.json")),
+            agent_state_file: root.join(format!("{profile}-agent-state.json")),
+            agent_status_file: root.join(format!("{profile}-agent-status.json")),
+            gateway_state_file: root.join(format!("{profile}-gateway-state.json")),
+            gateway_status_file: root.join(format!("{profile}-gateway-status.json")),
+            session_file: root.join(format!("{profile}-session.json")),
+            agent_log_file: root.join(format!("{profile}-agent.log")),
+            gateway_log_file: root.join(format!("{profile}-gateway.log")),
+            supervisor_log_file: root.join(format!("{profile}-supervisor.log")),
+        }
+    }
+}
+
+fn remote_lifecycle_test_root(args: &RemoteLifecycleTestArgs) -> PathBuf {
+    args.profile_file
+        .parent()
+        .unwrap_or_else(|| Path::new("/private/tmp"))
+        .join(format!(
+            "tunnel-remote-lifecycle-{}-{}",
+            process::id(),
+            now_unix_secs()
+        ))
+}
+
+fn prepare_remote_lifecycle_side(
+    args: &RemoteLifecycleTestArgs,
+    profile: &str,
+    paths: &RemoteLifecyclePaths,
+    local_component: ComponentSelection,
+) -> Result<()> {
+    let login_args = LoginArgs {
+        profile: profile.to_owned(),
+        profile_file: args.profile_file.clone(),
+        tenant: String::from("local-tenant"),
+        attachment: Some(profile.to_owned()),
+        agent_config: paths.agent_config.clone(),
+        gateway_config: paths.gateway_config.clone(),
+        gateway_host: args.gateway_host.clone(),
+        gateway_port: args.gateway_port,
+        destination_cidr: String::from("1.1.1.0/24"),
+        agent_tunnel_address: String::from("10.201.0.2"),
+        gateway_tunnel_address: String::from("10.201.0.1"),
+        egress_interface: String::from("en0"),
+        mode: Some(ProfileMode::Remote),
+        local_component: Some(local_component),
+        force: true,
+    };
+    ensure_local_configs_for_login(&login_args)?;
+    Ok(())
+}
+
+fn write_remote_lifecycle_profiles(
+    args: &RemoteLifecycleTestArgs,
+    agent_profile: &str,
+    agent_paths: &RemoteLifecyclePaths,
+    gateway_profile: &str,
+    gateway_paths: &RemoteLifecyclePaths,
+) -> Result<()> {
+    let config = ProfileConfig {
+        default: Some(agent_profile.to_owned()),
+        profiles: vec![
+            remote_lifecycle_profile(
+                agent_profile,
+                agent_paths,
+                ComponentSelection::Agent,
+                "local-tenant",
+            ),
+            remote_lifecycle_profile(
+                gateway_profile,
+                gateway_paths,
+                ComponentSelection::Gateway,
+                "local-tenant",
+            ),
+        ],
+    };
+    write_json_file(&args.profile_file, &config)
+}
+
+fn remote_lifecycle_profile(
+    profile: &str,
+    paths: &RemoteLifecyclePaths,
+    local_component: ComponentSelection,
+    tenant: &str,
+) -> TunnelProfile {
+    TunnelProfile {
+        name: profile.to_owned(),
+        tenant: tenant.to_owned(),
+        attachment: profile.to_owned(),
+        agent_config: Some(paths.agent_config.clone()),
+        gateway_config: Some(paths.gateway_config.clone()),
+        agent_state_file: Some(paths.agent_state_file.clone()),
+        agent_status_file: Some(paths.agent_status_file.clone()),
+        gateway_state_file: Some(paths.gateway_state_file.clone()),
+        gateway_status_file: Some(paths.gateway_status_file.clone()),
+        session_file: Some(paths.session_file.clone()),
+        agent_log_file: Some(paths.agent_log_file.clone()),
+        gateway_log_file: Some(paths.gateway_log_file.clone()),
+        supervisor_log_file: Some(paths.supervisor_log_file.clone()),
+        egress_interface: Some(String::from("en0")),
+        route_mode: Some(SystemCommandMode::Apply),
+        forwarding_mode: Some(SystemCommandMode::Apply),
+        nat_mode: Some(SystemCommandMode::Apply),
+        ready_timeout_secs: Some(12),
+        mode: ProfileMode::Remote,
+        local_component: Some(local_component),
+    }
+}
+
+fn write_gateway_doctor_fixture(args: &ConnectArgs) -> Result<()> {
+    let gateway_config: TunnelConfig = serde_json::from_str(
+        &fs::read_to_string(&args.gateway_config)
+            .with_context(|| format!("failed to read {}", args.gateway_config.display()))?,
+    )?;
+    let subnet = expected_gateway_tunnel_subnet(Some(&gateway_config))?
+        .unwrap_or_else(|| String::from("10.201.0.0/24"));
+    let rules_path = args.gateway_state_file.with_extension("pf.conf");
+    let rules = format!(
+        "nat on {egress} from {subnet} to any -> ({egress})\npass in quick on {tun} inet from {subnet} to any keep state\npass out quick on {egress} route-to ({egress} 192.0.2.1) inet from {subnet} to any keep state\n",
+        egress = args.egress_interface,
+        tun = "utun-test",
+    );
+    fs::write(&rules_path, rules)
+        .with_context(|| format!("failed to write {}", rules_path.display()))?;
+    write_json_file(
+        &args.gateway_state_file,
+        &GatewayRuntimeState {
+            tunnel_interface: String::from("utun-test"),
+            nat_anchor_name: Some(String::from("com.apple/tunnel-utun-test")),
+            nat_rules_path: Some(rules_path),
+            forwarding_was_enabled: Some(true),
+            egress_interface: Some(args.egress_interface.clone()),
+        },
+    )?;
+    write_json_file(
+        &args.gateway_status_file,
+        &runtime_status(ComponentKind::Gateway, Some(String::from("utun-test"))),
+    )?;
+    write_remote_lifecycle_session(args, Some(process::id()))
+}
+
+fn write_remote_agent_owned_files(args: &ConnectArgs) -> Result<()> {
+    write_json_file(
+        &args.agent_state_file,
+        &AgentRuntimeState {
+            tunnel_interface: String::from("utun-remote-agent"),
+            destination_cidrs: vec![String::from("1.1.1.0/24")],
+        },
+    )?;
+    write_json_file(
+        &args.agent_status_file,
+        &runtime_status(
+            ComponentKind::Agent,
+            Some(String::from("utun-remote-agent")),
+        ),
+    )
+}
+
+fn write_remote_lifecycle_session(args: &ConnectArgs, gateway_pid: Option<u32>) -> Result<()> {
+    let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
+    let attachment = required_connect_value(args.attachment.as_ref(), "attachment")?.to_owned();
+    let session = SessionManifest {
+        tenant,
+        attachment,
+        agent_config: args.agent_config.clone(),
+        gateway_config: args.gateway_config.clone(),
+        agent_state_file: args.agent_state_file.clone(),
+        agent_status_file: args.agent_status_file.clone(),
+        gateway_state_file: args.gateway_state_file.clone(),
+        gateway_status_file: args.gateway_status_file.clone(),
+        agent_log_file: args.agent_log_file.clone(),
+        gateway_log_file: args.gateway_log_file.clone(),
+        egress_interface: args.egress_interface.clone(),
+        route_mode: args.route_mode,
+        forwarding_mode: args.forwarding_mode,
+        nat_mode: args.nat_mode,
+        agent_pid: None,
+        gateway_pid,
+        mode: ProfileMode::Remote,
+        local_component: Some(ComponentSelection::Gateway),
+        supervised: false,
+        supervisor_pid: None,
+        supervisor_log_file: args.supervisor_log_file.clone(),
+    };
+    save_manifest(&args.session_file, &session)
+}
+
+fn runtime_status(component: ComponentKind, tunnel_interface: Option<String>) -> RuntimeStatus {
+    let now = now_unix_secs();
+    RuntimeStatus {
+        component,
+        state: HealthState::Healthy,
+        phase: TunnelPhase::Active,
+        tenant_id: Some(String::from("local-tenant")),
+        tunnel_id: Some(String::from("local-tunnel")),
+        transport: TransportKind::WireGuardUdp,
+        tunnel_interface,
+        peer_endpoint: Some(String::from("127.0.0.1:7000")),
+        ingress_bytes: 0,
+        egress_bytes: 0,
+        last_ingress_at_unix_secs: Some(now),
+        last_egress_at_unix_secs: Some(now),
+        last_peer_activity_unix_secs: Some(now),
+        last_activity_unix_secs: Some(now),
+        packet_path: PacketPathTelemetry::default(),
+        observed_at_unix_secs: now,
+        detail: String::from("remote lifecycle fixture"),
+    }
+}
+
 fn run_remote_check(args: RemoteCheckArgs) -> Result<()> {
     let mut checks = Vec::new();
     let mut connect_args =
@@ -2621,6 +3012,12 @@ fn run_supervisor(args: SupervisorArgs) -> Result<()> {
 
 fn run_doctor(args: DoctorArgs) -> Result<()> {
     let args = resolve_doctor_args(args)?;
+    let report = build_doctor_report(args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn build_doctor_report(args: DoctorArgs) -> Result<DoctorReport> {
     let mut checks = Vec::new();
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
 
@@ -2633,7 +3030,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
                 args.session_file.display()
             ),
         ));
-        return print_doctor_report(args.target, checks);
+        return Ok(make_doctor_report(args.target, checks));
     };
 
     checks.push(doctor_check(
@@ -2739,7 +3136,7 @@ fn run_doctor(args: DoctorArgs) -> Result<()> {
         push_remote_skip(&mut checks, "gateway_status", ComponentSelection::Gateway);
     }
 
-    print_doctor_report(args.target, checks)
+    Ok(make_doctor_report(args.target, checks))
 }
 
 fn run_soak(args: SoakArgs) -> Result<()> {
@@ -3824,7 +4221,7 @@ fn doctor_check(
     }
 }
 
-fn print_doctor_report(target: String, checks: Vec<DoctorCheck>) -> Result<()> {
+fn make_doctor_report(target: String, checks: Vec<DoctorCheck>) -> DoctorReport {
     let overall = if checks.iter().any(|check| check.state == DoctorState::Fail) {
         DoctorState::Fail
     } else if checks.iter().any(|check| check.state == DoctorState::Warn) {
@@ -3833,13 +4230,11 @@ fn print_doctor_report(target: String, checks: Vec<DoctorCheck>) -> Result<()> {
         DoctorState::Pass
     };
 
-    let report = DoctorReport {
+    DoctorReport {
         overall,
         target,
         checks,
-    };
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    }
 }
 
 fn check_component_process(
@@ -5465,7 +5860,15 @@ fn load_manifest(path: &Path) -> Result<SessionManifest> {
 }
 
 fn save_manifest(path: &Path, manifest: &SessionManifest) -> Result<()> {
-    fs::write(path, serde_json::to_string_pretty(manifest)?)
+    write_json_file(path, manifest)
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, serde_json::to_string_pretty(value)?)
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
