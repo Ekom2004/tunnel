@@ -163,6 +163,12 @@ struct ConnectArgs {
     nat_mode: SystemCommandMode,
     #[arg(long, hide = true, default_value_t = 12)]
     ready_timeout_secs: u64,
+    #[arg(long, hide = true, default_value = "1.1.1.1")]
+    warmup_target: String,
+    #[arg(long, hide = true, default_value_t = 2.0)]
+    warmup_probe_timeout_secs: f64,
+    #[arg(long, hide = true, default_value_t = 15)]
+    warmup_settle_secs: u64,
     #[arg(long, hide = true)]
     oneshot: bool,
     #[arg(
@@ -194,6 +200,9 @@ impl ConnectArgs {
             forwarding_mode: SystemCommandMode::Apply,
             nat_mode: SystemCommandMode::Apply,
             ready_timeout_secs: 12,
+            warmup_target: String::from("1.1.1.1"),
+            warmup_probe_timeout_secs: 2.0,
+            warmup_settle_secs: 15,
             oneshot: false,
             supervisor_log_file: PathBuf::from("/private/tmp/tunnel-supervisor.log"),
         }
@@ -558,6 +567,15 @@ struct RepairTestCheck {
     new_pid: Option<u32>,
     recovery_secs: Option<f64>,
     probe_rtt_ms: Option<f64>,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConnectWarmupReport {
+    target: String,
+    probe_rtt_ms: f64,
+    agent_active: bool,
+    gateway_active: bool,
     detail: String,
 }
 
@@ -1356,6 +1374,7 @@ fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
         let agent_running = pid_is_running_optional(session.agent_pid)?;
         let gateway_running = pid_is_running_optional(session.gateway_pid)?;
         if supervisor_running && agent_running && gateway_running {
+            let warmup = warm_connect_session(&args, &session)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -1369,6 +1388,7 @@ fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
                     "gateway_log_file": session.gateway_log_file,
                     "supervisor_log_file": session.supervisor_log_file,
                     "ready": true,
+                    "warmup": warmup,
                     "session_file": args.session_file,
                 }))?
             );
@@ -1377,6 +1397,7 @@ fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
     }
 
     let (supervisor_pid, session) = spawn_supervisor_for_connect(&args)?;
+    let warmup = warm_connect_session(&args, &session)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -1390,6 +1411,7 @@ fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
             "gateway_log_file": session.gateway_log_file,
             "supervisor_log_file": session.supervisor_log_file,
             "ready": true,
+            "warmup": warmup,
             "session_file": args.session_file,
         }))?
     );
@@ -1419,6 +1441,55 @@ fn spawn_supervisor_for_connect(args: &ConnectArgs) -> Result<(u32, SessionManif
     wait_for_supervised_connect_ready(args, supervisor_pid)?;
 
     Ok((supervisor_pid, load_manifest(&args.session_file)?))
+}
+
+fn warm_connect_session(
+    args: &ConnectArgs,
+    session: &SessionManifest,
+) -> Result<ConnectWarmupReport> {
+    let rtt_ms = wait_for_probe_success(
+        &args.warmup_target,
+        args.warmup_probe_timeout_secs,
+        args.warmup_settle_secs.max(1) as u32,
+        Duration::from_secs(1),
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "connect warm-up failed: {} did not reply within {:.1}s after {} attempt(s)",
+            args.warmup_target,
+            args.warmup_probe_timeout_secs,
+            args.warmup_settle_secs.max(1)
+        )
+    })?;
+
+    wait_for_active_status_after_probe(session, args.warmup_settle_secs)?;
+    let agent_status = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
+    let gateway_status = read_optional_json::<RuntimeStatus>(&session.gateway_status_file)?;
+    let agent_active = agent_status
+        .as_ref()
+        .map(is_transport_active)
+        .unwrap_or(false);
+    let gateway_active = gateway_status
+        .as_ref()
+        .map(is_transport_active)
+        .unwrap_or(false);
+
+    if !agent_active || !gateway_active {
+        bail!(
+            "connect warm-up moved probe traffic to {}, but tunnel did not become active: agent_active={} gateway_active={}. inspect logs with: tunnel-cli logs --component both --lines 80",
+            args.warmup_target,
+            agent_active,
+            gateway_active
+        );
+    }
+
+    Ok(ConnectWarmupReport {
+        target: args.warmup_target.clone(),
+        probe_rtt_ms: rtt_ms,
+        agent_active,
+        gateway_active,
+        detail: String::from("packet path warmed and runtime is active"),
+    })
 }
 
 fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
@@ -2884,6 +2955,9 @@ fn connect_args_from_session(session: &SessionManifest, session_file: &Path) -> 
         forwarding_mode: session.forwarding_mode,
         nat_mode: session.nat_mode,
         ready_timeout_secs: 12,
+        warmup_target: String::from("1.1.1.1"),
+        warmup_probe_timeout_secs: 2.0,
+        warmup_settle_secs: 15,
         oneshot: false,
         supervisor_log_file: session.supervisor_log_file.clone(),
     }
@@ -4515,7 +4589,13 @@ fn append_connect_args(command: &mut Command, args: &ConnectArgs) {
         .arg("--nat-mode")
         .arg(mode_str(args.nat_mode))
         .arg("--ready-timeout-secs")
-        .arg(args.ready_timeout_secs.to_string());
+        .arg(args.ready_timeout_secs.to_string())
+        .arg("--warmup-target")
+        .arg(&args.warmup_target)
+        .arg("--warmup-probe-timeout-secs")
+        .arg(args.warmup_probe_timeout_secs.to_string())
+        .arg("--warmup-settle-secs")
+        .arg(args.warmup_settle_secs.to_string());
 }
 
 #[cfg(test)]

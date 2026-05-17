@@ -303,6 +303,7 @@ fn run_wireguard_mode(config: &TunnelConfig, cli: &Cli, wireguard: &WireGuardCon
 
     spawn_status_thread(
         cli.status_interval_secs,
+        wireguard_stale_after_secs(cli.status_interval_secs, wireguard),
         cli.status_file.clone(),
         RuntimeStatusContext {
             component: ComponentKind::Agent,
@@ -582,6 +583,7 @@ struct RuntimeStatusContext {
 
 fn spawn_status_thread(
     interval_secs: u64,
+    stale_after_secs: u64,
     status_file: PathBuf,
     context: RuntimeStatusContext,
     peer: Arc<Mutex<PeerStatus>>,
@@ -607,7 +609,7 @@ fn spawn_status_thread(
         let last_ingress = counters.last_ingress_at_unix_secs.load(Ordering::Relaxed);
         let last_egress = counters.last_egress_at_unix_secs.load(Ordering::Relaxed);
         let last_activity = last_peer_activity.max(last_ingress).max(last_egress);
-        let is_stale = last_activity != 0 && now.saturating_sub(last_activity) > interval_secs * 3;
+        let is_stale = last_activity != 0 && now.saturating_sub(last_activity) > stale_after_secs;
         let uptime = now.saturating_sub(context.started_at_unix_secs);
         let has_traffic = counters.ingress_bytes.load(Ordering::Relaxed) > 0
             || counters.egress_bytes.load(Ordering::Relaxed) > 0;
@@ -666,6 +668,15 @@ fn spawn_status_thread(
             eprintln!("agent status render failed: {error}");
         }
     });
+}
+
+fn wireguard_stale_after_secs(interval_secs: u64, wireguard: &WireGuardConfig) -> u64 {
+    let status_window = interval_secs.saturating_mul(3);
+    let keepalive_window = wireguard
+        .persistent_keepalive_secs
+        .map(|secs| u64::from(secs).saturating_mul(2))
+        .unwrap_or(30);
+    status_window.max(keepalive_window)
 }
 
 fn packet_path_snapshot(counters: &ByteCounters) -> PacketPathTelemetry {
