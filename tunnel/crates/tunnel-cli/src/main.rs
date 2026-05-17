@@ -82,6 +82,10 @@ enum CommandKind {
     LifecycleTest(LifecycleTestArgs),
     #[command(hide = true)]
     RemoteCheck(RemoteCheckArgs),
+    #[command(hide = true)]
+    GatewayRun(SideRunArgs),
+    #[command(hide = true)]
+    AgentRun(SideRunArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -461,6 +465,14 @@ struct RemoteCheckArgs {
     gateway_port: Option<u16>,
 }
 
+#[derive(Debug, Args, Clone)]
+struct SideRunArgs {
+    #[arg(value_name = "PROFILE", default_value = "local-dev")]
+    profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 enum SystemCommandMode {
     Skip,
@@ -650,6 +662,19 @@ struct ConnectReport {
 }
 
 #[derive(Debug, Serialize)]
+struct SideRunReport {
+    component: ComponentSelection,
+    tenant: String,
+    attachment: String,
+    pid: u32,
+    config_file: PathBuf,
+    state_file: PathBuf,
+    status_file: PathBuf,
+    log_file: PathBuf,
+    ready: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct DisconnectReport {
     tenant: Option<String>,
     attachment: Option<String>,
@@ -819,6 +844,8 @@ fn main() -> Result<()> {
         CommandKind::RepairTest(args) => run_repair_test(args)?,
         CommandKind::LifecycleTest(args) => run_lifecycle_test(args)?,
         CommandKind::RemoteCheck(args) => run_remote_check(args)?,
+        CommandKind::GatewayRun(args) => run_side(args, ComponentSelection::Gateway)?,
+        CommandKind::AgentRun(args) => run_side(args, ComponentSelection::Agent)?,
     }
 
     Ok(())
@@ -1708,6 +1735,104 @@ fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn run_side(args: SideRunArgs, component: ComponentSelection) -> Result<()> {
+    let connect_args =
+        resolve_connect_args(ConnectArgs::for_profile(args.profile, args.profile_file))?;
+    preflight_side_args(&connect_args, component)?;
+    let report = match component {
+        ComponentSelection::Agent => run_agent_side(connect_args)?,
+        ComponentSelection::Gateway => run_gateway_side(connect_args)?,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn run_gateway_side(args: ConnectArgs) -> Result<SideRunReport> {
+    validate_config_file("gateway_config", &args.gateway_config)?;
+    let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
+    let attachment = required_connect_value(args.attachment.as_ref(), "attachment")?.to_owned();
+    let gateway_bin = sibling_binary("tunnel-gateway")?;
+    let (stdout, stderr) = log_stdio(&args.gateway_log_file, false)?;
+
+    let mut command = Command::new(&gateway_bin);
+    command
+        .arg("--config")
+        .arg(&args.gateway_config)
+        .arg("--tun")
+        .arg("--forwarding-mode")
+        .arg(mode_str(args.forwarding_mode))
+        .arg("--nat-mode")
+        .arg(mode_str(args.nat_mode))
+        .arg("--egress-interface")
+        .arg(&args.egress_interface)
+        .arg("--state-file")
+        .arg(&args.gateway_state_file)
+        .arg("--status-file")
+        .arg(&args.gateway_status_file)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", gateway_bin.display()))?;
+    thread::sleep(Duration::from_millis(750));
+    ensure_child_still_running(&mut child, "gateway", &args.gateway_log_file)?;
+
+    Ok(SideRunReport {
+        component: ComponentSelection::Gateway,
+        tenant,
+        attachment,
+        pid: child.id(),
+        config_file: args.gateway_config,
+        state_file: args.gateway_state_file,
+        status_file: args.gateway_status_file,
+        log_file: args.gateway_log_file,
+        ready: true,
+    })
+}
+
+fn run_agent_side(args: ConnectArgs) -> Result<SideRunReport> {
+    validate_config_file("agent_config", &args.agent_config)?;
+    let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
+    let attachment = required_connect_value(args.attachment.as_ref(), "attachment")?.to_owned();
+    let agent_bin = sibling_binary("tunnel-agent")?;
+    let (stdout, stderr) = log_stdio(&args.agent_log_file, false)?;
+
+    let mut command = Command::new(&agent_bin);
+    command
+        .arg("--config")
+        .arg(&args.agent_config)
+        .arg("--tun")
+        .arg("--route-mode")
+        .arg(mode_str(args.route_mode))
+        .arg("--state-file")
+        .arg(&args.agent_state_file)
+        .arg("--status-file")
+        .arg(&args.agent_status_file)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", agent_bin.display()))?;
+    thread::sleep(Duration::from_millis(750));
+    ensure_child_still_running(&mut child, "agent", &args.agent_log_file)?;
+
+    Ok(SideRunReport {
+        component: ComponentSelection::Agent,
+        tenant,
+        attachment,
+        pid: child.id(),
+        config_file: args.agent_config,
+        state_file: args.agent_state_file,
+        status_file: args.agent_status_file,
+        log_file: args.agent_log_file,
+        ready: true,
+    })
 }
 
 fn run_status(args: StatusArgs) -> Result<()> {
@@ -4678,6 +4803,20 @@ fn preflight_connect_args(args: &ConnectArgs) -> Result<()> {
     Ok(())
 }
 
+fn preflight_side_args(args: &ConnectArgs, component: ComponentSelection) -> Result<()> {
+    required_connect_value(args.tenant.as_ref(), "tenant")?;
+    required_connect_value(args.attachment.as_ref(), "attachment")?;
+
+    match component {
+        ComponentSelection::Agent => validate_config_file("agent_config", &args.agent_config)?,
+        ComponentSelection::Gateway => {
+            validate_config_file("gateway_config", &args.gateway_config)?
+        }
+    }
+
+    Ok(())
+}
+
 fn reconcile_before_connect(args: &ConnectArgs) -> Result<()> {
     let existing_session = read_optional_json::<SessionManifest>(&args.session_file)?;
 
@@ -5261,6 +5400,36 @@ mod tests {
 
         assert!(error.to_string().contains("not ready"));
         assert!(error.to_string().contains("agent_config"));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn side_preflight_only_requires_selected_component_config() -> Result<()> {
+        let root = test_root("side-preflight")?;
+        let args = test_login_args(&root, true);
+        ensure_local_configs_for_login(&args)?;
+        write_profile_for_login(&args)?;
+
+        let agent_config = args.agent_config.clone();
+        fs::remove_file(&agent_config)?;
+        let gateway_only_args = resolve_connect_args(ConnectArgs::for_profile(
+            args.profile.clone(),
+            args.profile_file.clone(),
+        ))?;
+        preflight_side_args(&gateway_only_args, ComponentSelection::Gateway)?;
+        assert!(preflight_connect_args(&gateway_only_args).is_err());
+
+        ensure_local_configs_for_login(&args)?;
+        let gateway_config = args.gateway_config.clone();
+        fs::remove_file(&gateway_config)?;
+        let agent_only_args = resolve_connect_args(ConnectArgs::for_profile(
+            args.profile.clone(),
+            args.profile_file.clone(),
+        ))?;
+        preflight_side_args(&agent_only_args, ComponentSelection::Agent)?;
+        assert!(preflight_connect_args(&agent_only_args).is_err());
+
         remove_test_root(root);
         Ok(())
     }
