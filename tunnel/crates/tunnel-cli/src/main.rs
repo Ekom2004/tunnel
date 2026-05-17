@@ -94,6 +94,8 @@ enum CommandKind {
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
     Init(ProfileInitArgs),
+    Export(ProfileExportArgs),
+    Import(ProfileImportArgs),
 }
 
 #[derive(Debug, Args, Clone)]
@@ -418,6 +420,32 @@ struct ProfileInitArgs {
     mode: ProfileMode,
     #[arg(long, hide = true, value_enum)]
     local_component: Option<ComponentSelection>,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ProfileExportArgs {
+    #[arg(value_name = "PROFILE", default_value = "local-dev")]
+    profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-bundles")]
+    out_dir: PathBuf,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ProfileImportArgs {
+    #[arg(value_name = "BUNDLE_DIR")]
+    bundle_dir: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, default_value = "/private/tmp")]
+    install_dir: PathBuf,
+    #[arg(long)]
+    profile: Option<String>,
     #[arg(long)]
     force: bool,
 }
@@ -779,6 +807,38 @@ struct RemoteLifecycleTestReport {
     checks: Vec<DoctorCheck>,
 }
 
+#[derive(Debug, Serialize)]
+struct ProfileExportReport {
+    profile: String,
+    out_dir: PathBuf,
+    agent_bundle: PathBuf,
+    gateway_bundle: PathBuf,
+    agent_config: PathBuf,
+    gateway_config: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct ProfileImportReport {
+    profile: String,
+    side: ComponentSelection,
+    profile_file: PathBuf,
+    installed_config: PathBuf,
+    ready: bool,
+    readiness: ReadinessReport,
+    next: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RemoteProfileBundleManifest {
+    version: u32,
+    profile: String,
+    side: ComponentSelection,
+    config_file: PathBuf,
+    profile_file: PathBuf,
+    run_hint: String,
+    import_hint: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ProfileConfig {
     default: Option<String>,
@@ -909,6 +969,12 @@ fn main() -> Result<()> {
         CommandKind::Profile {
             command: ProfileCommand::Init(args),
         } => run_profile_init(args)?,
+        CommandKind::Profile {
+            command: ProfileCommand::Export(args),
+        } => run_profile_export(args)?,
+        CommandKind::Profile {
+            command: ProfileCommand::Import(args),
+        } => run_profile_import(args)?,
         CommandKind::Soak(args) => run_soak(args)?,
         CommandKind::RepairTest(args) => run_repair_test(args)?,
         CommandKind::LifecycleTest(args) => run_lifecycle_test(args)?,
@@ -1111,6 +1177,100 @@ fn run_profile_init(args: ProfileInitArgs) -> Result<()> {
             "created": true,
         }))?
     );
+    Ok(())
+}
+
+fn run_profile_export(args: ProfileExportArgs) -> Result<()> {
+    let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+        args.profile.clone(),
+        args.profile_file,
+    ))?;
+    validate_config_file("agent_config", &connect_args.agent_config)?;
+    validate_config_file("gateway_config", &connect_args.gateway_config)?;
+
+    if args.out_dir.exists() && !args.force {
+        bail!(
+            "bundle output directory already exists: {}. rerun with --force to overwrite",
+            args.out_dir.display()
+        );
+    }
+    if args.out_dir.exists() {
+        fs::remove_dir_all(&args.out_dir)
+            .with_context(|| format!("failed to replace {}", args.out_dir.display()))?;
+    }
+
+    let agent_bundle = args.out_dir.join("agent");
+    let gateway_bundle = args.out_dir.join("gateway");
+    export_side_bundle(&connect_args, ComponentSelection::Agent, &agent_bundle)?;
+    export_side_bundle(&connect_args, ComponentSelection::Gateway, &gateway_bundle)?;
+
+    let report = ProfileExportReport {
+        profile: args.profile,
+        out_dir: args.out_dir,
+        agent_config: agent_bundle.join("tunnel-agent-wg.json"),
+        gateway_config: gateway_bundle.join("tunnel-gateway-wg.json"),
+        agent_bundle,
+        gateway_bundle,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn run_profile_import(args: ProfileImportArgs) -> Result<()> {
+    let manifest_path = args.bundle_dir.join("tunnel-bundle.json");
+    let manifest: RemoteProfileBundleManifest = serde_json::from_str(
+        &fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("failed to parse {}", manifest_path.display()))?;
+    if manifest.version != 1 {
+        bail!("unsupported bundle version {}", manifest.version);
+    }
+
+    let bundled_profiles_path = args.bundle_dir.join(&manifest.profile_file);
+    let bundled_profiles = load_profile_config(&bundled_profiles_path)?;
+    let bundled_profile = bundled_profiles
+        .profiles
+        .iter()
+        .find(|profile| profile.name == manifest.profile)
+        .ok_or_else(|| {
+            anyhow!(
+                "profile {:?} not found in {}",
+                manifest.profile,
+                bundled_profiles_path.display()
+            )
+        })?;
+    let source_config = args.bundle_dir.join(&manifest.config_file);
+    let installed_config = args.install_dir.join(match manifest.side {
+        ComponentSelection::Agent => "tunnel-agent-wg.json",
+        ComponentSelection::Gateway => "tunnel-gateway-wg.json",
+    });
+    install_bundle_config(&source_config, &installed_config, args.force)?;
+
+    let profile_name = args.profile.unwrap_or(manifest.profile);
+    let imported_profile = imported_side_profile(
+        &profile_name,
+        bundled_profile,
+        manifest.side,
+        &installed_config,
+    );
+    write_profile_entry(&args.profile_file, imported_profile, args.force)?;
+
+    let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+        profile_name.clone(),
+        args.profile_file.clone(),
+    ))?;
+    let readiness = build_connect_readiness(&connect_args);
+    let report = ProfileImportReport {
+        profile: profile_name.clone(),
+        side: manifest.side,
+        profile_file: args.profile_file,
+        installed_config,
+        ready: readiness.ready,
+        readiness,
+        next: format!("tunnel-cli connect {profile_name}"),
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -1468,8 +1628,12 @@ fn write_profile(args: ProfileInitArgs) -> Result<()> {
         mode: args.mode,
         local_component: args.local_component,
     };
-    let mut config = if args.profile_file.exists() {
-        load_profile_config(&args.profile_file)?
+    write_profile_entry(&args.profile_file, profile, args.force)
+}
+
+fn write_profile_entry(profile_file: &Path, profile: TunnelProfile, force: bool) -> Result<()> {
+    let mut config = if profile_file.exists() {
+        load_profile_config(profile_file)?
     } else {
         ProfileConfig {
             default: None,
@@ -1481,32 +1645,193 @@ fn write_profile(args: ProfileInitArgs) -> Result<()> {
         .profiles
         .iter()
         .any(|existing| existing.name == profile.name)
-        && !args.force
+        && !force
     {
         bail!(
             "profile {:?} already exists in {}. rerun with --force to overwrite",
             profile.name,
-            args.profile_file.display()
+            profile_file.display()
         );
     }
 
     config
         .profiles
         .retain(|existing| existing.name != profile.name);
+    let profile_name = profile.name.clone();
     config.profiles.push(profile);
-    config.default = Some(args.profile.clone());
+    config.default = Some(profile_name);
     config
         .profiles
         .sort_by(|left, right| left.name.cmp(&right.name));
 
-    if let Some(parent) = args.profile_file.parent() {
+    if let Some(parent) = profile_file.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(&args.profile_file, serde_json::to_string_pretty(&config)?)
-        .with_context(|| format!("failed to write {}", args.profile_file.display()))?;
+    fs::write(profile_file, serde_json::to_string_pretty(&config)?)
+        .with_context(|| format!("failed to write {}", profile_file.display()))?;
 
     Ok(())
+}
+
+fn export_side_bundle(
+    args: &ConnectArgs,
+    side: ComponentSelection,
+    bundle_dir: &Path,
+) -> Result<()> {
+    fs::create_dir_all(bundle_dir)
+        .with_context(|| format!("failed to create {}", bundle_dir.display()))?;
+    let profile_name = args.profile.clone().unwrap_or_else(|| {
+        required_connect_value(args.attachment.as_ref(), "attachment")
+            .unwrap_or("remote")
+            .to_owned()
+    });
+    let source_config = match side {
+        ComponentSelection::Agent => &args.agent_config,
+        ComponentSelection::Gateway => &args.gateway_config,
+    };
+    let config_file = match side {
+        ComponentSelection::Agent => PathBuf::from("tunnel-agent-wg.json"),
+        ComponentSelection::Gateway => PathBuf::from("tunnel-gateway-wg.json"),
+    };
+    let bundle_config_path = bundle_dir.join(&config_file);
+    fs::copy(source_config, &bundle_config_path).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source_config.display(),
+            bundle_config_path.display()
+        )
+    })?;
+
+    let profile = side_bundle_profile(args, side, &profile_name, &config_file)?;
+    write_json_file(
+        &bundle_dir.join("tunnel-profiles.json"),
+        &ProfileConfig {
+            default: Some(profile_name.clone()),
+            profiles: vec![profile],
+        },
+    )?;
+    write_json_file(
+        &bundle_dir.join("tunnel-bundle.json"),
+        &RemoteProfileBundleManifest {
+            version: 1,
+            profile: profile_name.clone(),
+            side,
+            config_file,
+            profile_file: PathBuf::from("tunnel-profiles.json"),
+            run_hint: format!("tunnel-cli connect {profile_name}"),
+            import_hint: format!(
+                "tunnel-cli profile import {} --profile-file /private/tmp/tunnel-profiles.json",
+                bundle_dir.display()
+            ),
+        },
+    )?;
+
+    Ok(())
+}
+
+fn side_bundle_profile(
+    args: &ConnectArgs,
+    side: ComponentSelection,
+    profile_name: &str,
+    config_file: &Path,
+) -> Result<TunnelProfile> {
+    let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
+    let attachment = required_connect_value(args.attachment.as_ref(), "attachment")?.to_owned();
+    Ok(TunnelProfile {
+        name: profile_name.to_owned(),
+        tenant,
+        attachment,
+        agent_config: (side == ComponentSelection::Agent).then(|| config_file.to_path_buf()),
+        gateway_config: (side == ComponentSelection::Gateway).then(|| config_file.to_path_buf()),
+        agent_state_file: (side == ComponentSelection::Agent)
+            .then(|| PathBuf::from("/private/tmp/tunnel-agent-state.json")),
+        agent_status_file: (side == ComponentSelection::Agent)
+            .then(|| PathBuf::from("/private/tmp/tunnel-agent-status.json")),
+        gateway_state_file: (side == ComponentSelection::Gateway)
+            .then(|| PathBuf::from("/private/tmp/tunnel-gateway-state.json")),
+        gateway_status_file: (side == ComponentSelection::Gateway)
+            .then(|| PathBuf::from("/private/tmp/tunnel-gateway-status.json")),
+        session_file: Some(PathBuf::from("/private/tmp/tunnel-session.json")),
+        agent_log_file: (side == ComponentSelection::Agent)
+            .then(|| PathBuf::from("/private/tmp/tunnel-agent.log")),
+        gateway_log_file: (side == ComponentSelection::Gateway)
+            .then(|| PathBuf::from("/private/tmp/tunnel-gateway.log")),
+        supervisor_log_file: Some(PathBuf::from("/private/tmp/tunnel-supervisor.log")),
+        egress_interface: Some(args.egress_interface.clone()),
+        route_mode: Some(args.route_mode),
+        forwarding_mode: Some(args.forwarding_mode),
+        nat_mode: Some(args.nat_mode),
+        ready_timeout_secs: Some(args.ready_timeout_secs),
+        mode: ProfileMode::Remote,
+        local_component: Some(side),
+    })
+}
+
+fn install_bundle_config(source: &Path, destination: &Path, force: bool) -> Result<()> {
+    validate_config_file("bundle_config", source)?;
+    if destination.exists() && !force {
+        bail!(
+            "config already exists at {}. rerun with --force to overwrite",
+            destination.display()
+        );
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::copy(source, destination).with_context(|| {
+        format!(
+            "failed to install bundle config {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn imported_side_profile(
+    profile_name: &str,
+    bundled_profile: &TunnelProfile,
+    side: ComponentSelection,
+    installed_config: &Path,
+) -> TunnelProfile {
+    TunnelProfile {
+        name: profile_name.to_owned(),
+        tenant: bundled_profile.tenant.clone(),
+        attachment: bundled_profile.attachment.clone(),
+        agent_config: (side == ComponentSelection::Agent).then(|| installed_config.to_path_buf()),
+        gateway_config: (side == ComponentSelection::Gateway)
+            .then(|| installed_config.to_path_buf()),
+        agent_state_file: (side == ComponentSelection::Agent)
+            .then(|| PathBuf::from("/private/tmp/tunnel-agent-state.json")),
+        agent_status_file: (side == ComponentSelection::Agent)
+            .then(|| PathBuf::from("/private/tmp/tunnel-agent-status.json")),
+        gateway_state_file: (side == ComponentSelection::Gateway)
+            .then(|| PathBuf::from("/private/tmp/tunnel-gateway-state.json")),
+        gateway_status_file: (side == ComponentSelection::Gateway)
+            .then(|| PathBuf::from("/private/tmp/tunnel-gateway-status.json")),
+        session_file: Some(PathBuf::from("/private/tmp/tunnel-session.json")),
+        agent_log_file: (side == ComponentSelection::Agent)
+            .then(|| PathBuf::from("/private/tmp/tunnel-agent.log")),
+        gateway_log_file: (side == ComponentSelection::Gateway)
+            .then(|| PathBuf::from("/private/tmp/tunnel-gateway.log")),
+        supervisor_log_file: Some(PathBuf::from("/private/tmp/tunnel-supervisor.log")),
+        egress_interface: bundled_profile
+            .egress_interface
+            .clone()
+            .or_else(|| Some(String::from("en0"))),
+        route_mode: bundled_profile
+            .route_mode
+            .or(Some(SystemCommandMode::Apply)),
+        forwarding_mode: bundled_profile
+            .forwarding_mode
+            .or(Some(SystemCommandMode::Apply)),
+        nat_mode: bundled_profile.nat_mode.or(Some(SystemCommandMode::Apply)),
+        ready_timeout_secs: bundled_profile.ready_timeout_secs.or(Some(12)),
+        mode: ProfileMode::Remote,
+        local_component: Some(side),
+    }
 }
 
 fn resolve_status_args(mut args: StatusArgs) -> Result<StatusArgs> {
@@ -6275,6 +6600,67 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn profile_export_separates_private_keys_and_imports_side_bundle() -> Result<()> {
+        let root = test_root("profile-export")?;
+        let args = test_login_args(&root, true);
+        ensure_local_configs_for_login(&args)?;
+        write_profile_for_login(&args)?;
+
+        let agent_config: TunnelConfig =
+            serde_json::from_str(&fs::read_to_string(&args.agent_config)?)?;
+        let gateway_config: TunnelConfig =
+            serde_json::from_str(&fs::read_to_string(&args.gateway_config)?)?;
+        let agent_private_key = agent_config
+            .wireguard
+            .as_ref()
+            .map(|wireguard| wireguard.private_key_base64.clone())
+            .expect("agent wireguard config should exist");
+        let gateway_private_key = gateway_config
+            .wireguard
+            .as_ref()
+            .map(|wireguard| wireguard.private_key_base64.clone())
+            .expect("gateway wireguard config should exist");
+
+        let out_dir = root.join("bundles");
+        run_profile_export(ProfileExportArgs {
+            profile: args.profile.clone(),
+            profile_file: args.profile_file.clone(),
+            out_dir: out_dir.clone(),
+            force: true,
+        })?;
+
+        let agent_bundle_contents = read_dir_text(&out_dir.join("agent"))?;
+        let gateway_bundle_contents = read_dir_text(&out_dir.join("gateway"))?;
+        assert!(agent_bundle_contents.contains(&agent_private_key));
+        assert!(!agent_bundle_contents.contains(&gateway_private_key));
+        assert!(gateway_bundle_contents.contains(&gateway_private_key));
+        assert!(!gateway_bundle_contents.contains(&agent_private_key));
+
+        let imported_profile_file = root.join("imported-profiles.json");
+        run_profile_import(ProfileImportArgs {
+            bundle_dir: out_dir.join("agent"),
+            profile_file: imported_profile_file.clone(),
+            install_dir: root.join("installed"),
+            profile: Some(String::from("imported-agent")),
+            force: true,
+        })?;
+        let imported_connect = resolve_connect_args(ConnectArgs::for_profile(
+            String::from("imported-agent"),
+            imported_profile_file,
+        ))?;
+        assert_eq!(imported_connect.mode, ProfileMode::Remote);
+        assert_eq!(
+            imported_connect.local_component,
+            Some(ComponentSelection::Agent)
+        );
+        assert!(build_connect_readiness(&imported_connect).ready);
+        assert!(imported_connect.agent_config.exists());
+
+        remove_test_root(root);
+        Ok(())
+    }
+
     fn test_login_args(root: &Path, force: bool) -> LoginArgs {
         LoginArgs {
             profile: String::from("test-dev"),
@@ -6322,5 +6708,19 @@ mod tests {
 
     fn remove_test_root(root: PathBuf) {
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn read_dir_text(path: &Path) -> Result<String> {
+        let mut combined = String::new();
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+        {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                combined.push_str(&fs::read_to_string(entry.path())?);
+                combined.push('\n');
+            }
+        }
+        Ok(combined)
     }
 }
