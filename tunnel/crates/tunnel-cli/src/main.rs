@@ -80,6 +80,8 @@ enum CommandKind {
     RepairTest(RepairTestArgs),
     #[command(hide = true)]
     LifecycleTest(LifecycleTestArgs),
+    #[command(hide = true)]
+    RemoteCheck(RemoteCheckArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -447,6 +449,18 @@ struct LifecycleTestArgs {
     target: String,
 }
 
+#[derive(Debug, Args, Clone)]
+struct RemoteCheckArgs {
+    #[arg(value_name = "PROFILE", default_value = "local-dev")]
+    profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long)]
+    gateway_host: Option<String>,
+    #[arg(long)]
+    gateway_port: Option<u16>,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 enum SystemCommandMode {
     Skip,
@@ -666,6 +680,15 @@ struct LifecycleTestReport {
     checks: Vec<DoctorCheck>,
 }
 
+#[derive(Debug, Serialize)]
+struct RemoteCheckReport {
+    overall: DoctorState,
+    profile: String,
+    gateway_host: Option<String>,
+    gateway_port: Option<u16>,
+    checks: Vec<DoctorCheck>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ProfileConfig {
     default: Option<String>,
@@ -795,6 +818,7 @@ fn main() -> Result<()> {
         CommandKind::Soak(args) => run_soak(args)?,
         CommandKind::RepairTest(args) => run_repair_test(args)?,
         CommandKind::LifecycleTest(args) => run_lifecycle_test(args)?,
+        CommandKind::RemoteCheck(args) => run_remote_check(args)?,
     }
 
     Ok(())
@@ -2004,6 +2028,171 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
 
     if report.overall != DoctorState::Pass {
         bail!("lifecycle test failed");
+    }
+
+    Ok(())
+}
+
+fn run_remote_check(args: RemoteCheckArgs) -> Result<()> {
+    let mut checks = Vec::new();
+    let mut connect_args =
+        ConnectArgs::for_profile(args.profile.clone(), args.profile_file.clone());
+    connect_args = match resolve_connect_args(connect_args) {
+        Ok(args) => {
+            checks.push(doctor_check(
+                "profile",
+                DoctorState::Pass,
+                "profile resolved successfully",
+            ));
+            args
+        }
+        Err(error) => {
+            checks.push(doctor_check(
+                "profile",
+                DoctorState::Fail,
+                format!("profile resolution failed: {error:#}"),
+            ));
+            return print_remote_check_report(args, checks);
+        }
+    };
+
+    push_config_validation_check(&mut checks, "agent_config", &connect_args.agent_config);
+    push_config_validation_check(&mut checks, "gateway_config", &connect_args.gateway_config);
+
+    let agent_config = read_optional_json::<TunnelConfig>(&connect_args.agent_config)?;
+    let gateway_config = read_optional_json::<TunnelConfig>(&connect_args.gateway_config)?;
+    check_remote_config_intent(
+        &mut checks,
+        agent_config.as_ref(),
+        gateway_config.as_ref(),
+        args.gateway_host.as_deref(),
+        args.gateway_port,
+    );
+
+    print_remote_check_report(args, checks)
+}
+
+fn push_config_validation_check(checks: &mut Vec<DoctorCheck>, name: &str, path: &Path) {
+    match validate_config_file(name, path) {
+        Ok(()) => checks.push(doctor_check(
+            name,
+            DoctorState::Pass,
+            format!("valid config: {}", path.display()),
+        )),
+        Err(error) => checks.push(doctor_check(name, DoctorState::Fail, format!("{error:#}"))),
+    }
+}
+
+fn check_remote_config_intent(
+    checks: &mut Vec<DoctorCheck>,
+    agent_config: Option<&TunnelConfig>,
+    gateway_config: Option<&TunnelConfig>,
+    expected_host: Option<&str>,
+    expected_port: Option<u16>,
+) {
+    let Some(agent_config) = agent_config else {
+        checks.push(doctor_check(
+            "agent_config_intent",
+            DoctorState::Fail,
+            "agent config could not be loaded",
+        ));
+        return;
+    };
+    let Some(gateway_config) = gateway_config else {
+        checks.push(doctor_check(
+            "gateway_config_intent",
+            DoctorState::Fail,
+            "gateway config could not be loaded",
+        ));
+        return;
+    };
+    let Some(agent_wg) = agent_config.wireguard.as_ref() else {
+        checks.push(doctor_check(
+            "agent_wireguard",
+            DoctorState::Fail,
+            "agent config has no WireGuard section",
+        ));
+        return;
+    };
+    let Some(gateway_wg) = gateway_config.wireguard.as_ref() else {
+        checks.push(doctor_check(
+            "gateway_wireguard",
+            DoctorState::Fail,
+            "gateway config has no WireGuard section",
+        ));
+        return;
+    };
+    let Some(peer_endpoint) = agent_wg.peer_endpoint.as_ref() else {
+        checks.push(doctor_check(
+            "agent_peer_endpoint",
+            DoctorState::Fail,
+            "agent config has no gateway peer endpoint",
+        ));
+        return;
+    };
+
+    let expected_host = expected_host.unwrap_or(&agent_config.gateway.host);
+    let expected_port = expected_port.unwrap_or(agent_config.gateway.port);
+    push_lifecycle_check(
+        checks,
+        "agent_gateway_endpoint",
+        peer_endpoint.host == expected_host && peer_endpoint.port == expected_port,
+        "agent peer endpoint matches expected gateway host/port",
+        "agent peer endpoint does not match expected gateway host/port",
+    );
+    push_lifecycle_check(
+        checks,
+        "gateway_bind_port",
+        gateway_wg.local_bind_port == expected_port,
+        "gateway bind port matches expected gateway port",
+        "gateway bind port does not match expected gateway port",
+    );
+    push_lifecycle_check(
+        checks,
+        "gateway_host_consistency",
+        agent_config.gateway.host == gateway_config.gateway.host
+            && agent_config.gateway.host == expected_host,
+        "agent/gateway configs agree on gateway host",
+        "agent/gateway configs disagree on gateway host",
+    );
+    push_lifecycle_check(
+        checks,
+        "tunnel_address_pair",
+        agent_wg.local_tunnel_address == gateway_wg.peer_tunnel_address
+            && agent_wg.peer_tunnel_address == gateway_wg.local_tunnel_address,
+        "agent/gateway tunnel addresses are mirrored",
+        "agent/gateway tunnel addresses are not mirrored",
+    );
+    push_lifecycle_check(
+        checks,
+        "destination_cidrs",
+        !agent_config.route_policy.destination_cidrs.is_empty()
+            && agent_config.route_policy.destination_cidrs
+                == gateway_config.route_policy.destination_cidrs,
+        "agent/gateway destination CIDRs match",
+        "agent/gateway destination CIDRs are missing or mismatched",
+    );
+}
+
+fn print_remote_check_report(args: RemoteCheckArgs, checks: Vec<DoctorCheck>) -> Result<()> {
+    let overall = if checks.iter().any(|check| check.state == DoctorState::Fail) {
+        DoctorState::Fail
+    } else if checks.iter().any(|check| check.state == DoctorState::Warn) {
+        DoctorState::Warn
+    } else {
+        DoctorState::Pass
+    };
+    let report = RemoteCheckReport {
+        overall,
+        profile: args.profile,
+        gateway_host: args.gateway_host,
+        gateway_port: args.gateway_port,
+        checks,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    if report.overall == DoctorState::Fail {
+        bail!("remote check failed");
     }
 
     Ok(())
