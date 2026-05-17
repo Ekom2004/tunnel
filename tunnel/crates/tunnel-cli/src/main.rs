@@ -78,6 +78,8 @@ enum CommandKind {
     Soak(SoakArgs),
     #[command(hide = true)]
     RepairTest(RepairTestArgs),
+    #[command(hide = true)]
+    LifecycleTest(LifecycleTestArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -287,6 +289,24 @@ struct DisconnectArgs {
     nat_mode: SystemCommandMode,
 }
 
+impl DisconnectArgs {
+    fn for_profile(profile: String, profile_file: PathBuf) -> Self {
+        Self {
+            profile: Some(profile),
+            profile_file,
+            agent_config: PathBuf::from("/private/tmp/tunnel-agent-wg.json"),
+            agent_state_file: PathBuf::from("/private/tmp/tunnel-agent-state.json"),
+            agent_status_file: PathBuf::from("/private/tmp/tunnel-agent-status.json"),
+            gateway_state_file: PathBuf::from("/private/tmp/tunnel-gateway-state.json"),
+            gateway_status_file: PathBuf::from("/private/tmp/tunnel-gateway-status.json"),
+            session_file: PathBuf::from("/private/tmp/tunnel-session.json"),
+            route_mode: SystemCommandMode::Apply,
+            forwarding_mode: SystemCommandMode::Apply,
+            nat_mode: SystemCommandMode::Apply,
+        }
+    }
+}
+
 #[derive(Debug, Args, Clone)]
 struct RestartArgs {
     #[arg(long)]
@@ -405,6 +425,16 @@ struct RepairTestArgs {
     mode: RepairTestMode,
     #[arg(long)]
     component: Option<ComponentSelection>,
+}
+
+#[derive(Debug, Args, Clone)]
+struct LifecycleTestArgs {
+    #[arg(value_name = "PROFILE", default_value = "local-dev")]
+    profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, default_value = "1.1.1.1")]
+    target: String,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
@@ -580,6 +610,22 @@ struct ConnectWarmupReport {
 }
 
 #[derive(Debug, Serialize)]
+struct ConnectReport {
+    tenant: String,
+    attachment: String,
+    supervised: bool,
+    supervisor_pid: Option<u32>,
+    agent_pid: Option<u32>,
+    gateway_pid: Option<u32>,
+    agent_log_file: PathBuf,
+    gateway_log_file: PathBuf,
+    supervisor_log_file: PathBuf,
+    ready: bool,
+    warmup: ConnectWarmupReport,
+    session_file: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
 struct DisconnectReport {
     tenant: Option<String>,
     attachment: Option<String>,
@@ -595,6 +641,19 @@ struct DisconnectReport {
     gateway_state_removed: bool,
     gateway_status_removed: bool,
     detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LifecycleTestReport {
+    overall: DoctorState,
+    profile: String,
+    login_ready: bool,
+    connect_ready: bool,
+    status_healthy: bool,
+    disconnect_clean: bool,
+    second_disconnect_clean: bool,
+    warmup: ConnectWarmupReport,
+    checks: Vec<DoctorCheck>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -725,6 +784,7 @@ fn main() -> Result<()> {
         } => run_profile_init(args)?,
         CommandKind::Soak(args) => run_soak(args)?,
         CommandKind::RepairTest(args) => run_repair_test(args)?,
+        CommandKind::LifecycleTest(args) => run_lifecycle_test(args)?,
     }
 
     Ok(())
@@ -1381,10 +1441,12 @@ fn run_connect(args: ConnectArgs) -> Result<()> {
         return run_connect_oneshot(args);
     }
 
-    run_connect_supervised(args)
+    let report = connect_supervised(args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
-fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
+fn connect_supervised(args: ConnectArgs) -> Result<ConnectReport> {
     preflight_connect_args(&args)?;
 
     if let Some(session) = read_optional_json::<SessionManifest>(&args.session_file)? {
@@ -1393,48 +1455,36 @@ fn run_connect_supervised(args: ConnectArgs) -> Result<()> {
         let gateway_running = pid_is_running_optional(session.gateway_pid)?;
         if supervisor_running && agent_running && gateway_running {
             let warmup = warm_connect_session(&args, &session)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "tenant": session.tenant,
-                    "attachment": session.attachment,
-                    "supervised": true,
-                    "supervisor_pid": session.supervisor_pid,
-                    "agent_pid": session.agent_pid,
-                    "gateway_pid": session.gateway_pid,
-                    "agent_log_file": session.agent_log_file,
-                    "gateway_log_file": session.gateway_log_file,
-                    "supervisor_log_file": session.supervisor_log_file,
-                    "ready": true,
-                    "warmup": warmup,
-                    "session_file": args.session_file,
-                }))?
-            );
-            return Ok(());
+            return Ok(connect_report_from_session(&args, session, warmup));
         }
     }
 
     let (supervisor_pid, session) = spawn_supervisor_for_connect(&args)?;
     let warmup = warm_connect_session(&args, &session)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "tenant": session.tenant,
-            "attachment": session.attachment,
-            "supervised": true,
-            "supervisor_pid": session.supervisor_pid.or(Some(supervisor_pid)),
-            "agent_pid": session.agent_pid,
-            "gateway_pid": session.gateway_pid,
-            "agent_log_file": session.agent_log_file,
-            "gateway_log_file": session.gateway_log_file,
-            "supervisor_log_file": session.supervisor_log_file,
-            "ready": true,
-            "warmup": warmup,
-            "session_file": args.session_file,
-        }))?
-    );
+    let mut report = connect_report_from_session(&args, session, warmup);
+    report.supervisor_pid = report.supervisor_pid.or(Some(supervisor_pid));
+    Ok(report)
+}
 
-    Ok(())
+fn connect_report_from_session(
+    args: &ConnectArgs,
+    session: SessionManifest,
+    warmup: ConnectWarmupReport,
+) -> ConnectReport {
+    ConnectReport {
+        tenant: session.tenant,
+        attachment: session.attachment,
+        supervised: true,
+        supervisor_pid: session.supervisor_pid,
+        agent_pid: session.agent_pid,
+        gateway_pid: session.gateway_pid,
+        agent_log_file: session.agent_log_file,
+        gateway_log_file: session.gateway_log_file,
+        supervisor_log_file: session.supervisor_log_file,
+        ready: true,
+        warmup,
+        session_file: args.session_file.clone(),
+    }
 }
 
 fn spawn_supervisor_for_connect(args: &ConnectArgs) -> Result<(u32, SessionManifest)> {
@@ -1704,6 +1754,17 @@ fn run_logs(args: LogsArgs) -> Result<()> {
 
 fn run_disconnect(args: DisconnectArgs) -> Result<()> {
     let args = resolve_disconnect_args(args)?;
+    let report = disconnect_tunnel(args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    if !report.disconnected {
+        bail!("disconnect completed with remaining tunnel state");
+    }
+
+    Ok(())
+}
+
+fn disconnect_tunnel(args: DisconnectArgs) -> Result<DisconnectReport> {
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
     let tenant = session.as_ref().map(|session| session.tenant.clone());
     let attachment = session.as_ref().map(|session| session.attachment.clone());
@@ -1727,7 +1788,7 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
     let agent_bin = sibling_binary("tunnel-agent")?;
     let gateway_bin = sibling_binary("tunnel-gateway")?;
 
-    let agent_cleaned = if args.agent_state_file.exists() {
+    if args.agent_state_file.exists() {
         run_cleanup_binary_quiet(
             &agent_bin,
             &[
@@ -1742,12 +1803,9 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
                 path_arg(&args.agent_status_file)?,
             ],
         )?;
-        true
-    } else {
-        !args.agent_status_file.exists()
-    };
+    }
 
-    let gateway_cleaned = if args.gateway_state_file.exists() {
+    if args.gateway_state_file.exists() {
         run_cleanup_binary_quiet(
             &gateway_bin,
             &[
@@ -1762,10 +1820,7 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
                 path_arg(&args.gateway_status_file)?,
             ],
         )?;
-        true
-    } else {
-        !args.gateway_status_file.exists()
-    };
+    }
 
     remove_stale_file("agent status", &args.agent_status_file)?;
     remove_stale_file("gateway status", &args.gateway_status_file)?;
@@ -1788,6 +1843,8 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
     let agent_status_removed = !args.agent_status_file.exists();
     let gateway_state_removed = !args.gateway_state_file.exists();
     let gateway_status_removed = !args.gateway_status_file.exists();
+    let agent_cleaned = agent_state_removed && agent_status_removed;
+    let gateway_cleaned = gateway_state_removed && gateway_status_removed;
     let disconnected = supervisor_stopped
         && agent_stopped
         && gateway_stopped
@@ -1819,13 +1876,145 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
             String::from("tunnel cleanup completed with remaining state")
         },
     };
+    Ok(report)
+}
+
+fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
+    let mut checks = Vec::new();
+    let login_args = LoginArgs {
+        profile: args.profile.clone(),
+        profile_file: args.profile_file.clone(),
+        tenant: String::from("local-tenant"),
+        attachment: Some(args.profile.clone()),
+        agent_config: PathBuf::from("/private/tmp/tunnel-agent-wg.json"),
+        gateway_config: PathBuf::from("/private/tmp/tunnel-gateway-wg.json"),
+        egress_interface: String::from("en0"),
+        force: false,
+    };
+
+    let _ = disconnect_tunnel(resolve_disconnect_args(DisconnectArgs::for_profile(
+        args.profile.clone(),
+        args.profile_file.clone(),
+    ))?)?;
+
+    ensure_local_configs_for_login(&login_args)?;
+    write_profile(ProfileInitArgs {
+        profile: login_args.profile.clone(),
+        profile_file: login_args.profile_file.clone(),
+        tenant: login_args.tenant.clone(),
+        attachment: login_args.attachment.clone(),
+        agent_config: login_args.agent_config.clone(),
+        gateway_config: login_args.gateway_config.clone(),
+        egress_interface: login_args.egress_interface.clone(),
+        force: true,
+    })?;
+
+    let mut connect_args = resolve_connect_args(ConnectArgs::for_profile(
+        args.profile.clone(),
+        args.profile_file.clone(),
+    ))?;
+    connect_args.warmup_target = args.target.clone();
+    let readiness = build_connect_readiness(&connect_args);
+    push_lifecycle_check(
+        &mut checks,
+        "login_ready",
+        readiness.ready,
+        "login produced a ready profile",
+        "login profile readiness failed",
+    );
+
+    let connect_report = connect_supervised(connect_args.clone())?;
+    push_lifecycle_check(
+        &mut checks,
+        "connect_ready",
+        connect_report.ready
+            && connect_report.warmup.agent_active
+            && connect_report.warmup.gateway_active,
+        "connect warmed the packet path and both runtimes are active",
+        "connect did not produce an active warmed tunnel",
+    );
+
+    let agent_status = read_optional_json::<RuntimeStatus>(&connect_args.agent_status_file)?;
+    let gateway_status = read_optional_json::<RuntimeStatus>(&connect_args.gateway_status_file)?;
+    let status_healthy = agent_status
+        .as_ref()
+        .map(is_transport_active)
+        .unwrap_or(false)
+        && gateway_status
+            .as_ref()
+            .map(is_transport_active)
+            .unwrap_or(false);
+    push_lifecycle_check(
+        &mut checks,
+        "status_healthy",
+        status_healthy,
+        "status reports healthy active agent and gateway",
+        "status did not report healthy active agent and gateway",
+    );
+
+    let disconnect_report = disconnect_tunnel(resolve_disconnect_args(
+        DisconnectArgs::for_profile(args.profile.clone(), args.profile_file.clone()),
+    )?)?;
+    push_lifecycle_check(
+        &mut checks,
+        "disconnect_clean",
+        disconnect_report.disconnected,
+        "disconnect cleaned tunnel lifecycle state",
+        "disconnect left tunnel lifecycle state behind",
+    );
+
+    let second_disconnect_report = disconnect_tunnel(resolve_disconnect_args(
+        DisconnectArgs::for_profile(args.profile.clone(), args.profile_file.clone()),
+    )?)?;
+    push_lifecycle_check(
+        &mut checks,
+        "second_disconnect_clean",
+        second_disconnect_report.disconnected,
+        "second disconnect was idempotent",
+        "second disconnect was not idempotent",
+    );
+
+    let overall = if checks.iter().any(|check| check.state == DoctorState::Fail) {
+        DoctorState::Fail
+    } else {
+        DoctorState::Pass
+    };
+    let report = LifecycleTestReport {
+        overall,
+        profile: args.profile,
+        login_ready: readiness.ready,
+        connect_ready: connect_report.ready,
+        status_healthy,
+        disconnect_clean: disconnect_report.disconnected,
+        second_disconnect_clean: second_disconnect_report.disconnected,
+        warmup: connect_report.warmup,
+        checks,
+    };
     println!("{}", serde_json::to_string_pretty(&report)?);
 
-    if !disconnected {
-        bail!("disconnect completed with remaining tunnel state");
+    if report.overall != DoctorState::Pass {
+        bail!("lifecycle test failed");
     }
 
     Ok(())
+}
+
+fn push_lifecycle_check(
+    checks: &mut Vec<DoctorCheck>,
+    name: &str,
+    passed: bool,
+    pass_detail: &str,
+    fail_detail: &str,
+) {
+    checks.push(doctor_check(
+        name,
+        if passed {
+            DoctorState::Pass
+        } else {
+            DoctorState::Fail
+        },
+        if passed { pass_detail } else { fail_detail },
+    ));
 }
 
 fn run_restart(args: RestartArgs) -> Result<()> {
