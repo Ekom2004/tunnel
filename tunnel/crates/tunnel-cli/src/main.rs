@@ -579,6 +579,24 @@ struct ConnectWarmupReport {
     detail: String,
 }
 
+#[derive(Debug, Serialize)]
+struct DisconnectReport {
+    tenant: Option<String>,
+    attachment: Option<String>,
+    disconnected: bool,
+    supervisor_stopped: bool,
+    agent_stopped: bool,
+    gateway_stopped: bool,
+    agent_cleaned: bool,
+    gateway_cleaned: bool,
+    session_removed: bool,
+    agent_state_removed: bool,
+    agent_status_removed: bool,
+    gateway_state_removed: bool,
+    gateway_status_removed: bool,
+    detail: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct ProfileConfig {
     default: Option<String>,
@@ -1687,6 +1705,12 @@ fn run_logs(args: LogsArgs) -> Result<()> {
 fn run_disconnect(args: DisconnectArgs) -> Result<()> {
     let args = resolve_disconnect_args(args)?;
     let session = read_optional_json::<SessionManifest>(&args.session_file)?;
+    let tenant = session.as_ref().map(|session| session.tenant.clone());
+    let attachment = session.as_ref().map(|session| session.attachment.clone());
+    let supervisor_pid = session.as_ref().and_then(|session| session.supervisor_pid);
+    let agent_pid = session.as_ref().and_then(|session| session.agent_pid);
+    let gateway_pid = session.as_ref().and_then(|session| session.gateway_pid);
+
     if let Some(session) = &session {
         terminate_pid_except_self(session.supervisor_pid)?;
         wait_for_pid_exit_except_self(
@@ -1696,13 +1720,15 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
         )?;
         terminate_pid(session.agent_pid)?;
         terminate_pid(session.gateway_pid)?;
+        wait_for_pid_exit_except_self(session.agent_pid, "agent", Duration::from_secs(3))?;
+        wait_for_pid_exit_except_self(session.gateway_pid, "gateway", Duration::from_secs(3))?;
     }
 
     let agent_bin = sibling_binary("tunnel-agent")?;
     let gateway_bin = sibling_binary("tunnel-gateway")?;
 
-    if args.agent_state_file.exists() {
-        run_cleanup_binary(
+    let agent_cleaned = if args.agent_state_file.exists() {
+        run_cleanup_binary_quiet(
             &agent_bin,
             &[
                 "--config",
@@ -1716,15 +1742,13 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
                 path_arg(&args.agent_status_file)?,
             ],
         )?;
+        true
     } else {
-        eprintln!(
-            "agent cleanup skipped: state file not found: {}",
-            args.agent_state_file.display()
-        );
-    }
+        !args.agent_status_file.exists()
+    };
 
-    if args.gateway_state_file.exists() {
-        run_cleanup_binary(
+    let gateway_cleaned = if args.gateway_state_file.exists() {
+        run_cleanup_binary_quiet(
             &gateway_bin,
             &[
                 "--cleanup-only",
@@ -1738,13 +1762,15 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
                 path_arg(&args.gateway_status_file)?,
             ],
         )?;
+        true
     } else {
-        eprintln!(
-            "gateway cleanup skipped: state file not found: {}",
-            args.gateway_state_file.display()
-        );
-    }
+        !args.gateway_status_file.exists()
+    };
 
+    remove_stale_file("agent status", &args.agent_status_file)?;
+    remove_stale_file("gateway status", &args.gateway_status_file)?;
+
+    let mut session_removed = !args.session_file.exists();
     if args.session_file.exists() {
         fs::remove_file(&args.session_file).with_context(|| {
             format!(
@@ -1752,6 +1778,51 @@ fn run_disconnect(args: DisconnectArgs) -> Result<()> {
                 args.session_file.display()
             )
         })?;
+        session_removed = true;
+    }
+
+    let supervisor_stopped = !pid_is_running_optional(supervisor_pid)?;
+    let agent_stopped = !pid_is_running_optional(agent_pid)?;
+    let gateway_stopped = !pid_is_running_optional(gateway_pid)?;
+    let agent_state_removed = !args.agent_state_file.exists();
+    let agent_status_removed = !args.agent_status_file.exists();
+    let gateway_state_removed = !args.gateway_state_file.exists();
+    let gateway_status_removed = !args.gateway_status_file.exists();
+    let disconnected = supervisor_stopped
+        && agent_stopped
+        && gateway_stopped
+        && agent_cleaned
+        && gateway_cleaned
+        && session_removed
+        && agent_state_removed
+        && agent_status_removed
+        && gateway_state_removed
+        && gateway_status_removed;
+
+    let report = DisconnectReport {
+        tenant,
+        attachment,
+        disconnected,
+        supervisor_stopped,
+        agent_stopped,
+        gateway_stopped,
+        agent_cleaned,
+        gateway_cleaned,
+        session_removed,
+        agent_state_removed,
+        agent_status_removed,
+        gateway_state_removed,
+        gateway_status_removed,
+        detail: if disconnected {
+            String::from("tunnel lifecycle cleanup complete")
+        } else {
+            String::from("tunnel cleanup completed with remaining state")
+        },
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    if !disconnected {
+        bail!("disconnect completed with remaining tunnel state");
     }
 
     Ok(())
@@ -4156,6 +4227,25 @@ fn run_cleanup_binary(binary: &Path, args: &[&str]) -> Result<()> {
 
     if !status.success() {
         bail!("cleanup command failed for {}", binary.display());
+    }
+
+    Ok(())
+}
+
+fn run_cleanup_binary_quiet(binary: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new(binary)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("failed to run {}", binary.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "cleanup command failed for {}\nstdout: {}\nstderr: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     Ok(())
