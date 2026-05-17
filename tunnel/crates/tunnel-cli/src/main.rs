@@ -69,6 +69,7 @@ enum CommandKind {
     Supervise(SupervisorArgs),
     Doctor(DoctorArgs),
     Logs(LogsArgs),
+    #[command(hide = true)]
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
@@ -622,7 +623,7 @@ struct ConfigBootstrapAction {
     detail: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ConfigBootstrapActionKind {
     Created,
@@ -4515,4 +4516,176 @@ fn append_connect_args(command: &mut Command, args: &ConnectArgs) {
         .arg(mode_str(args.nat_mode))
         .arg("--ready-timeout-secs")
         .arg(args.ready_timeout_secs.to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn public_help_hides_profile_plumbing() {
+        let mut command = Cli::command();
+        let help = command.render_help().to_string();
+
+        assert!(help.contains("login"));
+        assert!(help.contains("connect"));
+        assert!(!help.contains("profile"));
+    }
+
+    #[test]
+    fn login_generation_creates_valid_configs_and_ready_profile() -> Result<()> {
+        let root = test_root("generates-ready")?;
+        let args = test_login_args(&root, true);
+
+        let report = ensure_local_configs_for_login(&args)?;
+        assert_eq!(
+            report.agent_config.action,
+            ConfigBootstrapActionKind::Created
+        );
+        assert_eq!(
+            report.gateway_config.action,
+            ConfigBootstrapActionKind::Created
+        );
+        validate_config_file("agent_config", &args.agent_config)?;
+        validate_config_file("gateway_config", &args.gateway_config)?;
+
+        write_profile_for_login(&args)?;
+        let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+            args.profile.clone(),
+            args.profile_file.clone(),
+        ))?;
+        let readiness = build_connect_readiness(&connect_args);
+
+        assert!(readiness.ready);
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn login_generation_reuses_existing_valid_configs_without_force() -> Result<()> {
+        let root = test_root("reuses-valid")?;
+        let mut args = test_login_args(&root, true);
+        ensure_local_configs_for_login(&args)?;
+        let agent_before = fs::read_to_string(&args.agent_config)?;
+        let gateway_before = fs::read_to_string(&args.gateway_config)?;
+
+        args.force = false;
+        let report = ensure_local_configs_for_login(&args)?;
+
+        assert_eq!(
+            report.agent_config.action,
+            ConfigBootstrapActionKind::Reused
+        );
+        assert_eq!(
+            report.gateway_config.action,
+            ConfigBootstrapActionKind::Reused
+        );
+        assert_eq!(fs::read_to_string(&args.agent_config)?, agent_before);
+        assert_eq!(fs::read_to_string(&args.gateway_config)?, gateway_before);
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn login_generation_preserves_invalid_existing_config_until_force() -> Result<()> {
+        let root = test_root("preserves-invalid")?;
+        let mut args = test_login_args(&root, false);
+        fs::write(&args.agent_config, "{bad json")?;
+
+        let report = ensure_local_configs_for_login(&args)?;
+        assert_eq!(
+            report.agent_config.action,
+            ConfigBootstrapActionKind::PreservedInvalid
+        );
+        assert_eq!(fs::read_to_string(&args.agent_config)?, "{bad json");
+        assert!(validate_config_file("agent_config", &args.agent_config).is_err());
+
+        write_profile_for_login(&args)?;
+        let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+            args.profile.clone(),
+            args.profile_file.clone(),
+        ))?;
+        assert!(!build_connect_readiness(&connect_args).ready);
+
+        args.force = true;
+        let forced_report = ensure_local_configs_for_login(&args)?;
+        assert_eq!(
+            forced_report.agent_config.action,
+            ConfigBootstrapActionKind::Overwritten
+        );
+        validate_config_file("agent_config", &args.agent_config)?;
+        validate_config_file("gateway_config", &args.gateway_config)?;
+
+        write_profile_for_login(&args)?;
+        let forced_connect_args = resolve_connect_args(ConnectArgs::for_profile(
+            args.profile.clone(),
+            args.profile_file.clone(),
+        ))?;
+        assert!(build_connect_readiness(&forced_connect_args).ready);
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn connect_preflight_fails_before_launch_when_config_is_invalid() -> Result<()> {
+        let root = test_root("preflight-invalid")?;
+        let args = test_login_args(&root, false);
+        fs::write(&args.agent_config, "{bad json")?;
+        ensure_local_configs_for_login(&args)?;
+        write_profile_for_login(&args)?;
+
+        let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+            args.profile.clone(),
+            args.profile_file.clone(),
+        ))?;
+        let error = preflight_connect_args(&connect_args)
+            .expect_err("invalid config must fail preflight before launch");
+
+        assert!(error.to_string().contains("not ready"));
+        assert!(error.to_string().contains("agent_config"));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    fn test_login_args(root: &Path, force: bool) -> LoginArgs {
+        LoginArgs {
+            profile: String::from("test-dev"),
+            profile_file: root.join("profiles.json"),
+            tenant: String::from("test-tenant"),
+            attachment: Some(String::from("test-attachment")),
+            agent_config: root.join("agent.json"),
+            gateway_config: root.join("gateway.json"),
+            egress_interface: String::from("en0"),
+            force,
+        }
+    }
+
+    fn write_profile_for_login(args: &LoginArgs) -> Result<()> {
+        write_profile(ProfileInitArgs {
+            profile: args.profile.clone(),
+            profile_file: args.profile_file.clone(),
+            tenant: args.tenant.clone(),
+            attachment: args.attachment.clone(),
+            agent_config: args.agent_config.clone(),
+            gateway_config: args.gateway_config.clone(),
+            egress_interface: args.egress_interface.clone(),
+            force: true,
+        })
+    }
+
+    fn test_root(name: &str) -> Result<PathBuf> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("tunnel-cli-{name}-{}-{nanos}", process::id()));
+        fs::create_dir_all(&root)?;
+        Ok(root)
+    }
+
+    fn remove_test_root(root: PathBuf) {
+        let _ = fs::remove_dir_all(root);
+    }
 }
