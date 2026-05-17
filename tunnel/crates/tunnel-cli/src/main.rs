@@ -1773,16 +1773,9 @@ fn disconnect_tunnel(args: DisconnectArgs) -> Result<DisconnectReport> {
     let gateway_pid = session.as_ref().and_then(|session| session.gateway_pid);
 
     if let Some(session) = &session {
-        terminate_pid_except_self(session.supervisor_pid)?;
-        wait_for_pid_exit_except_self(
-            session.supervisor_pid,
-            "supervisor",
-            Duration::from_secs(3),
-        )?;
-        terminate_pid(session.agent_pid)?;
-        terminate_pid(session.gateway_pid)?;
-        wait_for_pid_exit_except_self(session.agent_pid, "agent", Duration::from_secs(3))?;
-        wait_for_pid_exit_except_self(session.gateway_pid, "gateway", Duration::from_secs(3))?;
+        terminate_pid_hard_except_self(session.supervisor_pid, "supervisor")?;
+        terminate_pid_hard(session.agent_pid, "agent")?;
+        terminate_pid_hard(session.gateway_pid, "gateway")?;
     }
 
     let agent_bin = sibling_binary("tunnel-agent")?;
@@ -4027,7 +4020,7 @@ fn pid_is_running(pid: u32) -> Result<bool> {
         .output()
         .with_context(|| format!("failed to check pid {pid}"))?;
     if output.status.success() {
-        return Ok(true);
+        return Ok(!pid_is_zombie(pid)?);
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4036,6 +4029,20 @@ fn pid_is_running(pid: u32) -> Result<bool> {
     }
 
     Ok(false)
+}
+
+fn pid_is_zombie(pid: u32) -> Result<bool> {
+    let output = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .with_context(|| format!("failed to inspect pid {pid} state"))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_start()
+        .starts_with('Z'))
 }
 
 fn pid_is_running_optional(pid: Option<u32>) -> Result<bool> {
@@ -4794,6 +4801,42 @@ fn terminate_pid_except_self(pid: Option<u32>) -> Result<()> {
     terminate_pid(pid)
 }
 
+fn terminate_pid_hard(pid: Option<u32>, label: &str) -> Result<()> {
+    terminate_pid(pid)?;
+    wait_for_pid_exit_or_kill(pid, label, Duration::from_secs(3))
+}
+
+fn terminate_pid_hard_except_self(pid: Option<u32>, label: &str) -> Result<()> {
+    if pid == Some(process::id()) {
+        return Ok(());
+    }
+    terminate_pid_hard(pid, label)
+}
+
+fn wait_for_pid_exit_or_kill(pid: Option<u32>, label: &str, timeout: Duration) -> Result<()> {
+    let Some(pid) = pid else {
+        return Ok(());
+    };
+    if pid == process::id() {
+        return Ok(());
+    }
+
+    if wait_for_pid_exit(pid, timeout)? {
+        return Ok(());
+    }
+
+    eprintln!("warning: {label} pid {pid} did not exit within {timeout:?}; sending KILL");
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .with_context(|| format!("failed to send KILL to {label} pid {pid}"))?;
+    if !status.success() {
+        eprintln!("warning: kill -KILL {pid} returned non-zero");
+    }
+    let _ = wait_for_pid_exit(pid, Duration::from_secs(1))?;
+    Ok(())
+}
+
 fn wait_for_pid_exit_except_self(pid: Option<u32>, label: &str, timeout: Duration) -> Result<()> {
     let Some(pid) = pid else {
         return Ok(());
@@ -4802,16 +4845,24 @@ fn wait_for_pid_exit_except_self(pid: Option<u32>, label: &str, timeout: Duratio
         return Ok(());
     }
 
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !pid_is_running(pid)? {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
+    if wait_for_pid_exit(pid, timeout)? {
+        return Ok(());
     }
 
     eprintln!("warning: {label} pid {pid} did not exit within {timeout:?}");
     Ok(())
+}
+
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_is_running(pid)? {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(false)
 }
 
 fn path_arg(path: &Path) -> Result<&str> {
