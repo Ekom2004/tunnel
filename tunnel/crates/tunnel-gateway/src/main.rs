@@ -79,6 +79,31 @@ enum SystemCommandMode {
     Apply,
 }
 
+#[allow(dead_code)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TargetOs {
+    Linux,
+    Macos,
+    Other,
+}
+
+fn current_target_os() -> TargetOs {
+    #[cfg(target_os = "linux")]
+    {
+        return TargetOs::Linux;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return TargetOs::Macos;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        TargetOs::Other
+    }
+}
+
 #[derive(Debug, Default)]
 struct ByteCounters {
     ingress_bytes: AtomicU64,
@@ -1011,61 +1036,62 @@ fn handle_nat(
 }
 
 fn build_forwarding_cleanup_commands(state: &GatewayRuntimeState) -> Vec<Vec<String>> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut commands = vec![
-            vec![
-                String::from("iptables"),
-                String::from("-D"),
-                String::from("FORWARD"),
-                String::from("-i"),
-                state.tunnel_interface.clone(),
-                String::from("-j"),
-                String::from("ACCEPT"),
-            ],
-            vec![
-                String::from("iptables"),
-                String::from("-D"),
-                String::from("FORWARD"),
-                String::from("-o"),
-                state.tunnel_interface.clone(),
-                String::from("-m"),
-                String::from("state"),
-                String::from("--state"),
-                String::from("RELATED,ESTABLISHED"),
-                String::from("-j"),
-                String::from("ACCEPT"),
-            ],
-        ];
+    build_forwarding_cleanup_commands_for_os(current_target_os(), state)
+}
 
-        if matches!(state.forwarding_was_enabled, Some(false)) {
-            commands.push(vec![
-                String::from("sysctl"),
-                String::from("-w"),
-                String::from("net.ipv4.ip_forward=0"),
-            ]);
+fn build_forwarding_cleanup_commands_for_os(
+    target_os: TargetOs,
+    state: &GatewayRuntimeState,
+) -> Vec<Vec<String>> {
+    match target_os {
+        TargetOs::Linux => {
+            let mut commands = vec![
+                vec![
+                    String::from("iptables"),
+                    String::from("-D"),
+                    String::from("FORWARD"),
+                    String::from("-i"),
+                    state.tunnel_interface.clone(),
+                    String::from("-j"),
+                    String::from("ACCEPT"),
+                ],
+                vec![
+                    String::from("iptables"),
+                    String::from("-D"),
+                    String::from("FORWARD"),
+                    String::from("-o"),
+                    state.tunnel_interface.clone(),
+                    String::from("-m"),
+                    String::from("state"),
+                    String::from("--state"),
+                    String::from("RELATED,ESTABLISHED"),
+                    String::from("-j"),
+                    String::from("ACCEPT"),
+                ],
+            ];
+
+            if matches!(state.forwarding_was_enabled, Some(false)) {
+                commands.push(vec![
+                    String::from("sysctl"),
+                    String::from("-w"),
+                    String::from("net.ipv4.ip_forward=0"),
+                ]);
+            }
+
+            commands
         }
-
-        commands
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if matches!(state.forwarding_was_enabled, Some(false)) {
-            return vec![vec![
-                String::from("sysctl"),
-                String::from("-w"),
-                String::from("net.inet.ip.forwarding=0"),
-            ]];
+        TargetOs::Macos => {
+            if matches!(state.forwarding_was_enabled, Some(false)) {
+                vec![vec![
+                    String::from("sysctl"),
+                    String::from("-w"),
+                    String::from("net.inet.ip.forwarding=0"),
+                ]]
+            } else {
+                Vec::new()
+            }
         }
-
-        Vec::new()
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = state;
-        Vec::new()
+        TargetOs::Other => Vec::new(),
     }
 }
 
@@ -1090,9 +1116,12 @@ fn handle_nat_cleanup(mode: SystemCommandMode, state: &GatewayRuntimeState) -> R
 }
 
 fn build_forwarding_commands(interface_name: &str) -> Vec<Vec<String>> {
-    #[cfg(target_os = "linux")]
-    {
-        vec![
+    build_forwarding_commands_for_os(current_target_os(), interface_name)
+}
+
+fn build_forwarding_commands_for_os(target_os: TargetOs, interface_name: &str) -> Vec<Vec<String>> {
+    match target_os {
+        TargetOs::Linux => vec![
             vec![
                 String::from("sysctl"),
                 String::from("-w"),
@@ -1120,25 +1149,19 @@ fn build_forwarding_commands(interface_name: &str) -> Vec<Vec<String>> {
                 String::from("-j"),
                 String::from("ACCEPT"),
             ],
-        ]
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let _ = interface_name;
-        vec![vec![
-            String::from("sysctl"),
-            String::from("-w"),
-            String::from("net.inet.ip.forwarding=1"),
-        ]]
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        vec![vec![
+        ],
+        TargetOs::Macos => {
+            let _ = interface_name;
+            vec![vec![
+                String::from("sysctl"),
+                String::from("-w"),
+                String::from("net.inet.ip.forwarding=1"),
+            ]]
+        }
+        TargetOs::Other => vec![vec![
             String::from("echo"),
             format!("manual forwarding enable required for {interface_name}"),
-        ]]
+        ]],
     }
 }
 
@@ -1184,74 +1207,93 @@ fn build_nat_commands(
     interface_name: &str,
     egress_interface: Option<&str>,
 ) -> Result<Vec<Vec<String>>> {
-    #[cfg(target_os = "linux")]
-    {
-        let egress_interface = egress_interface
-            .ok_or_else(|| anyhow!("--egress-interface is required when nat-mode is not skip"))?;
-        Ok(vec![
-            vec![
-                String::from("iptables"),
-                String::from("-t"),
-                String::from("nat"),
-                String::from("-A"),
-                String::from("POSTROUTING"),
-                String::from("-o"),
-                String::from(egress_interface),
-                String::from("-j"),
-                String::from("MASQUERADE"),
-            ],
-            vec![
-                String::from("iptables"),
-                String::from("-A"),
-                String::from("FORWARD"),
-                String::from("-i"),
-                String::from(interface_name),
-                String::from("-o"),
-                String::from(egress_interface),
-                String::from("-j"),
-                String::from("ACCEPT"),
-            ],
-        ])
-    }
+    build_nat_commands_for_os(current_target_os(), interface_name, egress_interface)
+}
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = interface_name;
-        let _ = egress_interface;
-        Ok(Vec::new())
+#[allow(dead_code)]
+fn build_nat_commands_for_os(
+    target_os: TargetOs,
+    interface_name: &str,
+    egress_interface: Option<&str>,
+) -> Result<Vec<Vec<String>>> {
+    match target_os {
+        TargetOs::Linux => {
+            let egress_interface = egress_interface.ok_or_else(|| {
+                anyhow!("--egress-interface is required when nat-mode is not skip")
+            })?;
+            Ok(vec![
+                vec![
+                    String::from("iptables"),
+                    String::from("-t"),
+                    String::from("nat"),
+                    String::from("-A"),
+                    String::from("POSTROUTING"),
+                    String::from("-o"),
+                    String::from(egress_interface),
+                    String::from("-j"),
+                    String::from("MASQUERADE"),
+                ],
+                vec![
+                    String::from("iptables"),
+                    String::from("-A"),
+                    String::from("FORWARD"),
+                    String::from("-i"),
+                    String::from(interface_name),
+                    String::from("-o"),
+                    String::from(egress_interface),
+                    String::from("-j"),
+                    String::from("ACCEPT"),
+                ],
+            ])
+        }
+        TargetOs::Macos | TargetOs::Other => Ok(Vec::new()),
     }
 }
 
+#[allow(dead_code)]
 #[cfg(target_os = "linux")]
 fn build_nat_cleanup_commands(state: &GatewayRuntimeState) -> Result<Vec<Vec<String>>> {
-    let egress_interface = state
-        .egress_interface
-        .as_deref()
-        .ok_or_else(|| anyhow!("gateway state missing egress interface"))?;
-    Ok(vec![
-        vec![
-            String::from("iptables"),
-            String::from("-t"),
-            String::from("nat"),
-            String::from("-D"),
-            String::from("POSTROUTING"),
-            String::from("-o"),
-            String::from(egress_interface),
-            String::from("-j"),
-            String::from("MASQUERADE"),
-        ],
-        vec![
-            String::from("iptables"),
-            String::from("-D"),
-            String::from("FORWARD"),
-            String::from("-i"),
-            state.tunnel_interface.clone(),
-            String::from("-o"),
-            String::from(egress_interface),
-            String::from("-j"),
-            String::from("ACCEPT"),
-        ],
-    ])
+    build_nat_cleanup_commands_for_os(TargetOs::Linux, state)
+}
+
+#[allow(dead_code)]
+fn build_nat_cleanup_commands_for_os(
+    target_os: TargetOs,
+    state: &GatewayRuntimeState,
+) -> Result<Vec<Vec<String>>> {
+    match target_os {
+        TargetOs::Linux => {
+            let egress_interface = state
+                .egress_interface
+                .as_deref()
+                .ok_or_else(|| anyhow!("gateway state missing egress interface"))?;
+            Ok(vec![
+                vec![
+                    String::from("iptables"),
+                    String::from("-t"),
+                    String::from("nat"),
+                    String::from("-D"),
+                    String::from("POSTROUTING"),
+                    String::from("-o"),
+                    String::from(egress_interface),
+                    String::from("-j"),
+                    String::from("MASQUERADE"),
+                ],
+                vec![
+                    String::from("iptables"),
+                    String::from("-D"),
+                    String::from("FORWARD"),
+                    String::from("-i"),
+                    state.tunnel_interface.clone(),
+                    String::from("-o"),
+                    String::from(egress_interface),
+                    String::from("-j"),
+                    String::from("ACCEPT"),
+                ],
+            ])
+        }
+        TargetOs::Macos | TargetOs::Other => Ok(Vec::new()),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1503,4 +1545,104 @@ fn prepare_output_file(
     fs::create_dir_all(output_dir)?;
     let path = output_dir.join(format!("{tenant_id}_{tunnel_id}_{}.bin", now_unix_secs()));
     Ok(Some(File::create(path)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_forwarding_commands_enable_ip_forwarding_and_forward_rules() {
+        assert_eq!(
+            build_forwarding_commands_for_os(TargetOs::Linux, "tun0"),
+            vec![
+                vec!["sysctl", "-w", "net.ipv4.ip_forward=1"],
+                vec!["iptables", "-A", "FORWARD", "-i", "tun0", "-j", "ACCEPT"],
+                vec![
+                    "iptables",
+                    "-A",
+                    "FORWARD",
+                    "-o",
+                    "tun0",
+                    "-m",
+                    "state",
+                    "--state",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ],
+            ]
+            .into_iter()
+            .map(string_vec)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linux_nat_commands_masquerade_and_cleanup_by_interface() -> Result<()> {
+        assert_eq!(
+            build_nat_commands_for_os(TargetOs::Linux, "tun0", Some("eth0"))?,
+            vec![
+                vec![
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-o",
+                    "eth0",
+                    "-j",
+                    "MASQUERADE",
+                ],
+                vec!["iptables", "-A", "FORWARD", "-i", "tun0", "-o", "eth0", "-j", "ACCEPT",],
+            ]
+            .into_iter()
+            .map(string_vec)
+            .collect::<Vec<_>>()
+        );
+
+        let state = GatewayRuntimeState {
+            tunnel_interface: String::from("tun0"),
+            nat_anchor_name: None,
+            nat_rules_path: None,
+            forwarding_was_enabled: Some(false),
+            egress_interface: Some(String::from("eth0")),
+        };
+        assert_eq!(
+            build_nat_cleanup_commands_for_os(TargetOs::Linux, &state)?,
+            vec![
+                vec![
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-D",
+                    "POSTROUTING",
+                    "-o",
+                    "eth0",
+                    "-j",
+                    "MASQUERADE",
+                ],
+                vec!["iptables", "-D", "FORWARD", "-i", "tun0", "-o", "eth0", "-j", "ACCEPT",],
+            ]
+            .into_iter()
+            .map(string_vec)
+            .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn macos_forwarding_commands_are_preserved() {
+        assert_eq!(
+            build_forwarding_commands_for_os(TargetOs::Macos, "utun6"),
+            vec![string_vec(
+                vec!["sysctl", "-w", "net.inet.ip.forwarding=1",]
+            )]
+        );
+    }
+
+    fn string_vec(parts: Vec<&str>) -> Vec<String> {
+        parts.into_iter().map(String::from).collect()
+    }
 }

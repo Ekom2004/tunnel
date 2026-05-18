@@ -68,6 +68,31 @@ enum SystemCommandMode {
     Apply,
 }
 
+#[allow(dead_code)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TargetOs {
+    Linux,
+    Macos,
+    Other,
+}
+
+fn current_target_os() -> TargetOs {
+    #[cfg(target_os = "linux")]
+    {
+        return TargetOs::Linux;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return TargetOs::Macos;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        TargetOs::Other
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let config: TunnelConfig = serde_json::from_str(&fs::read_to_string(&cli.config)?)?;
@@ -823,84 +848,84 @@ fn handle_agent_routes(
 }
 
 fn build_agent_route_commands(interface_name: &str, config: &TunnelConfig) -> Vec<Vec<String>> {
-    config
-        .route_policy
-        .destination_cidrs
+    build_agent_route_commands_for_os(
+        current_target_os(),
+        interface_name,
+        &config.route_policy.destination_cidrs,
+    )
+}
+
+fn build_agent_route_commands_for_os(
+    target_os: TargetOs,
+    interface_name: &str,
+    destination_cidrs: &[String],
+) -> Vec<Vec<String>> {
+    destination_cidrs
         .iter()
-        .map(|cidr| {
-            #[cfg(target_os = "linux")]
-            {
-                vec![
-                    String::from("ip"),
-                    String::from("route"),
-                    String::from("replace"),
-                    cidr.clone(),
-                    String::from("dev"),
-                    String::from(interface_name),
-                ]
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                vec![
-                    String::from("route"),
-                    String::from("-n"),
-                    String::from("add"),
-                    String::from("-net"),
-                    cidr.clone(),
-                    String::from("-interface"),
-                    String::from(interface_name),
-                ]
-            }
-
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                vec![
-                    String::from("echo"),
-                    format!("manual route required for {cidr} via {interface_name}"),
-                ]
-            }
+        .map(|cidr| match target_os {
+            TargetOs::Linux => vec![
+                String::from("ip"),
+                String::from("route"),
+                String::from("replace"),
+                cidr.clone(),
+                String::from("dev"),
+                String::from(interface_name),
+            ],
+            TargetOs::Macos => vec![
+                String::from("route"),
+                String::from("-n"),
+                String::from("add"),
+                String::from("-net"),
+                cidr.clone(),
+                String::from("-interface"),
+                String::from(interface_name),
+            ],
+            TargetOs::Other => vec![
+                String::from("echo"),
+                format!("manual route required for {cidr} via {interface_name}"),
+            ],
         })
         .collect()
 }
 
 fn build_agent_route_cleanup_commands(
-    _interface_name: &str,
+    interface_name: &str,
+    destination_cidrs: &[String],
+) -> Vec<Vec<String>> {
+    build_agent_route_cleanup_commands_for_os(
+        current_target_os(),
+        interface_name,
+        destination_cidrs,
+    )
+}
+
+fn build_agent_route_cleanup_commands_for_os(
+    target_os: TargetOs,
+    interface_name: &str,
     destination_cidrs: &[String],
 ) -> Vec<Vec<String>> {
     destination_cidrs
         .iter()
-        .map(|cidr| {
-            #[cfg(target_os = "linux")]
-            {
-                vec![
-                    String::from("ip"),
-                    String::from("route"),
-                    String::from("del"),
-                    cidr.clone(),
-                    String::from("dev"),
-                    String::from(_interface_name),
-                ]
-            }
-
-            #[cfg(target_os = "macos")]
-            {
-                vec![
-                    String::from("route"),
-                    String::from("-n"),
-                    String::from("delete"),
-                    String::from("-net"),
-                    cidr.clone(),
-                ]
-            }
-
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                vec![
-                    String::from("echo"),
-                    format!("manual route cleanup required for {cidr} via {_interface_name}"),
-                ]
-            }
+        .map(|cidr| match target_os {
+            TargetOs::Linux => vec![
+                String::from("ip"),
+                String::from("route"),
+                String::from("del"),
+                cidr.clone(),
+                String::from("dev"),
+                String::from(interface_name),
+            ],
+            TargetOs::Macos => vec![
+                String::from("route"),
+                String::from("-n"),
+                String::from("delete"),
+                String::from("-net"),
+                cidr.clone(),
+            ],
+            TargetOs::Other => vec![
+                String::from("echo"),
+                format!("manual route cleanup required for {cidr} via {interface_name}"),
+            ],
         })
         .collect()
 }
@@ -1014,4 +1039,67 @@ fn load_payload(cli: &Cli) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
     io::copy(&mut io::stdin().lock(), &mut payload)?;
     Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_route_commands_use_ip_route_replace_and_delete() {
+        let cidrs = vec![String::from("1.1.1.0/24"), String::from("10.0.0.0/8")];
+
+        assert_eq!(
+            build_agent_route_commands_for_os(TargetOs::Linux, "tun0", &cidrs),
+            vec![
+                vec!["ip", "route", "replace", "1.1.1.0/24", "dev", "tun0"],
+                vec!["ip", "route", "replace", "10.0.0.0/8", "dev", "tun0"],
+            ]
+            .into_iter()
+            .map(string_vec)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            build_agent_route_cleanup_commands_for_os(TargetOs::Linux, "tun0", &cidrs),
+            vec![
+                vec!["ip", "route", "del", "1.1.1.0/24", "dev", "tun0"],
+                vec!["ip", "route", "del", "10.0.0.0/8", "dev", "tun0"],
+            ]
+            .into_iter()
+            .map(string_vec)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn macos_route_commands_are_preserved() {
+        let cidrs = vec![String::from("1.1.1.0/24")];
+
+        assert_eq!(
+            build_agent_route_commands_for_os(TargetOs::Macos, "utun7", &cidrs),
+            vec![string_vec(vec![
+                "route",
+                "-n",
+                "add",
+                "-net",
+                "1.1.1.0/24",
+                "-interface",
+                "utun7",
+            ])]
+        );
+        assert_eq!(
+            build_agent_route_cleanup_commands_for_os(TargetOs::Macos, "utun7", &cidrs),
+            vec![string_vec(vec![
+                "route",
+                "-n",
+                "delete",
+                "-net",
+                "1.1.1.0/24",
+            ])]
+        );
+    }
+
+    fn string_vec(parts: Vec<&str>) -> Vec<String> {
+        parts.into_iter().map(String::from).collect()
+    }
 }

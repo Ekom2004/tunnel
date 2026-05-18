@@ -540,6 +540,31 @@ enum SystemCommandMode {
     Apply,
 }
 
+#[allow(dead_code)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TargetOs {
+    Linux,
+    Macos,
+    Other,
+}
+
+fn current_target_os() -> TargetOs {
+    #[cfg(target_os = "linux")]
+    {
+        return TargetOs::Linux;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return TargetOs::Macos;
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        TargetOs::Other
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
 enum ProfileMode {
     Local,
@@ -3397,7 +3422,7 @@ fn build_doctor_report(args: DoctorArgs) -> Result<DoctorReport> {
             &session.gateway_state_file,
             &mut checks,
         );
-        check_gateway_pf_rules(
+        check_gateway_os_rules(
             gateway_state.as_ref(),
             gateway_config.as_ref(),
             &session.egress_interface,
@@ -3405,7 +3430,7 @@ fn build_doctor_report(args: DoctorArgs) -> Result<DoctorReport> {
         )?;
     } else {
         push_remote_skip(&mut checks, "gateway_state", ComponentSelection::Gateway);
-        push_remote_skip(&mut checks, "gateway_pf_rules", ComponentSelection::Gateway);
+        push_remote_skip(&mut checks, "gateway_os_rules", ComponentSelection::Gateway);
     }
     let agent_packet_before = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?
         .map(|status| status.packet_path);
@@ -4380,12 +4405,12 @@ fn repair_gateway_os_state(session: &SessionManifest, supervisor_log: &mut File)
         repaired = true;
     }
 
-    if repair_gateway_pf_rules_if_needed(&state, gateway_config.as_ref(), session)? {
+    if repair_gateway_os_rules_if_needed(&state, gateway_config.as_ref(), session)? {
         emit_supervisor_event(
             supervisor_log,
-            "gateway_pf_repaired",
+            "gateway_os_rules_repaired",
             Some(ComponentSelection::Gateway),
-            "PF/NAT rules were missing or stale and have been re-applied",
+            "gateway forwarding/NAT rules were missing or stale and have been re-applied",
             Some(session),
         )?;
         repaired = true;
@@ -4399,35 +4424,10 @@ fn gateway_os_state_is_healthy(session: &SessionManifest) -> Result<bool> {
     else {
         return Ok(false);
     };
-    let gateway_config = read_optional_json::<TunnelConfig>(&session.gateway_config)?;
     let forwarding_ok = ip_forwarding_enabled()?;
-    let anchor_ok = state
-        .nat_anchor_name
-        .as_deref()
-        .map(gateway_pf_anchor_has_rules)
-        .transpose()?
-        .unwrap_or(false);
-    let rules_ok = if let Some(path) = state.nat_rules_path.as_ref() {
-        if path.exists() {
-            let rules = fs::read_to_string(path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            gateway_pf_rules_text_is_valid(
-                &rules,
-                &state.tunnel_interface,
-                state
-                    .egress_interface
-                    .as_deref()
-                    .unwrap_or(&session.egress_interface),
-                expected_gateway_tunnel_subnet(gateway_config.as_ref())?.as_deref(),
-            )
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let rules_ok = gateway_os_rules_are_healthy(&state, session)?;
 
-    Ok(forwarding_ok && anchor_ok && rules_ok)
+    Ok(forwarding_ok && rules_ok)
 }
 
 fn inject_gateway_os_state_drift(session: &SessionManifest) -> Result<()> {
@@ -4436,17 +4436,30 @@ fn inject_gateway_os_state_drift(session: &SessionManifest) -> Result<()> {
         bail!("gateway state file is missing");
     };
 
-    if let Some(anchor_name) = state.nat_anchor_name.as_deref() {
-        let _ = run_command_vec(
-            "gateway PF drift injection",
-            vec![
-                String::from("pfctl"),
-                String::from("-a"),
-                anchor_name.to_owned(),
-                String::from("-F"),
-                String::from("all"),
-            ],
-        );
+    match current_target_os() {
+        TargetOs::Macos => {
+            if let Some(anchor_name) = state.nat_anchor_name.as_deref() {
+                let _ = run_command_vec(
+                    "gateway PF drift injection",
+                    vec![
+                        String::from("pfctl"),
+                        String::from("-a"),
+                        anchor_name.to_owned(),
+                        String::from("-F"),
+                        String::from("all"),
+                    ],
+                );
+            }
+        }
+        TargetOs::Linux => {
+            for check in build_linux_gateway_rule_checks(&state, &session.egress_interface) {
+                let _ = run_command_vec(
+                    "gateway iptables drift injection",
+                    linux_rule_command_with_operation(&check.command, "-D"),
+                );
+            }
+        }
+        TargetOs::Other => {}
     }
 
     disable_ip_forwarding()
@@ -4862,6 +4875,103 @@ fn check_route_to_target(
     Ok(())
 }
 
+fn check_gateway_os_rules(
+    gateway_state: Option<&GatewayRuntimeState>,
+    gateway_config: Option<&TunnelConfig>,
+    session_egress_interface: &str,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
+    match current_target_os() {
+        TargetOs::Macos => check_gateway_pf_rules(
+            gateway_state,
+            gateway_config,
+            session_egress_interface,
+            checks,
+        ),
+        TargetOs::Linux => {
+            check_gateway_linux_rules(gateway_state, session_egress_interface, checks)
+        }
+        TargetOs::Other => {
+            checks.push(doctor_check(
+                "gateway_os_rules",
+                DoctorState::Warn,
+                "skipped because this OS has no gateway rule inspector",
+            ));
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayCommandCheck {
+    name: &'static str,
+    command: Vec<String>,
+    pass_detail: String,
+    fail_detail: String,
+}
+
+fn check_gateway_linux_rules(
+    gateway_state: Option<&GatewayRuntimeState>,
+    session_egress_interface: &str,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
+    let Some(state) = gateway_state else {
+        checks.push(doctor_check(
+            "gateway_linux_rules",
+            DoctorState::Warn,
+            "skipped because gateway state is missing",
+        ));
+        return Ok(());
+    };
+
+    match ip_forwarding_enabled() {
+        Ok(true) => checks.push(doctor_check(
+            "gateway_ip_forwarding",
+            DoctorState::Pass,
+            "net.ipv4.ip_forward is enabled",
+        )),
+        Ok(false) => checks.push(doctor_check(
+            "gateway_ip_forwarding",
+            DoctorState::Fail,
+            "net.ipv4.ip_forward is disabled",
+        )),
+        Err(error) => checks.push(doctor_check(
+            "gateway_ip_forwarding",
+            DoctorState::Fail,
+            format!("failed to inspect IP forwarding: {error:#}"),
+        )),
+    }
+
+    for rule_check in build_linux_gateway_rule_checks(state, session_egress_interface) {
+        match command_succeeds(&rule_check.command) {
+            Ok(true) => checks.push(doctor_check(
+                rule_check.name,
+                DoctorState::Pass,
+                rule_check.pass_detail,
+            )),
+            Ok(false) => checks.push(doctor_check(
+                rule_check.name,
+                DoctorState::Fail,
+                format!(
+                    "{}: {}",
+                    rule_check.fail_detail,
+                    rule_check.command.join(" ")
+                ),
+            )),
+            Err(error) => checks.push(doctor_check(
+                rule_check.name,
+                DoctorState::Fail,
+                format!(
+                    "failed to inspect rule with '{}': {error:#}",
+                    rule_check.command.join(" ")
+                ),
+            )),
+        }
+    }
+
+    Ok(())
+}
+
 fn check_gateway_pf_rules(
     gateway_state: Option<&GatewayRuntimeState>,
     gateway_config: Option<&TunnelConfig>,
@@ -5097,6 +5207,86 @@ fn enable_ip_forwarding() -> Result<()> {
     }
 }
 
+fn repair_gateway_os_rules_if_needed(
+    state: &GatewayRuntimeState,
+    gateway_config: Option<&TunnelConfig>,
+    session: &SessionManifest,
+) -> Result<bool> {
+    match current_target_os() {
+        TargetOs::Macos => repair_gateway_pf_rules_if_needed(state, gateway_config, session),
+        TargetOs::Linux => repair_gateway_linux_rules_if_needed(state, session),
+        TargetOs::Other => Ok(false),
+    }
+}
+
+fn gateway_os_rules_are_healthy(
+    state: &GatewayRuntimeState,
+    session: &SessionManifest,
+) -> Result<bool> {
+    match current_target_os() {
+        TargetOs::Macos => {
+            let gateway_config = read_optional_json::<TunnelConfig>(&session.gateway_config)?;
+            let anchor_ok = state
+                .nat_anchor_name
+                .as_deref()
+                .map(gateway_pf_anchor_has_rules)
+                .transpose()?
+                .unwrap_or(false);
+            let rules_ok = if let Some(path) = state.nat_rules_path.as_ref() {
+                if path.exists() {
+                    let rules = fs::read_to_string(path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    gateway_pf_rules_text_is_valid(
+                        &rules,
+                        &state.tunnel_interface,
+                        state
+                            .egress_interface
+                            .as_deref()
+                            .unwrap_or(&session.egress_interface),
+                        expected_gateway_tunnel_subnet(gateway_config.as_ref())?.as_deref(),
+                    )
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            Ok(anchor_ok && rules_ok)
+        }
+        TargetOs::Linux => linux_gateway_rules_are_present(state, &session.egress_interface),
+        TargetOs::Other => Ok(true),
+    }
+}
+
+fn repair_gateway_linux_rules_if_needed(
+    state: &GatewayRuntimeState,
+    session: &SessionManifest,
+) -> Result<bool> {
+    let mut repaired = false;
+    for check in build_linux_gateway_rule_checks(state, &session.egress_interface) {
+        if !command_succeeds(&check.command)? {
+            run_command_vec(
+                "gateway iptables repair",
+                linux_rule_command_with_operation(&check.command, "-A"),
+            )?;
+            repaired = true;
+        }
+    }
+    Ok(repaired)
+}
+
+fn linux_gateway_rules_are_present(
+    state: &GatewayRuntimeState,
+    session_egress_interface: &str,
+) -> Result<bool> {
+    for check in build_linux_gateway_rule_checks(state, session_egress_interface) {
+        if !command_succeeds(&check.command)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn repair_gateway_pf_rules_if_needed(
     state: &GatewayRuntimeState,
     gateway_config: Option<&TunnelConfig>,
@@ -5205,6 +5395,108 @@ fn gateway_pf_anchor_has_rules(anchor_name: &str) -> Result<bool> {
         let _ = anchor_name;
         Ok(true)
     }
+}
+
+fn build_linux_gateway_rule_checks(
+    state: &GatewayRuntimeState,
+    session_egress_interface: &str,
+) -> Vec<GatewayCommandCheck> {
+    let tunnel_interface = state.tunnel_interface.clone();
+    let egress_interface = state
+        .egress_interface
+        .as_deref()
+        .unwrap_or(session_egress_interface)
+        .to_owned();
+
+    vec![
+        GatewayCommandCheck {
+            name: "gateway_iptables_forward_in",
+            command: vec![
+                String::from("iptables"),
+                String::from("-C"),
+                String::from("FORWARD"),
+                String::from("-i"),
+                tunnel_interface.clone(),
+                String::from("-j"),
+                String::from("ACCEPT"),
+            ],
+            pass_detail: format!("FORWARD accepts ingress from {tunnel_interface}"),
+            fail_detail: format!("missing FORWARD ingress rule for {tunnel_interface}"),
+        },
+        GatewayCommandCheck {
+            name: "gateway_iptables_forward_established",
+            command: vec![
+                String::from("iptables"),
+                String::from("-C"),
+                String::from("FORWARD"),
+                String::from("-o"),
+                tunnel_interface.clone(),
+                String::from("-m"),
+                String::from("state"),
+                String::from("--state"),
+                String::from("RELATED,ESTABLISHED"),
+                String::from("-j"),
+                String::from("ACCEPT"),
+            ],
+            pass_detail: format!("FORWARD allows established return traffic to {tunnel_interface}"),
+            fail_detail: format!("missing established return rule for {tunnel_interface}"),
+        },
+        GatewayCommandCheck {
+            name: "gateway_iptables_forward_egress",
+            command: vec![
+                String::from("iptables"),
+                String::from("-C"),
+                String::from("FORWARD"),
+                String::from("-i"),
+                tunnel_interface.clone(),
+                String::from("-o"),
+                egress_interface.clone(),
+                String::from("-j"),
+                String::from("ACCEPT"),
+            ],
+            pass_detail: format!(
+                "FORWARD allows {tunnel_interface} to egress on {egress_interface}"
+            ),
+            fail_detail: format!(
+                "missing FORWARD egress rule from {tunnel_interface} to {egress_interface}"
+            ),
+        },
+        GatewayCommandCheck {
+            name: "gateway_iptables_nat",
+            command: vec![
+                String::from("iptables"),
+                String::from("-t"),
+                String::from("nat"),
+                String::from("-C"),
+                String::from("POSTROUTING"),
+                String::from("-o"),
+                egress_interface.clone(),
+                String::from("-j"),
+                String::from("MASQUERADE"),
+            ],
+            pass_detail: format!("POSTROUTING masquerades traffic on {egress_interface}"),
+            fail_detail: format!("missing POSTROUTING MASQUERADE rule on {egress_interface}"),
+        },
+    ]
+}
+
+fn command_succeeds(command: &[String]) -> Result<bool> {
+    let Some((binary, args)) = command.split_first() else {
+        bail!("command is empty");
+    };
+    let output = Command::new(binary)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute {}", command.join(" ")))?;
+    Ok(output.status.success())
+}
+
+fn linux_rule_command_with_operation(command: &[String], operation: &str) -> Vec<String> {
+    let mut command = command.to_vec();
+    if let Some(flag) = command.iter_mut().find(|part| part.as_str() == "-C") {
+        *flag = operation.to_owned();
+    }
+    command
 }
 
 fn build_gateway_pf_rules(
@@ -6826,6 +7118,102 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn linux_gateway_rule_checks_match_runtime_commands() {
+        let state = GatewayRuntimeState {
+            tunnel_interface: String::from("tun0"),
+            nat_anchor_name: None,
+            nat_rules_path: None,
+            forwarding_was_enabled: Some(false),
+            egress_interface: Some(String::from("eth0")),
+        };
+
+        let checks = build_linux_gateway_rule_checks(&state, "ignored0");
+        let commands = checks
+            .iter()
+            .map(|check| check.command.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            commands,
+            vec![
+                vec!["iptables", "-C", "FORWARD", "-i", "tun0", "-j", "ACCEPT"],
+                vec![
+                    "iptables",
+                    "-C",
+                    "FORWARD",
+                    "-o",
+                    "tun0",
+                    "-m",
+                    "state",
+                    "--state",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ],
+                vec!["iptables", "-C", "FORWARD", "-i", "tun0", "-o", "eth0", "-j", "ACCEPT",],
+                vec![
+                    "iptables",
+                    "-t",
+                    "nat",
+                    "-C",
+                    "POSTROUTING",
+                    "-o",
+                    "eth0",
+                    "-j",
+                    "MASQUERADE",
+                ],
+            ]
+            .into_iter()
+            .map(string_vec)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linux_rule_operation_rewrites_check_commands() {
+        let command = string_vec(vec![
+            "iptables",
+            "-t",
+            "nat",
+            "-C",
+            "POSTROUTING",
+            "-o",
+            "eth0",
+            "-j",
+            "MASQUERADE",
+        ]);
+
+        assert_eq!(
+            linux_rule_command_with_operation(&command, "-A"),
+            string_vec(vec![
+                "iptables",
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                "eth0",
+                "-j",
+                "MASQUERADE",
+            ])
+        );
+        assert_eq!(
+            linux_rule_command_with_operation(&command, "-D"),
+            string_vec(vec![
+                "iptables",
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-o",
+                "eth0",
+                "-j",
+                "MASQUERADE",
+            ])
+        );
+    }
+
     fn test_login_args(root: &Path, force: bool) -> LoginArgs {
         LoginArgs {
             profile: String::from("test-dev"),
@@ -6887,5 +7275,9 @@ mod tests {
             }
         }
         Ok(combined)
+    }
+
+    fn string_vec(parts: Vec<&str>) -> Vec<String> {
+        parts.into_iter().map(String::from).collect()
     }
 }
