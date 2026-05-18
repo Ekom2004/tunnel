@@ -2021,49 +2021,39 @@ fn connect_remote_side(args: ConnectArgs) -> Result<ConnectReport> {
         .local_component
         .ok_or_else(|| anyhow!("remote profile requires local_component=agent or gateway"))?;
     preflight_side_args(&args, local_component)?;
-    cleanup_remote_side_state(&args, local_component)?;
 
-    let side_report = match local_component {
-        ComponentSelection::Agent => run_agent_side(args.clone())?,
-        ComponentSelection::Gateway => run_gateway_side(args.clone())?,
-    };
-    let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
-    let attachment = required_connect_value(args.attachment.as_ref(), "attachment")?.to_owned();
+    if let Some(session) = read_optional_json::<SessionManifest>(&args.session_file)? {
+        let supervisor_running = pid_is_running_optional(session.supervisor_pid)?;
+        let local_running = pid_is_running_optional(component_pid(&session, local_component))?;
+        if supervisor_running && local_running {
+            return Ok(remote_connect_report_from_session(&args, session));
+        }
+    }
+
+    let (supervisor_pid, session) = spawn_supervisor_for_connect(&args)?;
+    let mut report = remote_connect_report_from_session(&args, session);
+    report.supervisor_pid = report.supervisor_pid.or(Some(supervisor_pid));
+    Ok(report)
+}
+
+fn remote_connect_report_from_session(
+    args: &ConnectArgs,
+    session: SessionManifest,
+) -> ConnectReport {
+    let local_component = session
+        .local_component
+        .expect("remote session must record local component");
     let remote_component = remote_component_for(ProfileMode::Remote, Some(local_component))
-        .ok_or_else(|| anyhow!("remote profile has no remote component"))?;
-    let session = SessionManifest {
-        tenant,
-        attachment,
-        agent_config: args.agent_config.clone(),
-        gateway_config: args.gateway_config.clone(),
-        agent_state_file: args.agent_state_file.clone(),
-        agent_status_file: args.agent_status_file.clone(),
-        gateway_state_file: args.gateway_state_file.clone(),
-        gateway_status_file: args.gateway_status_file.clone(),
-        agent_log_file: args.agent_log_file.clone(),
-        gateway_log_file: args.gateway_log_file.clone(),
-        egress_interface: args.egress_interface.clone(),
-        route_mode: args.route_mode,
-        forwarding_mode: args.forwarding_mode,
-        nat_mode: args.nat_mode,
-        agent_pid: (local_component == ComponentSelection::Agent).then_some(side_report.pid),
-        gateway_pid: (local_component == ComponentSelection::Gateway).then_some(side_report.pid),
-        mode: ProfileMode::Remote,
-        local_component: Some(local_component),
-        supervised: false,
-        supervisor_pid: None,
-        supervisor_log_file: args.supervisor_log_file.clone(),
-    };
-    save_manifest(&args.session_file, &session)?;
+        .expect("remote session must have opposite component");
 
-    Ok(ConnectReport {
+    ConnectReport {
         tenant: session.tenant,
         attachment: session.attachment,
         mode: session.mode,
         local_component: session.local_component,
         remote_component: Some(remote_component),
-        supervised: false,
-        supervisor_pid: None,
+        supervised: session.supervised,
+        supervisor_pid: session.supervisor_pid,
         agent_pid: session.agent_pid,
         gateway_pid: session.gateway_pid,
         agent_log_file: session.agent_log_file,
@@ -2071,13 +2061,13 @@ fn connect_remote_side(args: ConnectArgs) -> Result<ConnectReport> {
         supervisor_log_file: session.supervisor_log_file,
         ready: true,
         warmup: None,
-        session_file: args.session_file,
+        session_file: args.session_file.clone(),
         detail: format!(
-            "remote profile started local {}; remote {} must already be running on its host",
+            "remote profile supervising local {}; remote {} must already be running on its host",
             component_label(local_component),
             component_label(remote_component)
         ),
-    })
+    }
 }
 
 fn spawn_supervisor_for_connect(args: &ConnectArgs) -> Result<(u32, SessionManifest)> {
@@ -3263,6 +3253,12 @@ fn push_lifecycle_check(
 
 fn run_restart(args: RestartArgs) -> Result<()> {
     let mut session = load_manifest(&args.session_file)?;
+    if !component_is_locally_owned(&session, args.component) {
+        bail!(
+            "cannot restart remote-owned {} from this host",
+            component_label(args.component)
+        );
+    }
     restart_component(&mut session, args.component)?;
     save_manifest(&args.session_file, &session)?;
     println!("{}", serde_json::to_string_pretty(&session)?);
@@ -3272,10 +3268,15 @@ fn run_restart(args: RestartArgs) -> Result<()> {
 fn run_supervisor(args: SupervisorArgs) -> Result<()> {
     let mut args = args;
     args.connect = resolve_connect_args(args.connect)?;
-    if args.connect.mode != ProfileMode::Local {
-        bail!("supervisor only owns local profiles; remote profiles use side-specific lifecycle");
+    match args.connect.mode {
+        ProfileMode::Local => preflight_connect_args(&args.connect)?,
+        ProfileMode::Remote => {
+            let local_component = args.connect.local_component.ok_or_else(|| {
+                anyhow!("remote supervisor requires local_component=agent or gateway")
+            })?;
+            preflight_side_args(&args.connect, local_component)?;
+        }
     }
-    preflight_connect_args(&args.connect)?;
     let mut supervisor_log = open_log_file(&args.connect.supervisor_log_file, true)?;
     emit_supervisor_event(
         &mut supervisor_log,
@@ -3302,20 +3303,28 @@ fn run_supervisor(args: SupervisorArgs) -> Result<()> {
     loop {
         iteration += 1;
 
-        let agent_changed = supervise_component(
-            &mut session,
-            ComponentSelection::Agent,
-            &mut agent_state,
-            &args,
-            &mut supervisor_log,
-        )?;
-        let gateway_changed = supervise_component(
-            &mut session,
-            ComponentSelection::Gateway,
-            &mut gateway_state,
-            &args,
-            &mut supervisor_log,
-        )?;
+        let agent_changed = if component_is_locally_owned(&session, ComponentSelection::Agent) {
+            supervise_component(
+                &mut session,
+                ComponentSelection::Agent,
+                &mut agent_state,
+                &args,
+                &mut supervisor_log,
+            )?
+        } else {
+            false
+        };
+        let gateway_changed = if component_is_locally_owned(&session, ComponentSelection::Gateway) {
+            supervise_component(
+                &mut session,
+                ComponentSelection::Gateway,
+                &mut gateway_state,
+                &args,
+                &mut supervisor_log,
+            )?
+        } else {
+            false
+        };
         if agent_changed || gateway_changed {
             save_manifest(&args.connect.session_file, &session)?;
         }
@@ -3929,10 +3938,15 @@ fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -
     let existing_session = read_optional_json::<SessionManifest>(&args.connect.session_file)?;
 
     if let Some(mut session) = existing_session {
-        let agent_running = pid_is_running_optional(session.agent_pid)?;
-        let gateway_running = pid_is_running_optional(session.gateway_pid)?;
+        let local_components = local_components_for_session(&session);
+        let local_components_running = local_components
+            .iter()
+            .map(|component| pid_is_running_optional(component_pid(&session, *component)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|running| running);
 
-        if agent_running && gateway_running {
+        if local_components_running {
             session.supervised = true;
             session.supervisor_pid = Some(process::id());
             session.supervisor_log_file = args.connect.supervisor_log_file.clone();
@@ -3941,7 +3955,7 @@ fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -
                 supervisor_log,
                 "session_reused",
                 None,
-                "existing tunnel session is already running",
+                "existing local-owned tunnel session is already running",
                 Some(&session),
             )?;
             return Ok(());
@@ -3952,11 +3966,12 @@ fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -
             "session_reconcile_started",
             None,
             format!(
-                "existing session is not fully running: agent_running={agent_running} gateway_running={gateway_running}"
+                "existing session is not fully running for local-owned components: {:?}",
+                local_components
             ),
             Some(&session),
         )?;
-        run_disconnect(disconnect_args_from_connect(&args.connect))?;
+        disconnect_tunnel(disconnect_args_from_connect(&args.connect))?;
     }
 
     emit_supervisor_event(
@@ -3967,8 +3982,15 @@ fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -
         None,
     )?;
     let mut connect_args = args.connect.clone();
-    connect_args.oneshot = true;
-    run_connect_oneshot(connect_args)?;
+    match connect_args.mode {
+        ProfileMode::Local => {
+            connect_args.oneshot = true;
+            run_connect_oneshot(connect_args)?;
+        }
+        ProfileMode::Remote => {
+            start_remote_side_session(&connect_args)?;
+        }
+    }
     let mut session = load_manifest(&args.connect.session_file)?;
     session.supervised = true;
     session.supervisor_pid = Some(process::id());
@@ -3983,6 +4005,43 @@ fn ensure_supervised_session(args: &SupervisorArgs, supervisor_log: &mut File) -
     )?;
 
     Ok(())
+}
+
+fn start_remote_side_session(args: &ConnectArgs) -> Result<()> {
+    let local_component = local_component_for_connect(args)?;
+    preflight_side_args(args, local_component)?;
+    cleanup_remote_side_state(args, local_component)?;
+
+    let side_report = match local_component {
+        ComponentSelection::Agent => run_agent_side(args.clone())?,
+        ComponentSelection::Gateway => run_gateway_side(args.clone())?,
+    };
+    let tenant = required_connect_value(args.tenant.as_ref(), "tenant")?.to_owned();
+    let attachment = required_connect_value(args.attachment.as_ref(), "attachment")?.to_owned();
+    let session = SessionManifest {
+        tenant,
+        attachment,
+        agent_config: args.agent_config.clone(),
+        gateway_config: args.gateway_config.clone(),
+        agent_state_file: args.agent_state_file.clone(),
+        agent_status_file: args.agent_status_file.clone(),
+        gateway_state_file: args.gateway_state_file.clone(),
+        gateway_status_file: args.gateway_status_file.clone(),
+        agent_log_file: args.agent_log_file.clone(),
+        gateway_log_file: args.gateway_log_file.clone(),
+        egress_interface: args.egress_interface.clone(),
+        route_mode: args.route_mode,
+        forwarding_mode: args.forwarding_mode,
+        nat_mode: args.nat_mode,
+        agent_pid: (local_component == ComponentSelection::Agent).then_some(side_report.pid),
+        gateway_pid: (local_component == ComponentSelection::Gateway).then_some(side_report.pid),
+        mode: ProfileMode::Remote,
+        local_component: Some(local_component),
+        supervised: false,
+        supervisor_pid: None,
+        supervisor_log_file: args.supervisor_log_file.clone(),
+    };
+    save_manifest(&args.session_file, &session)
 }
 
 fn supervise_component(
@@ -4486,6 +4545,18 @@ fn remote_component_for(
 
 fn component_is_locally_owned(session: &SessionManifest, component: ComponentSelection) -> bool {
     session.mode == ProfileMode::Local || session.local_component == Some(component)
+}
+
+fn local_components_for_session(session: &SessionManifest) -> Vec<ComponentSelection> {
+    match session.mode {
+        ProfileMode::Local => vec![ComponentSelection::Agent, ComponentSelection::Gateway],
+        ProfileMode::Remote => session.local_component.into_iter().collect(),
+    }
+}
+
+fn local_component_for_connect(args: &ConnectArgs) -> Result<ComponentSelection> {
+    args.local_component
+        .ok_or_else(|| anyhow!("remote profile requires local_component=agent or gateway"))
 }
 
 fn disconnect_args_from_connect(args: &ConnectArgs) -> DisconnectArgs {
@@ -6044,21 +6115,18 @@ fn wait_for_supervised_connect_ready(args: &ConnectArgs, supervisor_pid: u32) ->
         let agent_state = read_optional_json::<AgentRuntimeState>(&args.agent_state_file)?;
         let gateway_state = read_optional_json::<GatewayRuntimeState>(&args.gateway_state_file)?;
 
-        if session
-            .as_ref()
-            .map(|session| {
-                session.supervised
-                    && session.supervisor_pid == Some(supervisor_pid)
-                    && session.agent_pid.is_some()
-                    && session.gateway_pid.is_some()
-            })
-            .unwrap_or(false)
-            && runtime_status_is_fresh(agent_status.as_ref(), args.ready_timeout_secs)
-            && runtime_status_is_fresh(gateway_status.as_ref(), args.ready_timeout_secs)
-            && agent_state.is_some()
-            && gateway_state.is_some()
-        {
-            return Ok(());
+        if let Some(session) = session.as_ref() {
+            if supervised_session_components_ready(
+                args,
+                supervisor_pid,
+                session,
+                agent_status.as_ref(),
+                gateway_status.as_ref(),
+                agent_state.as_ref(),
+                gateway_state.as_ref(),
+            ) {
+                return Ok(());
+            }
         }
 
         if Instant::now() >= deadline {
@@ -6071,6 +6139,43 @@ fn wait_for_supervised_connect_ready(args: &ConnectArgs, supervisor_pid: u32) ->
 
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn supervised_session_components_ready(
+    args: &ConnectArgs,
+    supervisor_pid: u32,
+    session: &SessionManifest,
+    agent_status: Option<&RuntimeStatus>,
+    gateway_status: Option<&RuntimeStatus>,
+    agent_state: Option<&AgentRuntimeState>,
+    gateway_state: Option<&GatewayRuntimeState>,
+) -> bool {
+    let manifest_ready = session.supervised && session.supervisor_pid == Some(supervisor_pid);
+    let runtime_ready = match session.mode {
+        ProfileMode::Local => {
+            session.agent_pid.is_some()
+                && session.gateway_pid.is_some()
+                && runtime_status_is_fresh(agent_status, args.ready_timeout_secs)
+                && runtime_status_is_fresh(gateway_status, args.ready_timeout_secs)
+                && agent_state.is_some()
+                && gateway_state.is_some()
+        }
+        ProfileMode::Remote => match session.local_component {
+            Some(ComponentSelection::Agent) => {
+                session.agent_pid.is_some()
+                    && runtime_status_is_fresh(agent_status, args.ready_timeout_secs)
+                    && agent_state.is_some()
+            }
+            Some(ComponentSelection::Gateway) => {
+                session.gateway_pid.is_some()
+                    && runtime_status_is_fresh(gateway_status, args.ready_timeout_secs)
+                    && gateway_state.is_some()
+            }
+            None => false,
+        },
+    };
+
+    manifest_ready && runtime_ready
 }
 
 fn runtime_status_is_fresh(status: Option<&RuntimeStatus>, stale_after_secs: u64) -> bool {
@@ -6556,6 +6661,66 @@ mod tests {
             Some(ComponentSelection::Gateway)
         );
         assert!(preflight_connect_args(&connect_args).is_ok());
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_supervised_ready_only_requires_local_component_state() -> Result<()> {
+        let root = test_root("remote-supervised-ready")?;
+        let mut args =
+            ConnectArgs::for_profile(String::from("remote-gateway"), root.join("profiles.json"));
+        args.tenant = Some(String::from("tenant"));
+        args.attachment = Some(String::from("remote-gateway"));
+        args.mode = ProfileMode::Remote;
+        args.local_component = Some(ComponentSelection::Gateway);
+        args.session_file = root.join("session.json");
+        args.gateway_state_file = root.join("gateway-state.json");
+        args.gateway_status_file = root.join("gateway-status.json");
+        args.ready_timeout_secs = 1;
+
+        let gateway_state = GatewayRuntimeState {
+            tunnel_interface: String::from("utun-test"),
+            nat_anchor_name: None,
+            nat_rules_path: None,
+            forwarding_was_enabled: Some(true),
+            egress_interface: Some(String::from("en0")),
+        };
+        let gateway_status =
+            runtime_status(ComponentKind::Gateway, Some(String::from("utun-test")));
+        let session = SessionManifest {
+            tenant: String::from("tenant"),
+            attachment: String::from("remote-gateway"),
+            agent_config: root.join("missing-agent.json"),
+            gateway_config: root.join("gateway.json"),
+            agent_state_file: root.join("missing-agent-state.json"),
+            agent_status_file: root.join("missing-agent-status.json"),
+            gateway_state_file: args.gateway_state_file.clone(),
+            gateway_status_file: args.gateway_status_file.clone(),
+            agent_log_file: root.join("agent.log"),
+            gateway_log_file: root.join("gateway.log"),
+            egress_interface: String::from("en0"),
+            route_mode: SystemCommandMode::Apply,
+            forwarding_mode: SystemCommandMode::Apply,
+            nat_mode: SystemCommandMode::Apply,
+            agent_pid: None,
+            gateway_pid: Some(42),
+            mode: ProfileMode::Remote,
+            local_component: Some(ComponentSelection::Gateway),
+            supervised: true,
+            supervisor_pid: Some(7),
+            supervisor_log_file: root.join("supervisor.log"),
+        };
+
+        assert!(supervised_session_components_ready(
+            &args,
+            7,
+            &session,
+            None,
+            Some(&gateway_status),
+            None,
+            Some(&gateway_state),
+        ));
         remove_test_root(root);
         Ok(())
     }
