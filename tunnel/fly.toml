@@ -1,0 +1,23 @@
+# fly.toml app configuration file generated for your-tunnel-linux-validation on 2026-05-18T10:30:19-04:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'your-tunnel-linux-validation'
+primary_region = 'iad'
+kill_signal = 'SIGTERM'
+kill_timeout = '30s'
+
+[build]
+  dockerfile = 'Dockerfile.fly'
+
+[env]
+  TUNNEL_DESTINATION_CIDR = '1.1.1.0/24'
+  TUNNEL_EGRESS_INTERFACE = 'eth0'
+  TUNNEL_PROFILE = 'local-dev'
+  TUNNEL_TARGET = '1.1.1.1'
+
+[[vm]]
+  memory = '1gb'
+  cpus = 1
+  memory_mb = 1024

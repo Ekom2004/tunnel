@@ -1,0 +1,33 @@
+FROM rust:1.80-bookworm AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+RUN cargo build --workspace --release
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iproute2 \
+        iptables \
+        iputils-ping \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/tunnel-agent /usr/local/bin/tunnel-agent
+COPY --from=builder /src/target/release/tunnel-cli /usr/local/bin/tunnel-cli
+COPY --from=builder /src/target/release/tunnel-control /usr/local/bin/tunnel-control
+COPY --from=builder /src/target/release/tunnel-gateway /usr/local/bin/tunnel-gateway
+COPY scripts/fly-linux-validate.sh /usr/local/bin/tunnel-fly-validate
+
+RUN chmod +x /usr/local/bin/tunnel-fly-validate
+
+ENV TUNNEL_PROFILE=local-dev
+ENV TUNNEL_TARGET=1.1.1.1
+ENV TUNNEL_DESTINATION_CIDR=1.1.1.0/24
+ENV TUNNEL_EGRESS_INTERFACE=eth0
+
+CMD ["tunnel-fly-validate"]
+
