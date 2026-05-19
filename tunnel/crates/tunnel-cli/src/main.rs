@@ -21,7 +21,11 @@ use tunnel_shared::{
     WireGuardRole,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 const TCP_MSS_CLAMP: &str = "1360";
+const SECRET_CONFIG_FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Parser)]
 #[command(name = "tunnel")]
@@ -2665,7 +2669,7 @@ fn write_generated_config(
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, serde_json::to_string_pretty(config)?)
+    write_secret_config_file(path, config)
         .with_context(|| format!("failed to write generated {label} {}", path.display()))?;
 
     Ok(ConfigBootstrapAction {
@@ -2766,6 +2770,45 @@ fn build_local_wireguard_config_pair(args: &LoginArgs) -> (TunnelConfig, TunnelC
     };
 
     (agent_config, gateway_config)
+}
+
+fn write_secret_config_file(path: &Path, config: &TunnelConfig) -> Result<()> {
+    let rendered = serde_json::to_string_pretty(config)?;
+    #[cfg(unix)]
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(SECRET_CONFIG_FILE_MODE)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.write_all(rendered.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(SECRET_CONFIG_FILE_MODE))
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, rendered).with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
+fn set_secret_config_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(SECRET_CONFIG_FILE_MODE))
+            .with_context(|| format!("failed to chmod {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn generate_wireguard_keypair() -> ([u8; 32], [u8; 32]) {
@@ -3018,6 +3061,7 @@ fn export_side_bundle(
             bundle_config_path.display()
         )
     })?;
+    set_secret_config_permissions(&bundle_config_path)?;
 
     let profile = side_bundle_profile(args, side, &profile_name, &config_file)?;
     write_json_file(
@@ -3103,6 +3147,7 @@ fn install_bundle_config(source: &Path, destination: &Path, force: bool) -> Resu
             destination.display()
         )
     })?;
+    set_secret_config_permissions(destination)?;
     Ok(())
 }
 
@@ -8243,7 +8288,43 @@ fn validate_config_file(label: &str, path: &Path) -> Result<()> {
     config
         .validate()
         .with_context(|| format!("{label} failed validation: {}", path.display()))?;
+    validate_secret_config_permissions(label, path, &config)?;
     Ok(())
+}
+
+fn validate_secret_config_permissions(
+    label: &str,
+    path: &Path,
+    config: &TunnelConfig,
+) -> Result<()> {
+    if !config_contains_private_key(config) {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(path)
+            .with_context(|| format!("failed to inspect {label} permissions: {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "{label} has insecure permissions {:03o}; expected private-key config to be readable only by owner: {}",
+                mode,
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn config_contains_private_key(config: &TunnelConfig) -> bool {
+    config
+        .wireguard
+        .as_ref()
+        .is_some_and(|wireguard| !wireguard.private_key_base64.trim().is_empty())
 }
 
 fn ensure_child_still_running(child: &mut Child, label: &str, log_path: &Path) -> Result<()> {
@@ -8690,6 +8771,8 @@ mod tests {
         );
         validate_config_file("agent_config", &args.agent_config)?;
         validate_config_file("gateway_config", &args.gateway_config)?;
+        assert_secret_config_mode(&args.agent_config)?;
+        assert_secret_config_mode(&args.gateway_config)?;
 
         write_profile_for_login(&args)?;
         let connect_args = resolve_connect_args(ConnectArgs::for_profile(
@@ -8699,6 +8782,21 @@ mod tests {
         let readiness = build_connect_readiness(&connect_args);
 
         assert!(readiness.ready);
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn config_validation_rejects_world_readable_private_key_file() -> Result<()> {
+        let root = test_root("rejects-insecure-config-mode")?;
+        let args = test_login_args(&root, true);
+        ensure_local_configs_for_login(&args)?;
+        fs::set_permissions(&args.agent_config, fs::Permissions::from_mode(0o644))?;
+
+        let error = validate_config_file("agent_config", &args.agent_config)
+            .expect_err("world-readable private key config must fail validation");
+        assert!(error.to_string().contains("insecure permissions"));
         remove_test_root(root);
         Ok(())
     }
@@ -9943,6 +10041,21 @@ mod tests {
 
     fn remove_test_root(root: PathBuf) {
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn assert_secret_config_mode(path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::metadata(path)?.permissions().mode() & 0o777,
+                SECRET_CONFIG_FILE_MODE
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+        Ok(())
     }
 
     fn read_dir_text(path: &Path) -> Result<String> {
