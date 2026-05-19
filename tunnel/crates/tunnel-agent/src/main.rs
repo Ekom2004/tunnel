@@ -76,6 +76,8 @@ enum TargetOs {
     Other,
 }
 
+const TCP_MSS_CLAMP: &str = "1360";
+
 fn current_target_os() -> TargetOs {
     #[cfg(target_os = "linux")]
     {
@@ -860,32 +862,34 @@ fn build_agent_route_commands_for_os(
     interface_name: &str,
     destination_cidrs: &[String],
 ) -> Vec<Vec<String>> {
-    destination_cidrs
-        .iter()
-        .map(|cidr| match target_os {
-            TargetOs::Linux => vec![
-                String::from("ip"),
-                String::from("route"),
-                String::from("replace"),
-                cidr.clone(),
-                String::from("dev"),
-                String::from(interface_name),
-            ],
-            TargetOs::Macos => vec![
-                String::from("route"),
-                String::from("-n"),
-                String::from("add"),
-                String::from("-net"),
-                cidr.clone(),
-                String::from("-interface"),
-                String::from(interface_name),
-            ],
-            TargetOs::Other => vec![
-                String::from("echo"),
-                format!("manual route required for {cidr} via {interface_name}"),
-            ],
-        })
-        .collect()
+    let mut commands = Vec::new();
+    if target_os == TargetOs::Linux {
+        commands.push(linux_mss_clamp_command("-A"));
+    }
+    commands.extend(destination_cidrs.iter().map(|cidr| match target_os {
+        TargetOs::Linux => vec![
+            String::from("ip"),
+            String::from("route"),
+            String::from("replace"),
+            cidr.clone(),
+            String::from("dev"),
+            String::from(interface_name),
+        ],
+        TargetOs::Macos => vec![
+            String::from("route"),
+            String::from("-n"),
+            String::from("add"),
+            String::from("-net"),
+            cidr.clone(),
+            String::from("-interface"),
+            String::from(interface_name),
+        ],
+        TargetOs::Other => vec![
+            String::from("echo"),
+            format!("manual route required for {cidr} via {interface_name}"),
+        ],
+    }));
+    commands
 }
 
 fn build_agent_route_cleanup_commands(
@@ -904,30 +908,51 @@ fn build_agent_route_cleanup_commands_for_os(
     interface_name: &str,
     destination_cidrs: &[String],
 ) -> Vec<Vec<String>> {
-    destination_cidrs
-        .iter()
-        .map(|cidr| match target_os {
-            TargetOs::Linux => vec![
-                String::from("ip"),
-                String::from("route"),
-                String::from("del"),
-                cidr.clone(),
-                String::from("dev"),
-                String::from(interface_name),
-            ],
-            TargetOs::Macos => vec![
-                String::from("route"),
-                String::from("-n"),
-                String::from("delete"),
-                String::from("-net"),
-                cidr.clone(),
-            ],
-            TargetOs::Other => vec![
-                String::from("echo"),
-                format!("manual route cleanup required for {cidr} via {interface_name}"),
-            ],
-        })
-        .collect()
+    let mut commands = Vec::new();
+    if target_os == TargetOs::Linux {
+        commands.push(linux_mss_clamp_command("-D"));
+    }
+    commands.extend(destination_cidrs.iter().map(|cidr| match target_os {
+        TargetOs::Linux => vec![
+            String::from("ip"),
+            String::from("route"),
+            String::from("del"),
+            cidr.clone(),
+            String::from("dev"),
+            String::from(interface_name),
+        ],
+        TargetOs::Macos => vec![
+            String::from("route"),
+            String::from("-n"),
+            String::from("delete"),
+            String::from("-net"),
+            cidr.clone(),
+        ],
+        TargetOs::Other => vec![
+            String::from("echo"),
+            format!("manual route cleanup required for {cidr} via {interface_name}"),
+        ],
+    }));
+    commands
+}
+
+fn linux_mss_clamp_command(operation: &str) -> Vec<String> {
+    vec![
+        String::from("iptables"),
+        String::from("-t"),
+        String::from("mangle"),
+        String::from(operation),
+        String::from("FORWARD"),
+        String::from("-p"),
+        String::from("tcp"),
+        String::from("--tcp-flags"),
+        String::from("SYN,RST"),
+        String::from("SYN"),
+        String::from("-j"),
+        String::from("TCPMSS"),
+        String::from("--set-mss"),
+        String::from(TCP_MSS_CLAMP),
+    ]
 }
 
 fn execute_commands(mode: SystemCommandMode, label: &str, commands: &[Vec<String>]) -> Result<()> {
@@ -1052,6 +1077,22 @@ mod tests {
         assert_eq!(
             build_agent_route_commands_for_os(TargetOs::Linux, "tun0", &cidrs),
             vec![
+                vec![
+                    "iptables",
+                    "-t",
+                    "mangle",
+                    "-A",
+                    "FORWARD",
+                    "-p",
+                    "tcp",
+                    "--tcp-flags",
+                    "SYN,RST",
+                    "SYN",
+                    "-j",
+                    "TCPMSS",
+                    "--set-mss",
+                    "1360",
+                ],
                 vec!["ip", "route", "replace", "1.1.1.0/24", "dev", "tun0"],
                 vec!["ip", "route", "replace", "10.0.0.0/8", "dev", "tun0"],
             ]
@@ -1062,6 +1103,22 @@ mod tests {
         assert_eq!(
             build_agent_route_cleanup_commands_for_os(TargetOs::Linux, "tun0", &cidrs),
             vec![
+                vec![
+                    "iptables",
+                    "-t",
+                    "mangle",
+                    "-D",
+                    "FORWARD",
+                    "-p",
+                    "tcp",
+                    "--tcp-flags",
+                    "SYN,RST",
+                    "SYN",
+                    "-j",
+                    "TCPMSS",
+                    "--set-mss",
+                    "1360",
+                ],
                 vec!["ip", "route", "del", "1.1.1.0/24", "dev", "tun0"],
                 vec!["ip", "route", "del", "10.0.0.0/8", "dev", "tun0"],
             ]

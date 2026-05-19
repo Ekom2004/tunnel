@@ -21,6 +21,8 @@ use tunnel_shared::{
     WireGuardRole,
 };
 
+const TCP_MSS_CLAMP: &str = "1360";
+
 #[derive(Debug, Parser)]
 #[command(name = "tunnel")]
 #[command(about = "Tunnel operator CLI", long_about = None)]
@@ -5018,9 +5020,11 @@ fn build_doctor_report(args: DoctorArgs) -> Result<DoctorReport> {
     if component_is_locally_owned(&session, ComponentSelection::Agent) {
         check_agent_state(agent_state.as_ref(), &session.agent_state_file, &mut checks);
         check_route_to_target(&args.target, agent_state.as_ref(), &mut checks)?;
+        check_agent_os_rules(agent_state.as_ref(), &mut checks)?;
     } else {
         push_remote_skip(&mut checks, "agent_state", ComponentSelection::Agent);
         push_remote_skip(&mut checks, "route_to_target", ComponentSelection::Agent);
+        push_remote_skip(&mut checks, "agent_os_rules", ComponentSelection::Agent);
     }
 
     if component_is_locally_owned(&session, ComponentSelection::Gateway) {
@@ -5927,6 +5931,19 @@ fn repair_agent_routes(session: &SessionManifest, supervisor_log: &mut File) -> 
         }
     }
 
+    #[cfg(target_os = "linux")]
+    if !command_succeeds(&linux_mss_clamp_command("-C"))? {
+        run_command_vec("agent mss clamp repair", linux_mss_clamp_command("-A"))?;
+        emit_supervisor_event(
+            supervisor_log,
+            "agent_mss_clamp_repaired",
+            Some(ComponentSelection::Agent),
+            format!("TCP MSS clamped to {TCP_MSS_CLAMP} for forwarded traffic"),
+            Some(session),
+        )?;
+        repaired = true;
+    }
+
     Ok(repaired)
 }
 
@@ -5940,6 +5957,11 @@ fn agent_routes_are_healthy(session: &SessionManifest) -> Result<bool> {
         if route_interface_for_target(&target)? != Some(state.tunnel_interface.clone()) {
             return Ok(false);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    if !command_succeeds(&linux_mss_clamp_command("-C"))? {
+        return Ok(false);
     }
 
     Ok(true)
@@ -6480,6 +6502,57 @@ fn check_route_to_target(
                 format!("could not determine route interface for {target}"),
             ));
         }
+    }
+
+    Ok(())
+}
+
+fn check_agent_os_rules(
+    agent_state: Option<&AgentRuntimeState>,
+    checks: &mut Vec<DoctorCheck>,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(agent_state) = agent_state else {
+            checks.push(doctor_check(
+                "agent_iptables_mss_clamp",
+                DoctorState::Warn,
+                "skipped because agent state is missing",
+            ));
+            return Ok(());
+        };
+
+        let command = linux_mss_clamp_command("-C");
+        match command_succeeds(&command) {
+            Ok(true) => checks.push(doctor_check(
+                "agent_iptables_mss_clamp",
+                DoctorState::Pass,
+                format!("FORWARD clamps TCP MSS to {TCP_MSS_CLAMP}"),
+            )),
+            Ok(false) => checks.push(doctor_check(
+                "agent_iptables_mss_clamp",
+                DoctorState::Fail,
+                format!(
+                    "missing TCP MSS clamp rule for agent interface {}: {}",
+                    agent_state.tunnel_interface,
+                    command.join(" ")
+                ),
+            )),
+            Err(error) => checks.push(doctor_check(
+                "agent_iptables_mss_clamp",
+                DoctorState::Fail,
+                format!(
+                    "failed to inspect agent MSS clamp rule with '{}': {error:#}",
+                    command.join(" ")
+                ),
+            )),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = agent_state;
+        let _ = checks;
     }
 
     Ok(())
@@ -7052,6 +7125,12 @@ fn build_linux_gateway_rule_checks(
             fail_detail: format!("missing established return rule for {tunnel_interface}"),
         },
         GatewayCommandCheck {
+            name: "gateway_iptables_mss_clamp",
+            command: linux_mss_clamp_command("-C"),
+            pass_detail: format!("FORWARD clamps TCP MSS to {TCP_MSS_CLAMP}"),
+            fail_detail: format!("missing TCP MSS clamp rule for {tunnel_interface}"),
+        },
+        GatewayCommandCheck {
             name: "gateway_iptables_forward_egress",
             command: vec![
                 String::from("iptables"),
@@ -7087,6 +7166,25 @@ fn build_linux_gateway_rule_checks(
             pass_detail: format!("POSTROUTING masquerades traffic on {egress_interface}"),
             fail_detail: format!("missing POSTROUTING MASQUERADE rule on {egress_interface}"),
         },
+    ]
+}
+
+fn linux_mss_clamp_command(operation: &str) -> Vec<String> {
+    vec![
+        String::from("iptables"),
+        String::from("-t"),
+        String::from("mangle"),
+        String::from(operation),
+        String::from("FORWARD"),
+        String::from("-p"),
+        String::from("tcp"),
+        String::from("--tcp-flags"),
+        String::from("SYN,RST"),
+        String::from("SYN"),
+        String::from("-j"),
+        String::from("TCPMSS"),
+        String::from("--set-mss"),
+        String::from(TCP_MSS_CLAMP),
     ]
 }
 
@@ -9489,6 +9587,22 @@ mod tests {
                     "-j",
                     "ACCEPT",
                 ],
+                vec![
+                    "iptables",
+                    "-t",
+                    "mangle",
+                    "-C",
+                    "FORWARD",
+                    "-p",
+                    "tcp",
+                    "--tcp-flags",
+                    "SYN,RST",
+                    "SYN",
+                    "-j",
+                    "TCPMSS",
+                    "--set-mss",
+                    "1360",
+                ],
                 vec!["iptables", "-C", "FORWARD", "-i", "tun0", "-o", "eth0", "-j", "ACCEPT",],
                 vec![
                     "iptables",
@@ -9548,6 +9662,46 @@ mod tests {
                 "eth0",
                 "-j",
                 "MASQUERADE",
+            ])
+        );
+
+        let mss_command = linux_mss_clamp_command("-C");
+        assert_eq!(
+            linux_rule_command_with_operation(&mss_command, "-A"),
+            string_vec(vec![
+                "iptables",
+                "-t",
+                "mangle",
+                "-A",
+                "FORWARD",
+                "-p",
+                "tcp",
+                "--tcp-flags",
+                "SYN,RST",
+                "SYN",
+                "-j",
+                "TCPMSS",
+                "--set-mss",
+                "1360",
+            ])
+        );
+        assert_eq!(
+            linux_rule_command_with_operation(&mss_command, "-D"),
+            string_vec(vec![
+                "iptables",
+                "-t",
+                "mangle",
+                "-D",
+                "FORWARD",
+                "-p",
+                "tcp",
+                "--tcp-flags",
+                "SYN,RST",
+                "SYN",
+                "-j",
+                "TCPMSS",
+                "--set-mss",
+                "1360",
             ])
         );
     }

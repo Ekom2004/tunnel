@@ -87,6 +87,8 @@ enum TargetOs {
     Other,
 }
 
+const TCP_MSS_CLAMP: &str = "1360";
+
 fn current_target_os() -> TargetOs {
     #[cfg(target_os = "linux")]
     {
@@ -1046,6 +1048,7 @@ fn build_forwarding_cleanup_commands_for_os(
     match target_os {
         TargetOs::Linux => {
             let mut commands = vec![
+                linux_mss_clamp_command("-D"),
                 vec![
                     String::from("iptables"),
                     String::from("-D"),
@@ -1127,6 +1130,7 @@ fn build_forwarding_commands_for_os(target_os: TargetOs, interface_name: &str) -
                 String::from("-w"),
                 String::from("net.ipv4.ip_forward=1"),
             ],
+            linux_mss_clamp_command("-A"),
             vec![
                 String::from("iptables"),
                 String::from("-A"),
@@ -1163,6 +1167,25 @@ fn build_forwarding_commands_for_os(target_os: TargetOs, interface_name: &str) -
             format!("manual forwarding enable required for {interface_name}"),
         ]],
     }
+}
+
+fn linux_mss_clamp_command(operation: &str) -> Vec<String> {
+    vec![
+        String::from("iptables"),
+        String::from("-t"),
+        String::from("mangle"),
+        String::from(operation),
+        String::from("FORWARD"),
+        String::from("-p"),
+        String::from("tcp"),
+        String::from("--tcp-flags"),
+        String::from("SYN,RST"),
+        String::from("SYN"),
+        String::from("-j"),
+        String::from("TCPMSS"),
+        String::from("--set-mss"),
+        String::from(TCP_MSS_CLAMP),
+    ]
 }
 
 fn query_ip_forwarding_enabled() -> Result<bool> {
@@ -1557,6 +1580,22 @@ mod tests {
             build_forwarding_commands_for_os(TargetOs::Linux, "tun0"),
             vec![
                 vec!["sysctl", "-w", "net.ipv4.ip_forward=1"],
+                vec![
+                    "iptables",
+                    "-t",
+                    "mangle",
+                    "-A",
+                    "FORWARD",
+                    "-p",
+                    "tcp",
+                    "--tcp-flags",
+                    "SYN,RST",
+                    "SYN",
+                    "-j",
+                    "TCPMSS",
+                    "--set-mss",
+                    "1360",
+                ],
                 vec!["iptables", "-A", "FORWARD", "-i", "tun0", "-j", "ACCEPT"],
                 vec![
                     "iptables",
@@ -1571,6 +1610,57 @@ mod tests {
                     "-j",
                     "ACCEPT",
                 ],
+            ]
+            .into_iter()
+            .map(string_vec)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linux_forwarding_cleanup_removes_mss_clamp_and_forward_rules() {
+        let state = GatewayRuntimeState {
+            tunnel_interface: String::from("tun0"),
+            nat_anchor_name: None,
+            nat_rules_path: None,
+            forwarding_was_enabled: Some(false),
+            egress_interface: Some(String::from("eth0")),
+        };
+
+        assert_eq!(
+            build_forwarding_cleanup_commands_for_os(TargetOs::Linux, &state),
+            vec![
+                vec![
+                    "iptables",
+                    "-t",
+                    "mangle",
+                    "-D",
+                    "FORWARD",
+                    "-p",
+                    "tcp",
+                    "--tcp-flags",
+                    "SYN,RST",
+                    "SYN",
+                    "-j",
+                    "TCPMSS",
+                    "--set-mss",
+                    "1360",
+                ],
+                vec!["iptables", "-D", "FORWARD", "-i", "tun0", "-j", "ACCEPT"],
+                vec![
+                    "iptables",
+                    "-D",
+                    "FORWARD",
+                    "-o",
+                    "tun0",
+                    "-m",
+                    "state",
+                    "--state",
+                    "RELATED,ESTABLISHED",
+                    "-j",
+                    "ACCEPT",
+                ],
+                vec!["sysctl", "-w", "net.ipv4.ip_forward=0"],
             ]
             .into_iter()
             .map(string_vec)
