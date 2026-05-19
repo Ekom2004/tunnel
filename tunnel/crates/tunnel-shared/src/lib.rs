@@ -104,6 +104,8 @@ pub struct AgentRuntimeState {
     pub destination_cidrs: Vec<String>,
     #[serde(default)]
     pub rp_filter: Option<AgentRpFilterState>,
+    #[serde(default)]
+    pub fallback_routes: Vec<AgentFallbackRoute>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,6 +113,16 @@ pub struct AgentRpFilterState {
     pub all: Option<u8>,
     pub default: Option<u8>,
     pub tunnel_interface: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentFallbackRoute {
+    pub cidr: String,
+    pub probe_target: String,
+    pub fallback_interface: Option<String>,
+    pub fallback_gateway: Option<String>,
+    #[serde(default)]
+    pub exact_route: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

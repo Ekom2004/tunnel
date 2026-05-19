@@ -4322,6 +4322,7 @@ fn write_remote_agent_owned_files(args: &ConnectArgs) -> Result<()> {
             tunnel_interface: String::from("utun-remote-agent"),
             destination_cidrs: vec![String::from("1.1.1.0/24")],
             rp_filter: None,
+            fallback_routes: Vec::new(),
         },
     )?;
     write_json_file(
@@ -5717,6 +5718,9 @@ fn supervise_component(
 
     let age_secs = now_unix_secs().saturating_sub(status.observed_at_unix_secs);
     if age_secs > args.stale_after_secs {
+        if component == ComponentSelection::Agent {
+            let _ = activate_agent_fallback(session, supervisor_log, "agent status is stale");
+        }
         return observe_unhealthy_component(
             session,
             component,
@@ -5725,6 +5729,21 @@ fn supervise_component(
             supervisor_log,
             format!("status is stale: observed {age_secs}s ago"),
         );
+    }
+
+    if component == ComponentSelection::Agent
+        && (status.state != HealthState::Healthy || status.phase != TunnelPhase::Active)
+    {
+        activate_agent_fallback(
+            session,
+            supervisor_log,
+            &format!(
+                "agent runtime is {:?}/{:?}: {}",
+                status.state, status.phase, status.detail
+            ),
+        )?;
+        state.unhealthy_samples = 0;
+        return Ok(false);
     }
 
     match repair_component_os_state(session, component, supervisor_log) {
@@ -5903,6 +5922,48 @@ fn repair_component_os_state(
         ComponentSelection::Agent => repair_agent_routes(session, supervisor_log),
         ComponentSelection::Gateway => repair_gateway_os_state(session, supervisor_log),
     }
+}
+
+fn activate_agent_fallback(
+    session: &SessionManifest,
+    supervisor_log: &mut File,
+    reason: &str,
+) -> Result<bool> {
+    let Some(state) = read_optional_json::<AgentRuntimeState>(&session.agent_state_file)? else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    for cidr in &state.destination_cidrs {
+        let target = cidr_route_probe_target(cidr);
+        if route_interface_for_target(&target)? == Some(state.tunnel_interface.clone()) {
+            let _ = delete_agent_route(cidr, &state.tunnel_interface);
+            changed = true;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    for fallback in &state.fallback_routes {
+        if let Some(route) = &fallback.exact_route {
+            run_command_vec(
+                "agent fallback route restore",
+                linux_route_replace_command(route),
+            )?;
+            changed = true;
+        }
+    }
+
+    if changed {
+        emit_supervisor_event(
+            supervisor_log,
+            "agent_fallback_activated",
+            Some(ComponentSelection::Agent),
+            format!("{reason}; Tunnel routes removed so fallback egress can carry traffic"),
+            Some(session),
+        )?;
+    }
+
+    Ok(changed)
 }
 
 fn repair_agent_routes(session: &SessionManifest, supervisor_log: &mut File) -> Result<bool> {
@@ -6456,9 +6517,10 @@ fn check_agent_state(
         "agent_state",
         DoctorState::Pass,
         format!(
-            "agent interface {} owns {} route(s)",
+            "agent interface {} owns {} route(s); fallback route records={}",
             state.tunnel_interface,
-            state.destination_cidrs.len()
+            state.destination_cidrs.len(),
+            state.fallback_routes.len()
         ),
     ));
 }
@@ -6506,7 +6568,17 @@ fn check_route_to_target(
             checks.push(doctor_check(
                 "route_to_target",
                 DoctorState::Pass,
-                format!("{target} routes through {}", agent_state.tunnel_interface),
+                format!(
+                    "tunnel_active: {target} routes through {}",
+                    agent_state.tunnel_interface
+                ),
+            ));
+        }
+        Some(interface) if route_matches_known_fallback(target, &interface, agent_state) => {
+            checks.push(doctor_check(
+                "route_to_target",
+                DoctorState::Warn,
+                format!("fallback_active: {target} routes through {interface}"),
             ));
         }
         Some(interface) => {
@@ -6529,6 +6601,17 @@ fn check_route_to_target(
     }
 
     Ok(())
+}
+
+fn route_matches_known_fallback(
+    target: &str,
+    observed_interface: &str,
+    agent_state: &AgentRuntimeState,
+) -> bool {
+    agent_state.fallback_routes.iter().any(|fallback| {
+        fallback.probe_target == target
+            && fallback.fallback_interface.as_deref() == Some(observed_interface)
+    })
 }
 
 fn check_agent_os_rules(
@@ -7214,6 +7297,17 @@ fn linux_mss_clamp_command(operation: &str) -> Vec<String> {
         String::from("--set-mss"),
         String::from(TCP_MSS_CLAMP),
     ]
+}
+
+#[cfg(target_os = "linux")]
+fn linux_route_replace_command(route: &[String]) -> Vec<String> {
+    let mut command = vec![
+        String::from("ip"),
+        String::from("route"),
+        String::from("replace"),
+    ];
+    command.extend(route.iter().cloned());
+    command
 }
 
 #[cfg(target_os = "linux")]

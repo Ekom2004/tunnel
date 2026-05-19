@@ -16,10 +16,10 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, ValueEnum};
 use tun::AbstractDevice;
 use tunnel_shared::{
-    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentRpFilterState,
-    AgentRuntimeState, AgentToGateway, ComponentKind, GatewayToAgent, HealthState,
-    PacketPathTelemetry, RuntimeStatus, SocketEndpoint, TransportKind, TunnelConfig, TunnelPhase,
-    WireGuardConfig,
+    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentFallbackRoute,
+    AgentRpFilterState, AgentRuntimeState, AgentToGateway, ComponentKind, GatewayToAgent,
+    HealthState, PacketPathTelemetry, RuntimeStatus, SocketEndpoint, TransportKind, TunnelConfig,
+    TunnelPhase, WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -745,6 +745,7 @@ fn save_agent_state(
         tunnel_interface: tunnel_interface.to_owned(),
         destination_cidrs: destination_cidrs.to_vec(),
         rp_filter: query_linux_rp_filter_state(tunnel_interface),
+        fallback_routes: query_fallback_routes(destination_cidrs),
     };
     fs::write(state_file, serde_json::to_string_pretty(&state)?)?;
     Ok(())
@@ -900,6 +901,7 @@ fn build_agent_route_cleanup_commands(state: &AgentRuntimeState) -> Vec<Vec<Stri
         &state.tunnel_interface,
         &state.destination_cidrs,
         state.rp_filter.as_ref(),
+        &state.fallback_routes,
     )
 }
 
@@ -908,6 +910,7 @@ fn build_agent_route_cleanup_commands_for_os(
     interface_name: &str,
     destination_cidrs: &[String],
     rp_filter: Option<&AgentRpFilterState>,
+    fallback_routes: &[AgentFallbackRoute],
 ) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     if target_os == TargetOs::Linux {
@@ -935,9 +938,109 @@ fn build_agent_route_cleanup_commands_for_os(
         ],
     }));
     if target_os == TargetOs::Linux {
+        commands.extend(linux_fallback_route_restore_commands(fallback_routes));
         commands.extend(linux_rp_filter_restore_commands(interface_name, rp_filter));
     }
     commands
+}
+
+fn linux_fallback_route_restore_commands(
+    fallback_routes: &[AgentFallbackRoute],
+) -> Vec<Vec<String>> {
+    fallback_routes
+        .iter()
+        .filter_map(|route| route.exact_route.as_ref())
+        .map(|route| {
+            let mut command = vec![
+                String::from("ip"),
+                String::from("route"),
+                String::from("replace"),
+            ];
+            command.extend(route.clone());
+            command
+        })
+        .collect()
+}
+
+fn query_fallback_routes(destination_cidrs: &[String]) -> Vec<AgentFallbackRoute> {
+    destination_cidrs
+        .iter()
+        .map(|cidr| {
+            let probe_target = cidr_route_probe_target(cidr);
+            let (fallback_interface, fallback_gateway) = query_route_get(&probe_target)
+                .map(|route| parse_route_get(&route))
+                .unwrap_or((None, None));
+
+            AgentFallbackRoute {
+                cidr: cidr.clone(),
+                probe_target,
+                fallback_interface,
+                fallback_gateway,
+                exact_route: query_exact_route(cidr),
+            }
+        })
+        .collect()
+}
+
+fn cidr_route_probe_target(cidr: &str) -> String {
+    cidr.split('/').next().unwrap_or(cidr).to_owned()
+}
+
+fn query_route_get(target: &str) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("ip")
+            .args(["route", "get", target])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = target;
+        None
+    }
+}
+
+fn query_exact_route(cidr: &str) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new("ip")
+            .args(["route", "show", "to", "exact", cidr])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let route = String::from_utf8_lossy(&output.stdout);
+        let route = route.lines().next()?.trim();
+        if route.is_empty() {
+            None
+        } else {
+            Some(route.split_whitespace().map(String::from).collect())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cidr;
+        None
+    }
+}
+
+fn parse_route_get(route: &str) -> (Option<String>, Option<String>) {
+    let parts = route.split_whitespace().collect::<Vec<_>>();
+    let fallback_interface = parts
+        .windows(2)
+        .find_map(|window| (window[0] == "dev").then(|| window[1].to_owned()));
+    let fallback_gateway = parts
+        .windows(2)
+        .find_map(|window| (window[0] == "via").then(|| window[1].to_owned()));
+    (fallback_interface, fallback_gateway)
 }
 
 fn linux_rp_filter_loose_commands(interface_name: &str) -> Vec<Vec<String>> {
@@ -1190,6 +1293,7 @@ mod tests {
                 "tun0",
                 &cidrs,
                 Some(&rp_filter),
+                &[],
             ),
             vec![
                 vec![
@@ -1237,7 +1341,7 @@ mod tests {
             ])]
         );
         assert_eq!(
-            build_agent_route_cleanup_commands_for_os(TargetOs::Macos, "utun7", &cidrs, None),
+            build_agent_route_cleanup_commands_for_os(TargetOs::Macos, "utun7", &cidrs, None, &[]),
             vec![string_vec(vec![
                 "route",
                 "-n",
@@ -1245,6 +1349,66 @@ mod tests {
                 "-net",
                 "1.1.1.0/24",
             ])]
+        );
+    }
+
+    #[test]
+    fn linux_cleanup_restores_exact_fallback_routes() {
+        let cidrs = vec![String::from("1.1.1.0/24")];
+        let fallback_routes = vec![AgentFallbackRoute {
+            cidr: String::from("1.1.1.0/24"),
+            probe_target: String::from("1.1.1.1"),
+            fallback_interface: Some(String::from("eth0")),
+            fallback_gateway: Some(String::from("10.0.0.1")),
+            exact_route: Some(string_vec(vec![
+                "1.1.1.0/24",
+                "via",
+                "10.0.0.1",
+                "dev",
+                "eth0",
+            ])),
+        }];
+
+        assert_eq!(
+            build_agent_route_cleanup_commands_for_os(
+                TargetOs::Linux,
+                "tun0",
+                &cidrs,
+                None,
+                &fallback_routes,
+            ),
+            vec![
+                vec![
+                    "iptables",
+                    "-t",
+                    "mangle",
+                    "-D",
+                    "FORWARD",
+                    "-p",
+                    "tcp",
+                    "--tcp-flags",
+                    "SYN,RST",
+                    "SYN",
+                    "-j",
+                    "TCPMSS",
+                    "--set-mss",
+                    "1360",
+                ],
+                vec!["ip", "route", "del", "1.1.1.0/24", "dev", "tun0"],
+                vec![
+                    "ip",
+                    "route",
+                    "replace",
+                    "1.1.1.0/24",
+                    "via",
+                    "10.0.0.1",
+                    "dev",
+                    "eth0",
+                ],
+            ]
+            .into_iter()
+            .map(string_vec)
+            .collect::<Vec<_>>()
         );
     }
 
