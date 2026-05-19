@@ -642,6 +642,12 @@ struct RemoteDeployArgs {
     #[arg(long)]
     report_file: Option<PathBuf>,
     #[arg(long)]
+    redact_report: bool,
+    #[arg(long)]
+    collect_logs_on_fail: bool,
+    #[arg(long, default_value_t = 120)]
+    collect_log_lines: usize,
+    #[arg(long)]
     no_rollback: bool,
 }
 
@@ -1000,8 +1006,11 @@ struct RemoteDeployReport {
     gateway_host: String,
     dry_run: bool,
     require_host_preflight: bool,
+    redact_report: bool,
     ssh_timeout_secs: u64,
     step_timeout_secs: u64,
+    collect_logs_on_fail: bool,
+    collect_log_lines: usize,
     rollback_on_fail: bool,
     rollback_attempted: bool,
     plan: RemotePlanReport,
@@ -1380,9 +1389,10 @@ fn run_remote_plan(args: RemotePlanArgs) -> Result<()> {
 
 fn run_remote_deploy(args: RemoteDeployArgs) -> Result<()> {
     let report_file = args.report_file.clone();
+    let redact_report = args.redact_report;
     let report = build_remote_deploy_report(args)?;
     let failed = report.overall == DoctorState::Fail;
-    let report_json = serde_json::to_string_pretty(&report)?;
+    let report_json = remote_deploy_report_json(&report, redact_report)?;
     if let Some(path) = report_file {
         write_report_file(&path, &report_json)?;
     }
@@ -1391,6 +1401,82 @@ fn run_remote_deploy(args: RemoteDeployArgs) -> Result<()> {
         bail!("remote deploy failed");
     }
     Ok(())
+}
+
+fn remote_deploy_report_json(report: &RemoteDeployReport, redact: bool) -> Result<String> {
+    if !redact {
+        return serde_json::to_string_pretty(report).context("failed to serialize deploy report");
+    }
+
+    let mut value = serde_json::to_value(report).context("failed to serialize deploy report")?;
+    redact_json_value(&mut value, None);
+    serde_json::to_string_pretty(&value).context("failed to serialize redacted deploy report")
+}
+
+fn redact_json_value(value: &mut serde_json::Value, key: Option<&str>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (child_key, child_value) in map.iter_mut() {
+                redact_json_value(child_value, Some(child_key));
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child_value in values {
+                redact_json_value(child_value, key);
+            }
+        }
+        serde_json::Value::String(text) => {
+            if key.map(is_sensitive_report_key).unwrap_or(false) {
+                *text = String::from("[REDACTED]");
+            } else {
+                *text = redact_sensitive_text(text);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_report_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    normalized.contains("private")
+        || normalized.contains("secret")
+        || normalized.contains("token")
+        || normalized.contains("password")
+        || normalized == "authorization"
+        || normalized == "api_key"
+        || normalized == "access_key"
+}
+
+fn redact_sensitive_text(text: &str) -> String {
+    if !text.contains('\n') {
+        return redact_sensitive_line(text).into_owned();
+    }
+
+    text.lines()
+        .map(|line| redact_sensitive_line(line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redact_sensitive_line(line: &str) -> std::borrow::Cow<'_, str> {
+    let normalized = line.to_ascii_lowercase();
+    let sensitive = normalized.contains("private_key")
+        || normalized.contains("private key")
+        || normalized.contains("preshared_key")
+        || normalized.contains("preshared key")
+        || normalized.contains("authorization:")
+        || normalized.contains("bearer ")
+        || normalized.contains("api_key")
+        || normalized.contains("access_key")
+        || normalized.contains("secret")
+        || normalized.contains("token")
+        || normalized.contains("password");
+
+    if sensitive {
+        std::borrow::Cow::Borrowed("[REDACTED]")
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    }
 }
 
 fn write_report_file(path: &Path, contents: &str) -> Result<()> {
@@ -1434,6 +1520,8 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
     let rollback_on_fail = !args.no_rollback;
     let dry_run = args.dry_run;
     let require_host_preflight = args.require_host_preflight;
+    let redact_report = args.redact_report;
+    let collect_logs_on_fail = args.collect_logs_on_fail;
     let step_timeout = Duration::from_secs(args.step_timeout_secs);
     let mut gateway_started = false;
     let mut agent_started = false;
@@ -1634,6 +1722,40 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
         }
     }
 
+    let failed_before_log_collection = steps.iter().any(|step| step.state == DoctorState::Fail);
+    if collect_logs_on_fail && failed_before_log_collection {
+        steps.push(build_remote_deploy_step(
+            "collect_gateway_logs_on_fail",
+            Some(gateway_host.clone()),
+            remote_collect_logs_command(
+                &args.ssh_bin,
+                &gateway_host,
+                &args.plan.gateway_profile,
+                ComponentSelection::Gateway,
+                &args.plan.remote_profile_file,
+                args.collect_log_lines,
+                args.ssh_timeout_secs,
+            ),
+            dry_run,
+            step_timeout,
+        ));
+        steps.push(build_remote_deploy_step(
+            "collect_agent_logs_on_fail",
+            Some(agent_host.clone()),
+            remote_collect_logs_command(
+                &args.ssh_bin,
+                &agent_host,
+                &args.plan.agent_profile,
+                ComponentSelection::Agent,
+                &args.plan.remote_profile_file,
+                args.collect_log_lines,
+                args.ssh_timeout_secs,
+            ),
+            dry_run,
+            step_timeout,
+        ));
+    }
+
     let overall = if steps.iter().any(|step| step.state == DoctorState::Fail) {
         DoctorState::Fail
     } else if steps.iter().any(|step| step.state == DoctorState::Warn) {
@@ -1649,8 +1771,11 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
         gateway_host,
         dry_run,
         require_host_preflight,
+        redact_report,
         ssh_timeout_secs: args.ssh_timeout_secs,
         step_timeout_secs: args.step_timeout_secs,
+        collect_logs_on_fail,
+        collect_log_lines: args.collect_log_lines,
         rollback_on_fail,
         rollback_attempted,
         plan,
@@ -2069,6 +2194,43 @@ fn remote_agent_smoke_test_command(args: &RemotePlanArgs) -> String {
         String::from("--count"),
         args.smoke_count.to_string(),
     ])
+}
+
+fn remote_collect_logs_command(
+    ssh_bin: &str,
+    host: &str,
+    profile: &str,
+    component: ComponentSelection,
+    profile_file: &Path,
+    lines: usize,
+    ssh_timeout_secs: u64,
+) -> Vec<String> {
+    let component = component_label(component);
+    let status = render_command(vec![
+        String::from("tunnel-cli"),
+        String::from("status"),
+        profile.to_owned(),
+        String::from("--profile-file"),
+        path_display(profile_file),
+    ]);
+    let logs = render_command(vec![
+        String::from("tunnel-cli"),
+        String::from("logs"),
+        profile.to_owned(),
+        String::from("--profile-file"),
+        path_display(profile_file),
+        String::from("--component"),
+        component.to_owned(),
+        String::from("--lines"),
+        lines.to_string(),
+    ]);
+    let remote_command = format!(
+        "sh -lc {}",
+        shell_quote(&format!(
+            "echo '==== tunnel status ===='; {status}; echo '==== tunnel logs ({component}) ===='; {logs}"
+        ))
+    );
+    deploy_ssh_command(ssh_bin, host, &remote_command, ssh_timeout_secs)
 }
 
 fn run_command_step(
@@ -8704,6 +8866,9 @@ mod tests {
             dry_run: false,
             require_host_preflight: false,
             report_file: None,
+            redact_report: false,
+            collect_logs_on_fail: false,
+            collect_log_lines: 120,
             no_rollback: false,
         })?;
 
@@ -8777,6 +8942,9 @@ mod tests {
             dry_run: false,
             require_host_preflight: false,
             report_file: None,
+            redact_report: false,
+            collect_logs_on_fail: false,
+            collect_log_lines: 120,
             no_rollback: false,
         })?;
 
@@ -8837,6 +9005,9 @@ mod tests {
             dry_run: false,
             require_host_preflight: false,
             report_file: None,
+            redact_report: false,
+            collect_logs_on_fail: false,
+            collect_log_lines: 120,
             no_rollback: false,
         })?;
 
@@ -8859,6 +9030,77 @@ mod tests {
                     .command
                     .contains("sudo -n tunnel-cli disconnect gateway-prod")
         }));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_deploy_collects_logs_after_failure_when_requested() -> Result<()> {
+        let root = test_root("remote-deploy-collect-logs")?;
+        let fake_bin = root.join("fake-ssh-scp");
+        write_fake_remote_deploy_binary(&fake_bin, "remote-smoke-test")?;
+
+        let report = build_remote_deploy_report(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: path_display(&fake_bin),
+            scp_bin: path_display(&fake_bin),
+            ssh_timeout_secs: 10,
+            step_timeout_secs: 120,
+            dry_run: false,
+            require_host_preflight: false,
+            report_file: None,
+            redact_report: false,
+            collect_logs_on_fail: true,
+            collect_log_lines: 42,
+            no_rollback: false,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Fail);
+        assert!(report.collect_logs_on_fail);
+        assert_eq!(report.collect_log_lines, 42);
+        let gateway_collect = report
+            .steps
+            .iter()
+            .find(|step| step.name == "collect_gateway_logs_on_fail")
+            .expect("gateway log collection step should be present");
+        assert_eq!(gateway_collect.state, DoctorState::Pass);
+        assert!(gateway_collect.command.contains("logs gateway-prod"));
+        assert!(gateway_collect.command.contains("--component gateway"));
+        assert!(gateway_collect.command.contains("--lines 42"));
+
+        let agent_collect = report
+            .steps
+            .iter()
+            .find(|step| step.name == "collect_agent_logs_on_fail")
+            .expect("agent log collection step should be present");
+        assert_eq!(agent_collect.state, DoctorState::Pass);
+        assert!(agent_collect.command.contains("logs agent-prod"));
+        assert!(agent_collect.command.contains("--component agent"));
         remove_test_root(root);
         Ok(())
     }
@@ -8903,6 +9145,9 @@ mod tests {
             dry_run: false,
             require_host_preflight: false,
             report_file: None,
+            redact_report: false,
+            collect_logs_on_fail: false,
+            collect_log_lines: 120,
             no_rollback: true,
         })?;
 
@@ -8956,6 +9201,9 @@ mod tests {
             dry_run: true,
             require_host_preflight: false,
             report_file: None,
+            redact_report: false,
+            collect_logs_on_fail: false,
+            collect_log_lines: 120,
             no_rollback: false,
         })?;
 
@@ -9026,6 +9274,9 @@ mod tests {
             dry_run: true,
             require_host_preflight: true,
             report_file: Some(report_file.clone()),
+            redact_report: false,
+            collect_logs_on_fail: false,
+            collect_log_lines: 120,
             no_rollback: false,
         })?;
 
@@ -9042,6 +9293,43 @@ mod tests {
         assert!(steps.iter().any(|step| step["name"] == "agent_smoke_test"));
         remove_test_root(root);
         Ok(())
+    }
+
+    #[test]
+    fn report_redaction_scrubs_secret_fields_and_log_lines() {
+        let mut value = serde_json::json!({
+            "redact_report": true,
+            "private_key_base64": "super-secret-private-key",
+            "public_key_base64": "safe-public-key",
+            "steps": [
+                {
+                    "stdout": "status ok\nAuthorization: Bearer super-secret-token\nprivate_key_base64: super-secret-private-key\nnext line",
+                    "stderr": "token=super-secret-token\nregular warning",
+                    "detail": "safe detail"
+                }
+            ],
+            "nested": {
+                "api_key": "super-secret-api-key",
+                "gateway_host": "203.0.113.10"
+            }
+        });
+
+        redact_json_value(&mut value, None);
+        let rendered = serde_json::to_string(&value).expect("json should render");
+
+        assert!(!rendered.contains("super-secret"));
+        assert_eq!(value["private_key_base64"], "[REDACTED]");
+        assert_eq!(value["public_key_base64"], "safe-public-key");
+        assert_eq!(value["nested"]["api_key"], "[REDACTED]");
+        assert_eq!(value["nested"]["gateway_host"], "203.0.113.10");
+        assert!(value["steps"][0]["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("status ok"));
+        assert!(value["steps"][0]["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[REDACTED]"));
     }
 
     #[test]
@@ -9084,6 +9372,9 @@ mod tests {
             dry_run: false,
             require_host_preflight: true,
             report_file: None,
+            redact_report: false,
+            collect_logs_on_fail: false,
+            collect_log_lines: 120,
             no_rollback: false,
         })?;
 
@@ -9142,6 +9433,9 @@ mod tests {
             dry_run: true,
             require_host_preflight: true,
             report_file: None,
+            redact_report: false,
+            collect_logs_on_fail: false,
+            collect_log_lines: 120,
             no_rollback: false,
         })?;
 
