@@ -88,6 +88,7 @@ enum TargetOs {
 }
 
 const TCP_MSS_CLAMP: &str = "1360";
+const PEER_ENDPOINT_CHANGE_MIN_SECS: u64 = 2;
 
 fn current_target_os() -> TargetOs {
     #[cfg(target_os = "linux")]
@@ -129,6 +130,7 @@ struct ByteCounters {
 struct PeerStatus {
     endpoint: Option<SocketAddr>,
     last_activity_unix_secs: u64,
+    last_endpoint_change_unix_secs: Option<u64>,
 }
 
 fn main() -> Result<()> {
@@ -266,6 +268,7 @@ fn run_wireguard_gateway(
     let peer = Arc::new(Mutex::new(PeerStatus {
         endpoint: resolve_optional_socket_endpoint(wireguard.peer_endpoint.as_ref())?,
         last_activity_unix_secs: now_unix_secs(),
+        last_endpoint_change_unix_secs: Some(now_unix_secs()),
     }));
     let counters = Arc::new(ByteCounters::default());
     let output_file = prepare_output_file(
@@ -528,13 +531,6 @@ fn wireguard_udp_receiver_loop(
         counters
             .udp_rx_bytes
             .fetch_add(amount as u64, Ordering::Relaxed);
-        {
-            let mut peer_guard = peer
-                .lock()
-                .map_err(|_| anyhow!("{label} peer lock poisoned"))?;
-            peer_guard.endpoint = Some(src_addr);
-            peer_guard.last_activity_unix_secs = now_unix_secs();
-        }
 
         let mut input = Some((src_addr.ip(), amount));
 
@@ -552,10 +548,13 @@ fn wireguard_udp_receiver_loop(
 
             match result {
                 TunnResult::WriteToNetwork(packet) => {
-                    let _ = send_udp_packet(&socket, &peer, packet, &counters, label)?;
+                    if mark_authenticated_peer_endpoint(&peer, src_addr, label)? {
+                        let _ = send_udp_packet(&socket, &peer, packet, &counters, label)?;
+                    }
                     continue;
                 }
                 TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
+                    mark_authenticated_peer_endpoint(&peer, src_addr, label)?;
                     counters
                         .wireguard_decapsulated_packets
                         .fetch_add(1, Ordering::Relaxed);
@@ -663,6 +662,54 @@ fn send_udp_packet(
         .fetch_add(packet.len() as u64, Ordering::Relaxed);
     guard.last_activity_unix_secs = now_unix_secs();
     Ok(true)
+}
+
+fn mark_authenticated_peer_endpoint(
+    peer: &Arc<Mutex<PeerStatus>>,
+    src_addr: SocketAddr,
+    label: &str,
+) -> Result<bool> {
+    let mut guard = peer
+        .lock()
+        .map_err(|_| anyhow!("{label} peer lock poisoned"))?;
+    let now = now_unix_secs();
+    let changed = apply_authenticated_peer_endpoint(&mut guard, src_addr, now);
+    if !changed && guard.endpoint != Some(src_addr) {
+        eprintln!("{label} ignored authenticated peer endpoint change to {src_addr}: rate limited");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn apply_authenticated_peer_endpoint(
+    status: &mut PeerStatus,
+    src_addr: SocketAddr,
+    now: u64,
+) -> bool {
+    match status.endpoint {
+        Some(current) if current == src_addr => {
+            status.last_activity_unix_secs = now;
+            true
+        }
+        Some(_) => {
+            let allowed = status
+                .last_endpoint_change_unix_secs
+                .map(|last| now.saturating_sub(last) >= PEER_ENDPOINT_CHANGE_MIN_SECS)
+                .unwrap_or(true);
+            if allowed {
+                status.endpoint = Some(src_addr);
+                status.last_activity_unix_secs = now;
+                status.last_endpoint_change_unix_secs = Some(now);
+            }
+            allowed
+        }
+        None => {
+            status.endpoint = Some(src_addr);
+            status.last_activity_unix_secs = now;
+            status.last_endpoint_change_unix_secs = Some(now);
+            true
+        }
+    }
 }
 
 fn build_wireguard_tunnel(wireguard: &WireGuardConfig, index: u32) -> Result<Tunn> {
@@ -1666,6 +1713,33 @@ mod tests {
             .map(string_vec)
             .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn authenticated_peer_endpoint_changes_are_rate_limited() {
+        let initial: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let attacker: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let legitimate_roam: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let mut status = PeerStatus {
+            endpoint: Some(initial),
+            last_activity_unix_secs: 10,
+            last_endpoint_change_unix_secs: Some(10),
+        };
+
+        assert!(!apply_authenticated_peer_endpoint(
+            &mut status,
+            attacker,
+            11
+        ));
+        assert_eq!(status.endpoint, Some(initial));
+
+        assert!(apply_authenticated_peer_endpoint(
+            &mut status,
+            legitimate_roam,
+            12
+        ));
+        assert_eq!(status.endpoint, Some(legitimate_roam));
+        assert_eq!(status.last_activity_unix_secs, 12);
     }
 
     #[test]
