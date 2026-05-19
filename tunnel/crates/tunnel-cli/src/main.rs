@@ -3,7 +3,7 @@
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, ToSocketAddrs, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command, Output, Stdio};
 use std::thread;
@@ -85,6 +85,8 @@ enum CommandKind {
     RemoteLifecycleTest(RemoteLifecycleTestArgs),
     #[command(hide = true)]
     RemoteCheck(RemoteCheckArgs),
+    #[command(hide = true)]
+    RemoteSmokeTest(RemoteSmokeTestArgs),
     #[command(hide = true)]
     GatewayRun(SideRunArgs),
     #[command(hide = true)]
@@ -520,9 +522,49 @@ struct RemoteCheckArgs {
     #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
     profile_file: PathBuf,
     #[arg(long)]
+    peer_profile: Option<String>,
+    #[arg(long)]
+    peer_profile_file: Option<PathBuf>,
+    #[arg(long)]
     gateway_host: Option<String>,
     #[arg(long)]
     gateway_port: Option<u16>,
+    #[arg(long)]
+    udp_probe: bool,
+    #[arg(long, default_value_t = 2.0)]
+    udp_probe_timeout_secs: f64,
+}
+
+#[derive(Debug, Args, Clone)]
+struct RemoteSmokeTestArgs {
+    #[arg(value_name = "PROFILE", default_value = "local-dev")]
+    profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long)]
+    peer_profile: Option<String>,
+    #[arg(long)]
+    peer_profile_file: Option<PathBuf>,
+    #[arg(long)]
+    gateway_host: Option<String>,
+    #[arg(long)]
+    gateway_port: Option<u16>,
+    #[arg(long, default_value = "/private/tmp/tunnel-session.json")]
+    session_file: PathBuf,
+    #[arg(long, default_value = "1.1.1.1")]
+    target: String,
+    #[arg(long, default_value_t = 10)]
+    count: u32,
+    #[arg(long, default_value_t = 1.0)]
+    interval_secs: f64,
+    #[arg(long, default_value_t = 2.0)]
+    probe_timeout_secs: f64,
+    #[arg(long, default_value_t = 15)]
+    stale_after_secs: u64,
+    #[arg(long, default_value_t = 15)]
+    post_probe_settle_secs: u64,
+    #[arg(long, default_value_t = 2.0)]
+    udp_probe_timeout_secs: f64,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -814,9 +856,32 @@ struct LifecycleTestReport {
 struct RemoteCheckReport {
     overall: DoctorState,
     profile: String,
+    peer_profile: Option<String>,
     gateway_host: Option<String>,
     gateway_port: Option<u16>,
     checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteSmokeTestReport {
+    overall: DoctorState,
+    profile: String,
+    peer_profile: Option<String>,
+    target: String,
+    remote_check: RemoteCheckReport,
+    gateway_udp_probe: UdpProbeReport,
+    doctor: DoctorReport,
+    soak: SoakReport,
+    checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UdpProbeReport {
+    host: String,
+    port: u16,
+    timeout_secs: f64,
+    sent: bool,
+    detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1005,6 +1070,7 @@ fn main() -> Result<()> {
         CommandKind::LifecycleTest(args) => run_lifecycle_test(args)?,
         CommandKind::RemoteLifecycleTest(args) => run_remote_lifecycle_test(args)?,
         CommandKind::RemoteCheck(args) => run_remote_check(args)?,
+        CommandKind::RemoteSmokeTest(args) => run_remote_smoke_test(args)?,
         CommandKind::GatewayRun(args) => run_side(args, ComponentSelection::Gateway)?,
         CommandKind::AgentRun(args) => run_side(args, ComponentSelection::Agent)?,
     }
@@ -3094,6 +3160,17 @@ fn runtime_status(component: ComponentKind, tunnel_interface: Option<String>) ->
 }
 
 fn run_remote_check(args: RemoteCheckArgs) -> Result<()> {
+    let report = build_remote_check_report(args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    if report.overall == DoctorState::Fail {
+        bail!("remote check failed");
+    }
+
+    Ok(())
+}
+
+fn build_remote_check_report(args: RemoteCheckArgs) -> Result<RemoteCheckReport> {
     let mut checks = Vec::new();
     let mut connect_args =
         ConnectArgs::for_profile(args.profile.clone(), args.profile_file.clone());
@@ -3112,15 +3189,48 @@ fn run_remote_check(args: RemoteCheckArgs) -> Result<()> {
                 DoctorState::Fail,
                 format!("profile resolution failed: {error:#}"),
             ));
-            return print_remote_check_report(args, checks);
+            return Ok(make_remote_check_report(args, checks));
         }
     };
+    let peer_connect_args = if let Some(peer_profile) = args.peer_profile.clone() {
+        let peer_profile_file = args
+            .peer_profile_file
+            .clone()
+            .unwrap_or_else(|| args.profile_file.clone());
+        let peer_args = ConnectArgs::for_profile(peer_profile.clone(), peer_profile_file.clone());
+        match resolve_connect_args(peer_args) {
+            Ok(peer_args) => {
+                checks.push(doctor_check(
+                    "peer_profile",
+                    DoctorState::Pass,
+                    format!(
+                        "peer profile {:?} resolved successfully from {}",
+                        peer_profile,
+                        peer_profile_file.display()
+                    ),
+                ));
+                Some(peer_args)
+            }
+            Err(error) => {
+                checks.push(doctor_check(
+                    "peer_profile",
+                    DoctorState::Fail,
+                    format!("peer profile resolution failed: {error:#}"),
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
-    push_config_validation_check(&mut checks, "agent_config", &connect_args.agent_config);
-    push_config_validation_check(&mut checks, "gateway_config", &connect_args.gateway_config);
+    let (agent_config_path, gateway_config_path) =
+        remote_check_config_paths(&connect_args, peer_connect_args.as_ref(), &mut checks);
+    push_config_validation_check(&mut checks, "agent_config", &agent_config_path);
+    push_config_validation_check(&mut checks, "gateway_config", &gateway_config_path);
 
-    let agent_config = read_optional_json::<TunnelConfig>(&connect_args.agent_config)?;
-    let gateway_config = read_optional_json::<TunnelConfig>(&connect_args.gateway_config)?;
+    let agent_config = read_optional_json::<TunnelConfig>(&agent_config_path)?;
+    let gateway_config = read_optional_json::<TunnelConfig>(&gateway_config_path)?;
     check_remote_config_intent(
         &mut checks,
         agent_config.as_ref(),
@@ -3128,8 +3238,17 @@ fn run_remote_check(args: RemoteCheckArgs) -> Result<()> {
         args.gateway_host.as_deref(),
         args.gateway_port,
     );
+    if args.udp_probe {
+        push_gateway_udp_probe_check(
+            &mut checks,
+            agent_config.as_ref(),
+            args.gateway_host.as_deref(),
+            args.gateway_port,
+            args.udp_probe_timeout_secs,
+        );
+    }
 
-    print_remote_check_report(args, checks)
+    Ok(make_remote_check_report(args, checks))
 }
 
 fn push_config_validation_check(checks: &mut Vec<DoctorCheck>, name: &str, path: &Path) {
@@ -3140,6 +3259,55 @@ fn push_config_validation_check(checks: &mut Vec<DoctorCheck>, name: &str, path:
             format!("valid config: {}", path.display()),
         )),
         Err(error) => checks.push(doctor_check(name, DoctorState::Fail, format!("{error:#}"))),
+    }
+}
+
+fn remote_check_config_paths(
+    primary: &ConnectArgs,
+    peer: Option<&ConnectArgs>,
+    checks: &mut Vec<DoctorCheck>,
+) -> (PathBuf, PathBuf) {
+    let Some(peer) = peer else {
+        return (primary.agent_config.clone(), primary.gateway_config.clone());
+    };
+
+    match (primary.local_component, peer.local_component) {
+        (Some(ComponentSelection::Agent), Some(ComponentSelection::Gateway)) => {
+            checks.push(doctor_check(
+                "profile_pair",
+                DoctorState::Pass,
+                "primary agent profile is paired with peer gateway profile",
+            ));
+            (primary.agent_config.clone(), peer.gateway_config.clone())
+        }
+        (Some(ComponentSelection::Gateway), Some(ComponentSelection::Agent)) => {
+            checks.push(doctor_check(
+                "profile_pair",
+                DoctorState::Pass,
+                "primary gateway profile is paired with peer agent profile",
+            ));
+            (peer.agent_config.clone(), primary.gateway_config.clone())
+        }
+        (Some(left), Some(right)) => {
+            checks.push(doctor_check(
+                "profile_pair",
+                DoctorState::Fail,
+                format!(
+                    "primary and peer profiles must be opposite remote sides; got {} and {}",
+                    component_label(left),
+                    component_label(right)
+                ),
+            ));
+            (primary.agent_config.clone(), primary.gateway_config.clone())
+        }
+        _ => {
+            checks.push(doctor_check(
+                "profile_pair",
+                DoctorState::Fail,
+                "peer profile validation requires both profiles to declare local_component",
+            ));
+            (primary.agent_config.clone(), primary.gateway_config.clone())
+        }
     }
 }
 
@@ -3234,7 +3402,7 @@ fn check_remote_config_intent(
     );
 }
 
-fn print_remote_check_report(args: RemoteCheckArgs, checks: Vec<DoctorCheck>) -> Result<()> {
+fn make_remote_check_report(args: RemoteCheckArgs, checks: Vec<DoctorCheck>) -> RemoteCheckReport {
     let overall = if checks.iter().any(|check| check.state == DoctorState::Fail) {
         DoctorState::Fail
     } else if checks.iter().any(|check| check.state == DoctorState::Warn) {
@@ -3242,20 +3410,236 @@ fn print_remote_check_report(args: RemoteCheckArgs, checks: Vec<DoctorCheck>) ->
     } else {
         DoctorState::Pass
     };
-    let report = RemoteCheckReport {
+    RemoteCheckReport {
         overall,
         profile: args.profile,
+        peer_profile: args.peer_profile,
         gateway_host: args.gateway_host,
         gateway_port: args.gateway_port,
+        checks,
+    }
+}
+
+fn push_gateway_udp_probe_check(
+    checks: &mut Vec<DoctorCheck>,
+    agent_config: Option<&TunnelConfig>,
+    expected_host: Option<&str>,
+    expected_port: Option<u16>,
+    timeout_secs: f64,
+) {
+    let Some((host, port)) = gateway_endpoint_for_probe(agent_config, expected_host, expected_port)
+    else {
+        checks.push(doctor_check(
+            "gateway_udp_probe",
+            DoctorState::Fail,
+            "gateway host/port could not be resolved for UDP probe",
+        ));
+        return;
+    };
+
+    let report = probe_gateway_udp(&host, port, timeout_secs);
+    let state = if report.sent {
+        DoctorState::Pass
+    } else {
+        DoctorState::Fail
+    };
+    checks.push(doctor_check("gateway_udp_probe", state, report.detail));
+}
+
+fn gateway_endpoint_for_probe(
+    agent_config: Option<&TunnelConfig>,
+    expected_host: Option<&str>,
+    expected_port: Option<u16>,
+) -> Option<(String, u16)> {
+    let host = expected_host
+        .map(str::to_owned)
+        .or_else(|| agent_config.map(|config| config.gateway.host.clone()))?;
+    let port = expected_port.or_else(|| agent_config.map(|config| config.gateway.port))?;
+    Some((host, port))
+}
+
+fn probe_gateway_udp(host: &str, port: u16, timeout_secs: f64) -> UdpProbeReport {
+    let timeout = Duration::from_secs_f64(timeout_secs.max(0.001));
+    let detail = match (host, port).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => match UdpSocket::bind(if addr.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            }) {
+                Ok(socket) => {
+                    let _ = socket.set_write_timeout(Some(timeout));
+                    match socket.connect(addr) {
+                        Ok(()) => match socket.send(&[0]) {
+                            Ok(bytes) => {
+                                return UdpProbeReport {
+                                    host: host.to_owned(),
+                                    port,
+                                    timeout_secs,
+                                    sent: true,
+                                    detail: format!(
+                                        "sent {bytes} byte UDP probe datagram to {host}:{port}; UDP reachability requires gateway-side packet counters for acknowledgement"
+                                    ),
+                                };
+                            }
+                            Err(error) => format!("failed to send UDP probe: {error}"),
+                        },
+                        Err(error) => format!("failed to connect UDP socket: {error}"),
+                    }
+                }
+                Err(error) => format!("failed to bind UDP probe socket: {error}"),
+            },
+            None => format!("gateway endpoint {host}:{port} resolved to no socket addresses"),
+        },
+        Err(error) => format!("failed to resolve gateway endpoint {host}:{port}: {error}"),
+    };
+
+    UdpProbeReport {
+        host: host.to_owned(),
+        port,
+        timeout_secs,
+        sent: false,
+        detail,
+    }
+}
+
+fn run_remote_smoke_test(args: RemoteSmokeTestArgs) -> Result<()> {
+    let mut checks = Vec::new();
+    let remote_check_args = RemoteCheckArgs {
+        profile: args.profile.clone(),
+        profile_file: args.profile_file.clone(),
+        peer_profile: args.peer_profile.clone(),
+        peer_profile_file: args.peer_profile_file.clone(),
+        gateway_host: args.gateway_host.clone(),
+        gateway_port: args.gateway_port,
+        udp_probe: false,
+        udp_probe_timeout_secs: args.udp_probe_timeout_secs,
+    };
+    let remote_check = build_remote_check_report(remote_check_args.clone())?;
+    push_lifecycle_check(
+        &mut checks,
+        "remote_check",
+        remote_check.overall != DoctorState::Fail,
+        "remote profile/config check is non-failing",
+        "remote profile/config check failed",
+    );
+
+    let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+        args.profile.clone(),
+        args.profile_file.clone(),
+    ))?;
+    push_lifecycle_check(
+        &mut checks,
+        "agent_side_profile",
+        connect_args.local_component == Some(ComponentSelection::Agent),
+        "smoke test is running from the agent-side profile",
+        "remote smoke-test must run from the agent-side host/profile so it can generate routed probe traffic",
+    );
+
+    let gateway_udp_probe =
+        gateway_udp_probe_for_remote_args(&remote_check_args, args.udp_probe_timeout_secs)?;
+    push_lifecycle_check(
+        &mut checks,
+        "gateway_udp_probe",
+        gateway_udp_probe.sent,
+        "gateway UDP endpoint accepted an outbound probe datagram",
+        gateway_udp_probe.detail.as_str(),
+    );
+
+    let doctor_args = resolve_doctor_args(DoctorArgs {
+        profile: Some(args.profile.clone()),
+        profile_file: args.profile_file.clone(),
+        session_file: args.session_file.clone(),
+        target: args.target.clone(),
+        probe_timeout_secs: args.probe_timeout_secs,
+        stale_after_secs: args.stale_after_secs,
+        post_probe_settle_secs: args.post_probe_settle_secs,
+    })?;
+    let session_file = doctor_args.session_file.clone();
+    let doctor = build_doctor_report(doctor_args)?;
+    push_lifecycle_check(
+        &mut checks,
+        "doctor",
+        doctor.overall != DoctorState::Fail,
+        "doctor is non-failing",
+        "doctor failed",
+    );
+
+    let soak = build_soak_report(SoakArgs {
+        session_file,
+        target: args.target.clone(),
+        count: args.count,
+        interval_secs: args.interval_secs,
+        probe_timeout_secs: args.probe_timeout_secs,
+        bounce_agent_at: None,
+        bounce_gateway_at: None,
+    })?;
+    push_lifecycle_check(
+        &mut checks,
+        "soak",
+        soak.sent > 0 && soak.received == soak.sent,
+        "soak completed with zero packet loss",
+        "soak reported packet loss",
+    );
+
+    let overall = if checks.iter().any(|check| check.state == DoctorState::Fail) {
+        DoctorState::Fail
+    } else if checks.iter().any(|check| check.state == DoctorState::Warn)
+        || remote_check.overall == DoctorState::Warn
+        || doctor.overall == DoctorState::Warn
+    {
+        DoctorState::Warn
+    } else {
+        DoctorState::Pass
+    };
+    let report = RemoteSmokeTestReport {
+        overall,
+        profile: args.profile,
+        peer_profile: args.peer_profile,
+        target: args.target,
+        remote_check,
+        gateway_udp_probe,
+        doctor,
+        soak,
         checks,
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
 
     if report.overall == DoctorState::Fail {
-        bail!("remote check failed");
+        bail!("remote smoke test failed");
     }
 
     Ok(())
+}
+
+fn gateway_udp_probe_for_remote_args(
+    args: &RemoteCheckArgs,
+    timeout_secs: f64,
+) -> Result<UdpProbeReport> {
+    let mut checks = Vec::new();
+    let primary = resolve_connect_args(ConnectArgs::for_profile(
+        args.profile.clone(),
+        args.profile_file.clone(),
+    ))?;
+    let peer = if let Some(peer_profile) = args.peer_profile.clone() {
+        Some(resolve_connect_args(ConnectArgs::for_profile(
+            peer_profile,
+            args.peer_profile_file
+                .clone()
+                .unwrap_or_else(|| args.profile_file.clone()),
+        ))?)
+    } else {
+        None
+    };
+    let (agent_config_path, _) = remote_check_config_paths(&primary, peer.as_ref(), &mut checks);
+    let agent_config = read_optional_json::<TunnelConfig>(&agent_config_path)?;
+    let (host, port) = gateway_endpoint_for_probe(
+        agent_config.as_ref(),
+        args.gateway_host.as_deref(),
+        args.gateway_port,
+    )
+    .ok_or_else(|| anyhow!("gateway host/port could not be resolved for UDP probe"))?;
+    Ok(probe_gateway_udp(&host, port, timeout_secs))
 }
 
 fn push_lifecycle_check(
@@ -3499,6 +3883,12 @@ fn build_doctor_report(args: DoctorArgs) -> Result<DoctorReport> {
 }
 
 fn run_soak(args: SoakArgs) -> Result<()> {
+    let report = build_soak_report(args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn build_soak_report(args: SoakArgs) -> Result<SoakReport> {
     let mut session = load_manifest(&args.session_file)?;
     let start = Instant::now();
     let agent_before = read_optional_json::<RuntimeStatus>(&session.agent_status_file)?;
@@ -3577,7 +3967,7 @@ fn run_soak(args: SoakArgs) -> Result<()> {
         gateway_after.as_ref(),
     );
 
-    let report = SoakReport {
+    Ok(SoakReport {
         target: args.target,
         probe_timeout_secs: args.probe_timeout_secs,
         sent,
@@ -3614,10 +4004,7 @@ fn run_soak(args: SoakArgs) -> Result<()> {
         transport_active_but_probe_failed,
         likely_failure_domain,
         elapsed_secs: start.elapsed().as_secs_f64(),
-    };
-
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    })
 }
 
 fn run_repair_test(args: RepairTestArgs) -> Result<()> {
@@ -7114,6 +7501,59 @@ mod tests {
         assert!(build_connect_readiness(&imported_connect).ready);
         assert!(imported_connect.agent_config.exists());
 
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_check_validates_imported_agent_gateway_profile_pair() -> Result<()> {
+        let root = test_root("remote-check-imported-pair")?;
+        let mut args = test_login_args(&root, true);
+        args.gateway_host = String::from("203.0.113.10");
+        ensure_local_configs_for_login(&args)?;
+        write_profile_for_login(&args)?;
+
+        let out_dir = root.join("bundles");
+        run_profile_export(ProfileExportArgs {
+            profile: args.profile.clone(),
+            profile_file: args.profile_file.clone(),
+            out_dir: out_dir.clone(),
+            force: true,
+        })?;
+
+        let agent_profile_file = root.join("agent-profiles.json");
+        let gateway_profile_file = root.join("gateway-profiles.json");
+        run_profile_import(ProfileImportArgs {
+            bundle_dir: out_dir.join("agent"),
+            profile_file: agent_profile_file.clone(),
+            install_dir: root.join("agent-install"),
+            profile: Some(String::from("agent-side")),
+            force: true,
+        })?;
+        run_profile_import(ProfileImportArgs {
+            bundle_dir: out_dir.join("gateway"),
+            profile_file: gateway_profile_file.clone(),
+            install_dir: root.join("gateway-install"),
+            profile: Some(String::from("gateway-side")),
+            force: true,
+        })?;
+
+        let report = build_remote_check_report(RemoteCheckArgs {
+            profile: String::from("agent-side"),
+            profile_file: agent_profile_file,
+            peer_profile: Some(String::from("gateway-side")),
+            peer_profile_file: Some(gateway_profile_file),
+            gateway_host: Some(String::from("203.0.113.10")),
+            gateway_port: Some(7000),
+            udp_probe: false,
+            udp_probe_timeout_secs: 0.1,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Pass);
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.name == "profile_pair" && check.state == DoctorState::Pass));
         remove_test_root(root);
         Ok(())
     }
