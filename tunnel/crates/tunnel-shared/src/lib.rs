@@ -102,6 +102,15 @@ pub struct PacketPathTelemetry {
 pub struct AgentRuntimeState {
     pub tunnel_interface: String,
     pub destination_cidrs: Vec<String>,
+    #[serde(default)]
+    pub rp_filter: Option<AgentRpFilterState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRpFilterState {
+    pub all: Option<u8>,
+    pub default: Option<u8>,
+    pub tunnel_interface: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

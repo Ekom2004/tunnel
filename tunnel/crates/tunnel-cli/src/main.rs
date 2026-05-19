@@ -4321,6 +4321,7 @@ fn write_remote_agent_owned_files(args: &ConnectArgs) -> Result<()> {
         &AgentRuntimeState {
             tunnel_interface: String::from("utun-remote-agent"),
             destination_cidrs: vec![String::from("1.1.1.0/24")],
+            rp_filter: None,
         },
     )?;
     write_json_file(
@@ -5944,6 +5945,24 @@ fn repair_agent_routes(session: &SessionManifest, supervisor_log: &mut File) -> 
         repaired = true;
     }
 
+    #[cfg(target_os = "linux")]
+    if !linux_agent_rp_filter_is_loose(&state.tunnel_interface)? {
+        for command in linux_rp_filter_loose_commands(&state.tunnel_interface) {
+            run_command_vec("agent rp_filter repair", command)?;
+        }
+        emit_supervisor_event(
+            supervisor_log,
+            "agent_rp_filter_repaired",
+            Some(ComponentSelection::Agent),
+            format!(
+                "rp_filter set to loose mode for all/default/{}",
+                state.tunnel_interface
+            ),
+            Some(session),
+        )?;
+        repaired = true;
+    }
+
     Ok(repaired)
 }
 
@@ -5961,6 +5980,11 @@ fn agent_routes_are_healthy(session: &SessionManifest) -> Result<bool> {
 
     #[cfg(target_os = "linux")]
     if !command_succeeds(&linux_mss_clamp_command("-C"))? {
+        return Ok(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    if !linux_agent_rp_filter_is_loose(&state.tunnel_interface)? {
         return Ok(false);
     }
 
@@ -6546,6 +6570,10 @@ fn check_agent_os_rules(
                     command.join(" ")
                 ),
             )),
+        }
+
+        for scope in ["all", "default", agent_state.tunnel_interface.as_str()] {
+            check_linux_rp_filter_scope(scope, checks);
         }
     }
 
@@ -7186,6 +7214,74 @@ fn linux_mss_clamp_command(operation: &str) -> Vec<String> {
         String::from("--set-mss"),
         String::from(TCP_MSS_CLAMP),
     ]
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rp_filter_loose_commands(interface_name: &str) -> Vec<Vec<String>> {
+    ["all", "default", interface_name]
+        .into_iter()
+        .map(|scope| linux_sysctl_command(&format!("net.ipv4.conf.{scope}.rp_filter"), "2"))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sysctl_command(key: &str, value: &str) -> Vec<String> {
+    vec![
+        String::from("sysctl"),
+        String::from("-w"),
+        format!("{key}={value}"),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn linux_agent_rp_filter_is_loose(interface_name: &str) -> Result<bool> {
+    for scope in ["all", "default", interface_name] {
+        if linux_rp_filter_value(scope)? != 2 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rp_filter_value(scope: &str) -> Result<u8> {
+    let key = format!("net.ipv4.conf.{scope}.rp_filter");
+    let output = Command::new("sysctl")
+        .args(["-n", &key])
+        .output()
+        .with_context(|| format!("failed to query {key}"))?;
+    if !output.status.success() {
+        bail!(
+            "failed to query {key}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u8>()
+        .with_context(|| format!("invalid {key} value"))
+}
+
+#[cfg(target_os = "linux")]
+fn check_linux_rp_filter_scope(scope: &str, checks: &mut Vec<DoctorCheck>) {
+    let check_name = format!("agent_rp_filter_{}", scope.replace('.', "_"));
+    match linux_rp_filter_value(scope) {
+        Ok(2) => checks.push(doctor_check(
+            check_name,
+            DoctorState::Pass,
+            format!("net.ipv4.conf.{scope}.rp_filter is loose mode"),
+        )),
+        Ok(value) => checks.push(doctor_check(
+            check_name,
+            DoctorState::Fail,
+            format!("net.ipv4.conf.{scope}.rp_filter={value}, expected 2"),
+        )),
+        Err(error) => checks.push(doctor_check(
+            check_name,
+            DoctorState::Fail,
+            format!("failed to inspect net.ipv4.conf.{scope}.rp_filter: {error:#}"),
+        )),
+    }
 }
 
 fn command_succeeds(command: &[String]) -> Result<bool> {

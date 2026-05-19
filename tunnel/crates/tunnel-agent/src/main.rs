@@ -16,9 +16,10 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, ValueEnum};
 use tun::AbstractDevice;
 use tunnel_shared::{
-    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentRuntimeState,
-    AgentToGateway, ComponentKind, GatewayToAgent, HealthState, PacketPathTelemetry, RuntimeStatus,
-    SocketEndpoint, TransportKind, TunnelConfig, TunnelPhase, WireGuardConfig,
+    decode_key_32, now_unix_secs, read_json_line, write_json_line, AgentRpFilterState,
+    AgentRuntimeState, AgentToGateway, ComponentKind, GatewayToAgent, HealthState,
+    PacketPathTelemetry, RuntimeStatus, SocketEndpoint, TransportKind, TunnelConfig, TunnelPhase,
+    WireGuardConfig,
 };
 
 #[derive(Debug, Parser)]
@@ -143,8 +144,7 @@ fn run_cleanup_only(cli: &Cli, config: &TunnelConfig) -> Result<()> {
         return Ok(());
     }
 
-    let commands =
-        build_agent_route_cleanup_commands(&state.tunnel_interface, &state.destination_cidrs);
+    let commands = build_agent_route_cleanup_commands(&state);
     execute_commands(cli.tun.route_mode, "agent route cleanup", &commands)?;
 
     if cli.tun.route_mode == SystemCommandMode::Apply {
@@ -744,6 +744,7 @@ fn save_agent_state(
     let state = AgentRuntimeState {
         tunnel_interface: tunnel_interface.to_owned(),
         destination_cidrs: destination_cidrs.to_vec(),
+        rp_filter: query_linux_rp_filter_state(tunnel_interface),
     };
     fs::write(state_file, serde_json::to_string_pretty(&state)?)?;
     Ok(())
@@ -864,6 +865,7 @@ fn build_agent_route_commands_for_os(
 ) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     if target_os == TargetOs::Linux {
+        commands.extend(linux_rp_filter_loose_commands(interface_name));
         commands.push(linux_mss_clamp_command("-A"));
     }
     commands.extend(destination_cidrs.iter().map(|cidr| match target_os {
@@ -892,14 +894,12 @@ fn build_agent_route_commands_for_os(
     commands
 }
 
-fn build_agent_route_cleanup_commands(
-    interface_name: &str,
-    destination_cidrs: &[String],
-) -> Vec<Vec<String>> {
+fn build_agent_route_cleanup_commands(state: &AgentRuntimeState) -> Vec<Vec<String>> {
     build_agent_route_cleanup_commands_for_os(
         current_target_os(),
-        interface_name,
-        destination_cidrs,
+        &state.tunnel_interface,
+        &state.destination_cidrs,
+        state.rp_filter.as_ref(),
     )
 }
 
@@ -907,6 +907,7 @@ fn build_agent_route_cleanup_commands_for_os(
     target_os: TargetOs,
     interface_name: &str,
     destination_cidrs: &[String],
+    rp_filter: Option<&AgentRpFilterState>,
 ) -> Vec<Vec<String>> {
     let mut commands = Vec::new();
     if target_os == TargetOs::Linux {
@@ -933,7 +934,50 @@ fn build_agent_route_cleanup_commands_for_os(
             format!("manual route cleanup required for {cidr} via {interface_name}"),
         ],
     }));
+    if target_os == TargetOs::Linux {
+        commands.extend(linux_rp_filter_restore_commands(interface_name, rp_filter));
+    }
     commands
+}
+
+fn linux_rp_filter_loose_commands(interface_name: &str) -> Vec<Vec<String>> {
+    ["all", "default", interface_name]
+        .into_iter()
+        .map(|scope| linux_sysctl_command(&format!("net.ipv4.conf.{scope}.rp_filter"), "2"))
+        .collect()
+}
+
+fn linux_rp_filter_restore_commands(
+    interface_name: &str,
+    rp_filter: Option<&AgentRpFilterState>,
+) -> Vec<Vec<String>> {
+    let Some(rp_filter) = rp_filter else {
+        return Vec::new();
+    };
+
+    [
+        ("all", rp_filter.all),
+        ("default", rp_filter.default),
+        (interface_name, rp_filter.tunnel_interface),
+    ]
+    .into_iter()
+    .filter_map(|(scope, value)| {
+        value.map(|value| {
+            linux_sysctl_command(
+                &format!("net.ipv4.conf.{scope}.rp_filter"),
+                &value.to_string(),
+            )
+        })
+    })
+    .collect()
+}
+
+fn linux_sysctl_command(key: &str, value: &str) -> Vec<String> {
+    vec![
+        String::from("sysctl"),
+        String::from("-w"),
+        format!("{key}={value}"),
+    ]
 }
 
 fn linux_mss_clamp_command(operation: &str) -> Vec<String> {
@@ -953,6 +997,38 @@ fn linux_mss_clamp_command(operation: &str) -> Vec<String> {
         String::from("--set-mss"),
         String::from(TCP_MSS_CLAMP),
     ]
+}
+
+fn query_linux_rp_filter_state(interface_name: &str) -> Option<AgentRpFilterState> {
+    #[cfg(target_os = "linux")]
+    {
+        let state = AgentRpFilterState {
+            all: query_linux_rp_filter_value("all"),
+            default: query_linux_rp_filter_value("default"),
+            tunnel_interface: query_linux_rp_filter_value(interface_name),
+        };
+        if state.all.is_some() || state.default.is_some() || state.tunnel_interface.is_some() {
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = interface_name;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn query_linux_rp_filter_value(scope: &str) -> Option<u8> {
+    let key = format!("net.ipv4.conf.{scope}.rp_filter");
+    let output = Command::new("sysctl").args(["-n", &key]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 fn execute_commands(mode: SystemCommandMode, label: &str, commands: &[Vec<String>]) -> Result<()> {
@@ -1077,6 +1153,9 @@ mod tests {
         assert_eq!(
             build_agent_route_commands_for_os(TargetOs::Linux, "tun0", &cidrs),
             vec![
+                vec!["sysctl", "-w", "net.ipv4.conf.all.rp_filter=2"],
+                vec!["sysctl", "-w", "net.ipv4.conf.default.rp_filter=2"],
+                vec!["sysctl", "-w", "net.ipv4.conf.tun0.rp_filter=2"],
                 vec![
                     "iptables",
                     "-t",
@@ -1100,8 +1179,18 @@ mod tests {
             .map(string_vec)
             .collect::<Vec<_>>()
         );
+        let rp_filter = AgentRpFilterState {
+            all: Some(1),
+            default: Some(0),
+            tunnel_interface: Some(1),
+        };
         assert_eq!(
-            build_agent_route_cleanup_commands_for_os(TargetOs::Linux, "tun0", &cidrs),
+            build_agent_route_cleanup_commands_for_os(
+                TargetOs::Linux,
+                "tun0",
+                &cidrs,
+                Some(&rp_filter),
+            ),
             vec![
                 vec![
                     "iptables",
@@ -1121,6 +1210,9 @@ mod tests {
                 ],
                 vec!["ip", "route", "del", "1.1.1.0/24", "dev", "tun0"],
                 vec!["ip", "route", "del", "10.0.0.0/8", "dev", "tun0"],
+                vec!["sysctl", "-w", "net.ipv4.conf.all.rp_filter=1"],
+                vec!["sysctl", "-w", "net.ipv4.conf.default.rp_filter=0"],
+                vec!["sysctl", "-w", "net.ipv4.conf.tun0.rp_filter=1"],
             ]
             .into_iter()
             .map(string_vec)
@@ -1145,7 +1237,7 @@ mod tests {
             ])]
         );
         assert_eq!(
-            build_agent_route_cleanup_commands_for_os(TargetOs::Macos, "utun7", &cidrs),
+            build_agent_route_cleanup_commands_for_os(TargetOs::Macos, "utun7", &cidrs, None),
             vec![string_vec(vec![
                 "route",
                 "-n",
