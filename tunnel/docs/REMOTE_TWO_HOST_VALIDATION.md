@@ -33,6 +33,8 @@ tunnel-cli remote-deploy remote-prod \
   --gateway-ssh-host <gateway-ssh-target> \
   --require-host-preflight \
   --report-file ./deploy-report.json \
+  --ssh-timeout-secs 10 \
+  --step-timeout-secs 120 \
   --force
 ```
 
@@ -48,7 +50,7 @@ tunnel-cli remote-deploy remote-prod \
   --force
 ```
 
-`remote-deploy` generates/reuses the plan, copies both side bundles over `scp`, imports the profiles on each host over `ssh`, starts gateway then agent, and runs the agent-side smoke test. Remote privileged commands use `sudo -n`, so hosts must already allow non-interactive sudo for the tunnel operator. With `--dry-run`, it returns the same ordered step report with planned commands marked as not executed. Use `--report-file` to persist the exact JSON deploy artifact for support and debugging.
+`remote-deploy` generates/reuses the plan, copies both side bundles over `scp`, imports the profiles on each host over `ssh`, starts gateway then agent, and runs the agent-side smoke test. Remote privileged commands use `sudo -n`, so hosts must already allow non-interactive sudo for the tunnel operator. With `--dry-run`, it returns the same ordered step report with planned commands marked as not executed. Use `--report-file` to persist the exact JSON deploy artifact for support and debugging. SSH/SCP commands use `--ssh-timeout-secs` as their connect timeout, and every remote step is killed after `--step-timeout-secs` instead of hanging indefinitely.
 
 Use `--require-host-preflight` to stop before mutation unless both hosts pass basic capability checks. It verifies `tunnel-cli`, non-interactive sudo, `/dev/net/tun`, `ip`, gateway `iptables`, gateway UDP port availability when `ss` or `netstat` exists, and agent routeability to the gateway host.
 

@@ -631,6 +631,10 @@ struct RemoteDeployArgs {
     ssh_bin: String,
     #[arg(long, default_value = "scp")]
     scp_bin: String,
+    #[arg(long, default_value_t = 10)]
+    ssh_timeout_secs: u64,
+    #[arg(long, default_value_t = 120)]
+    step_timeout_secs: u64,
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
@@ -996,6 +1000,8 @@ struct RemoteDeployReport {
     gateway_host: String,
     dry_run: bool,
     require_host_preflight: bool,
+    ssh_timeout_secs: u64,
+    step_timeout_secs: u64,
     rollback_on_fail: bool,
     rollback_attempted: bool,
     plan: RemotePlanReport,
@@ -1416,12 +1422,19 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
         &args.plan.gateway_remote_bundle_dir,
         "gateway_remote_bundle_dir",
     )?;
+    if args.ssh_timeout_secs == 0 {
+        bail!("--ssh-timeout-secs must be greater than zero");
+    }
+    if args.step_timeout_secs == 0 {
+        bail!("--step-timeout-secs must be greater than zero");
+    }
 
     let plan = build_remote_plan_report(args.plan.clone())?;
     let mut steps = Vec::new();
     let rollback_on_fail = !args.no_rollback;
     let dry_run = args.dry_run;
     let require_host_preflight = args.require_host_preflight;
+    let step_timeout = Duration::from_secs(args.step_timeout_secs);
     let mut gateway_started = false;
     let mut agent_started = false;
     steps.push(RemoteDeployStep {
@@ -1441,6 +1454,7 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
             Some(gateway_host.clone()),
             remote_gateway_host_preflight_command(&args)?,
             dry_run,
+            step_timeout,
         ));
     }
     if require_host_preflight && steps.iter().all(|step| step.state != DoctorState::Fail) {
@@ -1449,6 +1463,7 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
             Some(agent_host.clone()),
             remote_agent_host_preflight_command(&args)?,
             dry_run,
+            step_timeout,
         ));
     }
 
@@ -1460,8 +1475,10 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                 &args.ssh_bin,
                 &gateway_host,
                 &args.plan.gateway_remote_bundle_dir,
+                args.ssh_timeout_secs,
             )?,
             dry_run,
+            step_timeout,
         ));
     }
     if steps.iter().all(|step| step.state != DoctorState::Fail) {
@@ -1473,8 +1490,10 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                 &plan.gateway_bundle,
                 &gateway_host,
                 &args.plan.gateway_remote_bundle_dir,
+                args.ssh_timeout_secs,
             ),
             dry_run,
+            step_timeout,
         ));
     }
     if steps.iter().all(|step| step.state != DoctorState::Fail) {
@@ -1485,8 +1504,10 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                 &args.ssh_bin,
                 &agent_host,
                 &args.plan.agent_remote_bundle_dir,
+                args.ssh_timeout_secs,
             )?,
             dry_run,
+            step_timeout,
         ));
     }
     if steps.iter().all(|step| step.state != DoctorState::Fail) {
@@ -1498,16 +1519,24 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                 &plan.agent_bundle,
                 &agent_host,
                 &args.plan.agent_remote_bundle_dir,
+                args.ssh_timeout_secs,
             ),
             dry_run,
+            step_timeout,
         ));
     }
     if steps.iter().all(|step| step.state != DoctorState::Fail) {
         steps.push(build_remote_deploy_step(
             "gateway_import",
             Some(gateway_host.clone()),
-            deploy_ssh_command(&args.ssh_bin, &gateway_host, &plan.commands.gateway_import),
+            deploy_ssh_command(
+                &args.ssh_bin,
+                &gateway_host,
+                &plan.commands.gateway_import,
+                args.ssh_timeout_secs,
+            ),
             dry_run,
+            step_timeout,
         ));
     }
     if steps.iter().all(|step| step.state != DoctorState::Fail) {
@@ -1518,8 +1547,10 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                 &args.ssh_bin,
                 &gateway_host,
                 &remote_gateway_connect_command(&args.plan),
+                args.ssh_timeout_secs,
             ),
             dry_run,
+            step_timeout,
         );
         gateway_started = !dry_run && step.state == DoctorState::Pass;
         steps.push(step);
@@ -1528,8 +1559,14 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
         steps.push(build_remote_deploy_step(
             "agent_import",
             Some(agent_host.clone()),
-            deploy_ssh_command(&args.ssh_bin, &agent_host, &plan.commands.agent_import),
+            deploy_ssh_command(
+                &args.ssh_bin,
+                &agent_host,
+                &plan.commands.agent_import,
+                args.ssh_timeout_secs,
+            ),
             dry_run,
+            step_timeout,
         ));
     }
     if steps.iter().all(|step| step.state != DoctorState::Fail) {
@@ -1540,8 +1577,10 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                 &args.ssh_bin,
                 &agent_host,
                 &remote_agent_connect_command(&args.plan),
+                args.ssh_timeout_secs,
             ),
             dry_run,
+            step_timeout,
         );
         agent_started = !dry_run && step.state == DoctorState::Pass;
         steps.push(step);
@@ -1554,8 +1593,10 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                 &args.ssh_bin,
                 &agent_host,
                 &remote_agent_smoke_test_command(&args.plan),
+                args.ssh_timeout_secs,
             ),
             dry_run,
+            step_timeout,
         ));
     }
 
@@ -1571,8 +1612,10 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                     &args.ssh_bin,
                     &agent_host,
                     &remote_agent_disconnect_command(&args.plan),
+                    args.ssh_timeout_secs,
                 ),
                 dry_run,
+                step_timeout,
             ));
         }
         if gateway_started {
@@ -1583,8 +1626,10 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
                     &args.ssh_bin,
                     &gateway_host,
                     &remote_gateway_disconnect_command(&args.plan),
+                    args.ssh_timeout_secs,
                 ),
                 dry_run,
+                step_timeout,
             ));
         }
     }
@@ -1604,6 +1649,8 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
         gateway_host,
         dry_run,
         require_host_preflight,
+        ssh_timeout_secs: args.ssh_timeout_secs,
+        step_timeout_secs: args.step_timeout_secs,
         rollback_on_fail,
         rollback_attempted,
         plan,
@@ -1854,6 +1901,7 @@ fn remote_prepare_bundle_command(
     ssh_bin: &str,
     host: &str,
     bundle_dir: &Path,
+    ssh_timeout_secs: u64,
 ) -> Result<Vec<String>> {
     let parent = bundle_dir
         .parent()
@@ -1863,7 +1911,12 @@ fn remote_prepare_bundle_command(
         shell_quote(&path_display(bundle_dir)),
         shell_quote(&path_display(parent))
     );
-    Ok(deploy_ssh_command(ssh_bin, host, &remote_command))
+    Ok(deploy_ssh_command(
+        ssh_bin,
+        host,
+        &remote_command,
+        ssh_timeout_secs,
+    ))
 }
 
 fn deploy_scp_command(
@@ -1871,18 +1924,32 @@ fn deploy_scp_command(
     local_dir: &Path,
     host: &str,
     remote_dir: &Path,
+    ssh_timeout_secs: u64,
 ) -> Vec<String> {
     vec![
         scp_bin.to_owned(),
+        String::from("-o"),
+        format!("ConnectTimeout={ssh_timeout_secs}"),
+        String::from("-o"),
+        String::from("BatchMode=yes"),
         String::from("-r"),
         path_display(local_dir),
         format!("{host}:{}", path_display(remote_dir)),
     ]
 }
 
-fn deploy_ssh_command(ssh_bin: &str, host: &str, remote_command: &str) -> Vec<String> {
+fn deploy_ssh_command(
+    ssh_bin: &str,
+    host: &str,
+    remote_command: &str,
+    ssh_timeout_secs: u64,
+) -> Vec<String> {
     vec![
         ssh_bin.to_owned(),
+        String::from("-o"),
+        format!("ConnectTimeout={ssh_timeout_secs}"),
+        String::from("-o"),
+        String::from("BatchMode=yes"),
         host.to_owned(),
         remote_command.to_owned(),
     ]
@@ -1901,7 +1968,12 @@ fn remote_gateway_host_preflight_command(args: &RemoteDeployArgs) -> Result<Vec<
             gateway_udp_port_available_script(args.plan.gateway_port)
         ))
     );
-    Ok(deploy_ssh_command(&args.ssh_bin, host, &command))
+    Ok(deploy_ssh_command(
+        &args.ssh_bin,
+        host,
+        &command,
+        args.ssh_timeout_secs,
+    ))
 }
 
 fn remote_agent_host_preflight_command(args: &RemoteDeployArgs) -> Result<Vec<String>> {
@@ -1917,7 +1989,12 @@ fn remote_agent_host_preflight_command(args: &RemoteDeployArgs) -> Result<Vec<St
             shell_quote(&args.plan.gateway_host)
         ))
     );
-    Ok(deploy_ssh_command(&args.ssh_bin, host, &command))
+    Ok(deploy_ssh_command(
+        &args.ssh_bin,
+        host,
+        &command,
+        args.ssh_timeout_secs,
+    ))
 }
 
 fn gateway_udp_port_available_script(port: u16) -> String {
@@ -1994,7 +2071,12 @@ fn remote_agent_smoke_test_command(args: &RemotePlanArgs) -> String {
     ])
 }
 
-fn run_command_step(name: &str, host: Option<String>, command: Vec<String>) -> RemoteDeployStep {
+fn run_command_step(
+    name: &str,
+    host: Option<String>,
+    command: Vec<String>,
+    timeout: Duration,
+) -> RemoteDeployStep {
     let command_text = render_command(command.clone());
     if command.is_empty() {
         return RemoteDeployStep {
@@ -2009,18 +2091,86 @@ fn run_command_step(name: &str, host: Option<String>, command: Vec<String>) -> R
         };
     }
 
-    match Command::new(&command[0]).args(&command[1..]).output() {
-        Ok(output) => remote_deploy_step_from_output(name, host, command_text, output),
-        Err(error) => RemoteDeployStep {
-            name: name.to_owned(),
-            host,
-            command: command_text,
-            state: DoctorState::Fail,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: String::new(),
-            detail: format!("failed to execute command: {error}"),
-        },
+    let mut child = match Command::new(&command[0])
+        .args(&command[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return RemoteDeployStep {
+                name: name.to_owned(),
+                host,
+                command: command_text,
+                state: DoctorState::Fail,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                detail: format!("failed to execute command: {error}"),
+            };
+        }
+    };
+
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return match child.wait_with_output() {
+                    Ok(output) => remote_deploy_step_from_output(name, host, command_text, output),
+                    Err(error) => RemoteDeployStep {
+                        name: name.to_owned(),
+                        host,
+                        command: command_text,
+                        state: DoctorState::Fail,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        detail: format!("failed to collect command output: {error}"),
+                    },
+                };
+            }
+            Ok(None) if started_at.elapsed() >= timeout => {
+                let kill_result = child.kill();
+                return match child.wait_with_output() {
+                    Ok(output) => remote_deploy_timeout_step(
+                        name,
+                        host,
+                        command_text,
+                        timeout,
+                        output,
+                        kill_result.err(),
+                    ),
+                    Err(error) => RemoteDeployStep {
+                        name: name.to_owned(),
+                        host,
+                        command: command_text,
+                        state: DoctorState::Fail,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        detail: format!(
+                            "command timed out after {:.3}s and output collection failed: {error}",
+                            timeout.as_secs_f64()
+                        ),
+                    },
+                };
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(error) => {
+                let _ = child.kill();
+                return RemoteDeployStep {
+                    name: name.to_owned(),
+                    host,
+                    command: command_text,
+                    state: DoctorState::Fail,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    detail: format!("failed while waiting for command: {error}"),
+                };
+            }
+        }
     }
 }
 
@@ -2029,11 +2179,12 @@ fn build_remote_deploy_step(
     host: Option<String>,
     command: Vec<String>,
     dry_run: bool,
+    timeout: Duration,
 ) -> RemoteDeployStep {
     if dry_run {
         return planned_remote_deploy_step(name, host, command);
     }
-    run_command_step(name, host, command)
+    run_command_step(name, host, command, timeout)
 }
 
 fn planned_remote_deploy_step(
@@ -2081,6 +2232,40 @@ fn remote_deploy_step_from_output(
         command,
         state,
         exit_code,
+        stdout,
+        stderr,
+        detail,
+    }
+}
+
+fn remote_deploy_timeout_step(
+    name: &str,
+    host: Option<String>,
+    command: String,
+    timeout: Duration,
+    output: Output,
+    kill_error: Option<std::io::Error>,
+) -> RemoteDeployStep {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let detail = if let Some(error) = kill_error {
+        format!(
+            "command timed out after {:.3}s; kill returned error: {error}",
+            timeout.as_secs_f64()
+        )
+    } else {
+        format!(
+            "command timed out after {:.3}s; process was killed",
+            timeout.as_secs_f64()
+        )
+    };
+
+    RemoteDeployStep {
+        name: name.to_owned(),
+        host,
+        command,
+        state: DoctorState::Fail,
+        exit_code: None,
         stdout,
         stderr,
         detail,
@@ -8514,6 +8699,8 @@ mod tests {
             },
             ssh_bin: String::from("true"),
             scp_bin: String::from("true"),
+            ssh_timeout_secs: 10,
+            step_timeout_secs: 120,
             dry_run: false,
             require_host_preflight: false,
             report_file: None,
@@ -8522,12 +8709,16 @@ mod tests {
 
         assert_eq!(report.overall, DoctorState::Pass);
         assert!(!report.dry_run);
+        assert_eq!(report.ssh_timeout_secs, 10);
+        assert_eq!(report.step_timeout_secs, 120);
         assert_eq!(report.agent_host, "agent.example");
         assert_eq!(report.gateway_host, "gateway.example");
         assert!(report
             .steps
             .iter()
-            .any(|step| step.name == "copy_agent_bundle" && step.state == DoctorState::Pass));
+            .any(|step| step.name == "copy_agent_bundle"
+                && step.state == DoctorState::Pass
+                && step.command.contains("ConnectTimeout=10")));
         assert!(report
             .steps
             .iter()
@@ -8542,6 +8733,66 @@ mod tests {
                 && step
                     .command
                     .contains("sudo -n tunnel-cli remote-smoke-test agent-prod")));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_deploy_times_out_hung_remote_step() -> Result<()> {
+        let root = test_root("remote-deploy-timeout")?;
+        let fake_bin = root.join("sleepy-ssh-scp");
+        write_sleeping_remote_deploy_binary(&fake_bin, 5)?;
+
+        let report = build_remote_deploy_report(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: path_display(&fake_bin),
+            scp_bin: path_display(&fake_bin),
+            ssh_timeout_secs: 1,
+            step_timeout_secs: 1,
+            dry_run: false,
+            require_host_preflight: false,
+            report_file: None,
+            no_rollback: false,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Fail);
+        assert_eq!(report.ssh_timeout_secs, 1);
+        assert_eq!(report.step_timeout_secs, 1);
+        assert!(report.steps.iter().any(|step| {
+            step.name == "gateway_prepare_bundle_dir"
+                && step.state == DoctorState::Fail
+                && step.exit_code.is_none()
+                && step.detail.contains("timed out")
+        }));
+        assert!(!report
+            .steps
+            .iter()
+            .any(|step| step.name == "copy_gateway_bundle"));
         remove_test_root(root);
         Ok(())
     }
@@ -8581,6 +8832,8 @@ mod tests {
             },
             ssh_bin: path_display(&fake_bin),
             scp_bin: path_display(&fake_bin),
+            ssh_timeout_secs: 10,
+            step_timeout_secs: 120,
             dry_run: false,
             require_host_preflight: false,
             report_file: None,
@@ -8645,6 +8898,8 @@ mod tests {
             },
             ssh_bin: path_display(&fake_bin),
             scp_bin: path_display(&fake_bin),
+            ssh_timeout_secs: 10,
+            step_timeout_secs: 120,
             dry_run: false,
             require_host_preflight: false,
             report_file: None,
@@ -8696,6 +8951,8 @@ mod tests {
             },
             ssh_bin: path_display(&missing_bin),
             scp_bin: path_display(&missing_bin),
+            ssh_timeout_secs: 10,
+            step_timeout_secs: 120,
             dry_run: true,
             require_host_preflight: false,
             report_file: None,
@@ -8764,6 +9021,8 @@ mod tests {
             },
             ssh_bin: path_display(&missing_bin),
             scp_bin: path_display(&missing_bin),
+            ssh_timeout_secs: 10,
+            step_timeout_secs: 120,
             dry_run: true,
             require_host_preflight: true,
             report_file: Some(report_file.clone()),
@@ -8820,6 +9079,8 @@ mod tests {
             },
             ssh_bin: path_display(&fake_bin),
             scp_bin: path_display(&fake_bin),
+            ssh_timeout_secs: 10,
+            step_timeout_secs: 120,
             dry_run: false,
             require_host_preflight: true,
             report_file: None,
@@ -8876,6 +9137,8 @@ mod tests {
             },
             ssh_bin: path_display(&missing_bin),
             scp_bin: path_display(&missing_bin),
+            ssh_timeout_secs: 10,
+            step_timeout_secs: 120,
             dry_run: true,
             require_host_preflight: true,
             report_file: None,
@@ -9063,6 +9326,19 @@ mod tests {
             "#!/bin/sh\ncase \"$*\" in\n  *{}*) exit 42 ;;\n  *) exit 0 ;;\nesac\n",
             fail_when_contains
         );
+        fs::write(path, script)?;
+        let mut permissions = fs::metadata(path)?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)?;
+        }
+        Ok(())
+    }
+
+    fn write_sleeping_remote_deploy_binary(path: &Path, sleep_secs: u64) -> Result<()> {
+        let script = format!("#!/bin/sh\nsleep {sleep_secs}\nexit 0\n");
         fs::write(path, script)?;
         let mut permissions = fs::metadata(path)?.permissions();
         #[cfg(unix)]
