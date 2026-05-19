@@ -23,6 +23,33 @@ tunnel-cli remote-plan remote-prod \
 
 The plan emits JSON containing the generated bundle paths plus exact copy, import, connect, `remote-check`, and `remote-smoke-test` commands.
 
+To execute the full plan from the operator machine:
+
+```sh
+tunnel-cli remote-deploy remote-prod \
+  --gateway-host <gateway-public-or-private-ip> \
+  --out-dir /tmp/tunnel-bundles \
+  --agent-ssh-host <agent-ssh-target> \
+  --gateway-ssh-host <gateway-ssh-target> \
+  --force
+```
+
+Audit the exact deploy sequence before touching hosts:
+
+```sh
+tunnel-cli remote-deploy remote-prod \
+  --gateway-host <gateway-public-or-private-ip> \
+  --out-dir /tmp/tunnel-bundles \
+  --agent-ssh-host <agent-ssh-target> \
+  --gateway-ssh-host <gateway-ssh-target> \
+  --dry-run \
+  --force
+```
+
+`remote-deploy` generates/reuses the plan, copies both side bundles over `scp`, imports the profiles on each host over `ssh`, starts gateway then agent, and runs the agent-side smoke test. Remote privileged commands use `sudo -n`, so hosts must already allow non-interactive sudo for the tunnel operator. With `--dry-run`, it returns the same ordered step report with planned commands marked as not executed.
+
+Rollback is enabled by default. If a later step fails after gateway or agent startup, `remote-deploy` runs remote `disconnect` for the started side(s) and includes those rollback steps in the JSON result. Use `--no-rollback` when you intentionally want to leave failed state in place for manual debugging.
+
 The underlying manual flow is:
 
 ```sh

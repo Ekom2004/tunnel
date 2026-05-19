@@ -90,6 +90,8 @@ enum CommandKind {
     #[command(hide = true)]
     RemotePlan(RemotePlanArgs),
     #[command(hide = true)]
+    RemoteDeploy(RemoteDeployArgs),
+    #[command(hide = true)]
     GatewayRun(SideRunArgs),
     #[command(hide = true)]
     AgentRun(SideRunArgs),
@@ -622,6 +624,20 @@ struct RemotePlanArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct RemoteDeployArgs {
+    #[command(flatten)]
+    plan: RemotePlanArgs,
+    #[arg(long, default_value = "ssh")]
+    ssh_bin: String,
+    #[arg(long, default_value = "scp")]
+    scp_bin: String,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    no_rollback: bool,
+}
+
+#[derive(Debug, Args, Clone)]
 struct SideRunArgs {
     #[arg(value_name = "PROFILE", default_value = "local-dev")]
     profile: String,
@@ -969,6 +985,31 @@ struct RemotePlanCommands {
 }
 
 #[derive(Debug, Serialize)]
+struct RemoteDeployReport {
+    overall: DoctorState,
+    profile: String,
+    agent_host: String,
+    gateway_host: String,
+    dry_run: bool,
+    rollback_on_fail: bool,
+    rollback_attempted: bool,
+    plan: RemotePlanReport,
+    steps: Vec<RemoteDeployStep>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemoteDeployStep {
+    name: String,
+    host: Option<String>,
+    command: String,
+    state: DoctorState,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
 struct RemoteLifecycleTestReport {
     overall: DoctorState,
     agent_profile: String,
@@ -1156,6 +1197,7 @@ fn main() -> Result<()> {
         CommandKind::RemoteCheck(args) => run_remote_check(args)?,
         CommandKind::RemoteSmokeTest(args) => run_remote_smoke_test(args)?,
         CommandKind::RemotePlan(args) => run_remote_plan(args)?,
+        CommandKind::RemoteDeploy(args) => run_remote_deploy(args)?,
         CommandKind::GatewayRun(args) => run_side(args, ComponentSelection::Gateway)?,
         CommandKind::AgentRun(args) => run_side(args, ComponentSelection::Agent)?,
     }
@@ -1323,6 +1365,212 @@ fn run_remote_plan(args: RemotePlanArgs) -> Result<()> {
     let report = build_remote_plan_report(args)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn run_remote_deploy(args: RemoteDeployArgs) -> Result<()> {
+    let report = build_remote_deploy_report(args)?;
+    let failed = report.overall == DoctorState::Fail;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if failed {
+        bail!("remote deploy failed");
+    }
+    Ok(())
+}
+
+fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployReport> {
+    let agent_host = args
+        .plan
+        .agent_ssh_host
+        .clone()
+        .ok_or_else(|| anyhow!("remote-deploy requires --agent-ssh-host"))?;
+    let gateway_host = args
+        .plan
+        .gateway_ssh_host
+        .clone()
+        .ok_or_else(|| anyhow!("remote-deploy requires --gateway-ssh-host"))?;
+
+    validate_remote_bundle_dir(
+        &args.plan.agent_remote_bundle_dir,
+        "agent_remote_bundle_dir",
+    )?;
+    validate_remote_bundle_dir(
+        &args.plan.gateway_remote_bundle_dir,
+        "gateway_remote_bundle_dir",
+    )?;
+
+    let plan = build_remote_plan_report(args.plan.clone())?;
+    let mut steps = Vec::new();
+    let rollback_on_fail = !args.no_rollback;
+    let dry_run = args.dry_run;
+    let mut gateway_started = false;
+    let mut agent_started = false;
+    steps.push(RemoteDeployStep {
+        name: String::from("operator_remote_check"),
+        host: None,
+        command: plan.commands.operator_remote_check.clone(),
+        state: plan.remote_check.overall,
+        exit_code: Some(0),
+        stdout: serde_json::to_string_pretty(&plan.remote_check)?,
+        stderr: String::new(),
+        detail: String::from("local remote profile check passed"),
+    });
+
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "gateway_prepare_bundle_dir",
+            Some(gateway_host.clone()),
+            remote_prepare_bundle_command(
+                &args.ssh_bin,
+                &gateway_host,
+                &args.plan.gateway_remote_bundle_dir,
+            )?,
+            dry_run,
+        ));
+    }
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "copy_gateway_bundle",
+            Some(gateway_host.clone()),
+            deploy_scp_command(
+                &args.scp_bin,
+                &plan.gateway_bundle,
+                &gateway_host,
+                &args.plan.gateway_remote_bundle_dir,
+            ),
+            dry_run,
+        ));
+    }
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "agent_prepare_bundle_dir",
+            Some(agent_host.clone()),
+            remote_prepare_bundle_command(
+                &args.ssh_bin,
+                &agent_host,
+                &args.plan.agent_remote_bundle_dir,
+            )?,
+            dry_run,
+        ));
+    }
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "copy_agent_bundle",
+            Some(agent_host.clone()),
+            deploy_scp_command(
+                &args.scp_bin,
+                &plan.agent_bundle,
+                &agent_host,
+                &args.plan.agent_remote_bundle_dir,
+            ),
+            dry_run,
+        ));
+    }
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "gateway_import",
+            Some(gateway_host.clone()),
+            deploy_ssh_command(&args.ssh_bin, &gateway_host, &plan.commands.gateway_import),
+            dry_run,
+        ));
+    }
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        let step = build_remote_deploy_step(
+            "gateway_connect",
+            Some(gateway_host.clone()),
+            deploy_ssh_command(
+                &args.ssh_bin,
+                &gateway_host,
+                &remote_gateway_connect_command(&args.plan),
+            ),
+            dry_run,
+        );
+        gateway_started = !dry_run && step.state == DoctorState::Pass;
+        steps.push(step);
+    }
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "agent_import",
+            Some(agent_host.clone()),
+            deploy_ssh_command(&args.ssh_bin, &agent_host, &plan.commands.agent_import),
+            dry_run,
+        ));
+    }
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        let step = build_remote_deploy_step(
+            "agent_connect",
+            Some(agent_host.clone()),
+            deploy_ssh_command(
+                &args.ssh_bin,
+                &agent_host,
+                &remote_agent_connect_command(&args.plan),
+            ),
+            dry_run,
+        );
+        agent_started = !dry_run && step.state == DoctorState::Pass;
+        steps.push(step);
+    }
+    if steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "agent_smoke_test",
+            Some(agent_host.clone()),
+            deploy_ssh_command(
+                &args.ssh_bin,
+                &agent_host,
+                &remote_agent_smoke_test_command(&args.plan),
+            ),
+            dry_run,
+        ));
+    }
+
+    let failed_before_rollback = steps.iter().any(|step| step.state == DoctorState::Fail);
+    let rollback_attempted =
+        failed_before_rollback && rollback_on_fail && (agent_started || gateway_started);
+    if rollback_attempted {
+        if agent_started {
+            steps.push(build_remote_deploy_step(
+                "rollback_agent_disconnect",
+                Some(agent_host.clone()),
+                deploy_ssh_command(
+                    &args.ssh_bin,
+                    &agent_host,
+                    &remote_agent_disconnect_command(&args.plan),
+                ),
+                dry_run,
+            ));
+        }
+        if gateway_started {
+            steps.push(build_remote_deploy_step(
+                "rollback_gateway_disconnect",
+                Some(gateway_host.clone()),
+                deploy_ssh_command(
+                    &args.ssh_bin,
+                    &gateway_host,
+                    &remote_gateway_disconnect_command(&args.plan),
+                ),
+                dry_run,
+            ));
+        }
+    }
+
+    let overall = if steps.iter().any(|step| step.state == DoctorState::Fail) {
+        DoctorState::Fail
+    } else if steps.iter().any(|step| step.state == DoctorState::Warn) {
+        DoctorState::Warn
+    } else {
+        DoctorState::Pass
+    };
+
+    Ok(RemoteDeployReport {
+        overall,
+        profile: plan.profile.clone(),
+        agent_host,
+        gateway_host,
+        dry_run,
+        rollback_on_fail,
+        rollback_attempted,
+        plan,
+        steps,
+    })
 }
 
 fn build_remote_plan_report(args: RemotePlanArgs) -> Result<RemotePlanReport> {
@@ -1545,6 +1793,222 @@ fn remote_plan_next_steps(commands: &RemotePlanCommands) -> Vec<String> {
     steps.push(format!("agent host: {}", commands.agent_connect));
     steps.push(format!("agent host: {}", commands.agent_smoke_test));
     steps
+}
+
+fn validate_remote_bundle_dir(path: &Path, label: &str) -> Result<()> {
+    if !path.is_absolute() {
+        bail!(
+            "{label} must be an absolute remote path: {}",
+            path.display()
+        );
+    }
+    if path.parent().is_none() || path.file_name().is_none() {
+        bail!("{label} must point to a concrete bundle directory");
+    }
+    let value = path_display(path);
+    if value == "/" || value == "/tmp" || value == "/private/tmp" {
+        bail!("{label} is too broad for deploy cleanup: {value}");
+    }
+    Ok(())
+}
+
+fn remote_prepare_bundle_command(
+    ssh_bin: &str,
+    host: &str,
+    bundle_dir: &Path,
+) -> Result<Vec<String>> {
+    let parent = bundle_dir
+        .parent()
+        .ok_or_else(|| anyhow!("remote bundle dir has no parent: {}", bundle_dir.display()))?;
+    let remote_command = format!(
+        "rm -rf {} && mkdir -p {}",
+        shell_quote(&path_display(bundle_dir)),
+        shell_quote(&path_display(parent))
+    );
+    Ok(deploy_ssh_command(ssh_bin, host, &remote_command))
+}
+
+fn deploy_scp_command(
+    scp_bin: &str,
+    local_dir: &Path,
+    host: &str,
+    remote_dir: &Path,
+) -> Vec<String> {
+    vec![
+        scp_bin.to_owned(),
+        String::from("-r"),
+        path_display(local_dir),
+        format!("{host}:{}", path_display(remote_dir)),
+    ]
+}
+
+fn deploy_ssh_command(ssh_bin: &str, host: &str, remote_command: &str) -> Vec<String> {
+    vec![
+        ssh_bin.to_owned(),
+        host.to_owned(),
+        remote_command.to_owned(),
+    ]
+}
+
+fn remote_gateway_connect_command(args: &RemotePlanArgs) -> String {
+    render_command(vec![
+        String::from("sudo"),
+        String::from("-n"),
+        String::from("tunnel-cli"),
+        String::from("connect"),
+        args.gateway_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+    ])
+}
+
+fn remote_agent_connect_command(args: &RemotePlanArgs) -> String {
+    render_command(vec![
+        String::from("sudo"),
+        String::from("-n"),
+        String::from("tunnel-cli"),
+        String::from("connect"),
+        args.agent_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+    ])
+}
+
+fn remote_gateway_disconnect_command(args: &RemotePlanArgs) -> String {
+    render_command(vec![
+        String::from("sudo"),
+        String::from("-n"),
+        String::from("tunnel-cli"),
+        String::from("disconnect"),
+        args.gateway_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+    ])
+}
+
+fn remote_agent_disconnect_command(args: &RemotePlanArgs) -> String {
+    render_command(vec![
+        String::from("sudo"),
+        String::from("-n"),
+        String::from("tunnel-cli"),
+        String::from("disconnect"),
+        args.agent_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+    ])
+}
+
+fn remote_agent_smoke_test_command(args: &RemotePlanArgs) -> String {
+    render_command(vec![
+        String::from("sudo"),
+        String::from("-n"),
+        String::from("tunnel-cli"),
+        String::from("remote-smoke-test"),
+        args.agent_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+        String::from("--gateway-host"),
+        args.gateway_host.clone(),
+        String::from("--gateway-port"),
+        args.gateway_port.to_string(),
+        String::from("--target"),
+        args.smoke_target.clone(),
+        String::from("--count"),
+        args.smoke_count.to_string(),
+    ])
+}
+
+fn run_command_step(name: &str, host: Option<String>, command: Vec<String>) -> RemoteDeployStep {
+    let command_text = render_command(command.clone());
+    if command.is_empty() {
+        return RemoteDeployStep {
+            name: name.to_owned(),
+            host,
+            command: command_text,
+            state: DoctorState::Fail,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            detail: String::from("empty command"),
+        };
+    }
+
+    match Command::new(&command[0]).args(&command[1..]).output() {
+        Ok(output) => remote_deploy_step_from_output(name, host, command_text, output),
+        Err(error) => RemoteDeployStep {
+            name: name.to_owned(),
+            host,
+            command: command_text,
+            state: DoctorState::Fail,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            detail: format!("failed to execute command: {error}"),
+        },
+    }
+}
+
+fn build_remote_deploy_step(
+    name: &str,
+    host: Option<String>,
+    command: Vec<String>,
+    dry_run: bool,
+) -> RemoteDeployStep {
+    if dry_run {
+        return planned_remote_deploy_step(name, host, command);
+    }
+    run_command_step(name, host, command)
+}
+
+fn planned_remote_deploy_step(
+    name: &str,
+    host: Option<String>,
+    command: Vec<String>,
+) -> RemoteDeployStep {
+    RemoteDeployStep {
+        name: name.to_owned(),
+        host,
+        command: render_command(command),
+        state: DoctorState::Warn,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        detail: String::from("dry-run planned; command was not executed"),
+    }
+}
+
+fn remote_deploy_step_from_output(
+    name: &str,
+    host: Option<String>,
+    command: String,
+    output: Output,
+) -> RemoteDeployStep {
+    let state = if output.status.success() {
+        DoctorState::Pass
+    } else {
+        DoctorState::Fail
+    };
+    let exit_code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let detail = match (state, exit_code) {
+        (DoctorState::Pass, Some(code)) => format!("command exited {code}"),
+        (DoctorState::Pass, None) => String::from("command exited successfully"),
+        (DoctorState::Fail, Some(code)) => format!("command failed with exit code {code}"),
+        (DoctorState::Fail, None) => String::from("command failed without an exit code"),
+        (DoctorState::Warn, _) => String::from("command completed with warning"),
+    };
+
+    RemoteDeployStep {
+        name: name.to_owned(),
+        host,
+        command,
+        state,
+        exit_code,
+        stdout,
+        stderr,
+        detail,
+    }
 }
 
 fn path_display(path: &Path) -> String {
@@ -7943,6 +8407,245 @@ mod tests {
     }
 
     #[test]
+    fn remote_deploy_runs_plan_steps_over_ssh_and_scp() -> Result<()> {
+        let root = test_root("remote-deploy")?;
+        let report = build_remote_deploy_report(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: String::from("true"),
+            scp_bin: String::from("true"),
+            dry_run: false,
+            no_rollback: false,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Pass);
+        assert!(!report.dry_run);
+        assert_eq!(report.agent_host, "agent.example");
+        assert_eq!(report.gateway_host, "gateway.example");
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.name == "copy_agent_bundle" && step.state == DoctorState::Pass));
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.name == "gateway_connect"
+                && step
+                    .command
+                    .contains("sudo -n tunnel-cli connect gateway-prod")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.name == "agent_smoke_test"
+                && step
+                    .command
+                    .contains("sudo -n tunnel-cli remote-smoke-test agent-prod")));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_deploy_rolls_back_started_sides_after_smoke_failure() -> Result<()> {
+        let root = test_root("remote-deploy-rollback")?;
+        let fake_bin = root.join("fake-ssh-scp");
+        write_fake_remote_deploy_binary(&fake_bin, "remote-smoke-test")?;
+
+        let report = build_remote_deploy_report(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: path_display(&fake_bin),
+            scp_bin: path_display(&fake_bin),
+            dry_run: false,
+            no_rollback: false,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Fail);
+        assert!(report.rollback_on_fail);
+        assert!(report.rollback_attempted);
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.name == "agent_smoke_test" && step.state == DoctorState::Fail));
+        assert!(report.steps.iter().any(|step| {
+            step.name == "rollback_agent_disconnect"
+                && step
+                    .command
+                    .contains("sudo -n tunnel-cli disconnect agent-prod")
+        }));
+        assert!(report.steps.iter().any(|step| {
+            step.name == "rollback_gateway_disconnect"
+                && step
+                    .command
+                    .contains("sudo -n tunnel-cli disconnect gateway-prod")
+        }));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_deploy_no_rollback_leaves_failure_for_debugging() -> Result<()> {
+        let root = test_root("remote-deploy-no-rollback")?;
+        let fake_bin = root.join("fake-ssh-scp");
+        write_fake_remote_deploy_binary(&fake_bin, "remote-smoke-test")?;
+
+        let report = build_remote_deploy_report(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: path_display(&fake_bin),
+            scp_bin: path_display(&fake_bin),
+            dry_run: false,
+            no_rollback: true,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Fail);
+        assert!(!report.rollback_on_fail);
+        assert!(!report.rollback_attempted);
+        assert!(!report
+            .steps
+            .iter()
+            .any(|step| step.name.starts_with("rollback_")));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_deploy_dry_run_plans_steps_without_executing_remote_commands() -> Result<()> {
+        let root = test_root("remote-deploy-dry-run")?;
+        let missing_bin = root.join("definitely-not-a-real-command");
+
+        let report = build_remote_deploy_report(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: path_display(&missing_bin),
+            scp_bin: path_display(&missing_bin),
+            dry_run: true,
+            no_rollback: false,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Warn);
+        assert!(report.dry_run);
+        assert!(report.rollback_on_fail);
+        assert!(!report.rollback_attempted);
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.name == "operator_remote_check" && step.state == DoctorState::Pass));
+        assert!(report
+            .steps
+            .iter()
+            .filter(|step| step.name != "operator_remote_check")
+            .all(|step| step.state == DoctorState::Warn
+                && step
+                    .detail
+                    .contains("dry-run planned; command was not executed")));
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.name == "agent_smoke_test"
+                && step
+                    .command
+                    .contains("sudo -n tunnel-cli remote-smoke-test agent-prod")));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
     fn linux_gateway_rule_checks_match_runtime_commands() {
         let state = GatewayRuntimeState {
             tunnel_interface: String::from("tun0"),
@@ -8099,6 +8802,22 @@ mod tests {
             }
         }
         Ok(combined)
+    }
+
+    fn write_fake_remote_deploy_binary(path: &Path, fail_when_contains: &str) -> Result<()> {
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *{}*) exit 42 ;;\n  *) exit 0 ;;\nesac\n",
+            fail_when_contains
+        );
+        fs::write(path, script)?;
+        let mut permissions = fs::metadata(path)?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions)?;
+        }
+        Ok(())
     }
 
     fn string_vec(parts: Vec<&str>) -> Vec<String> {
