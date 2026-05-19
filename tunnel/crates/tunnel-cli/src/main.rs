@@ -634,6 +634,10 @@ struct RemoteDeployArgs {
     #[arg(long)]
     dry_run: bool,
     #[arg(long)]
+    require_host_preflight: bool,
+    #[arg(long)]
+    report_file: Option<PathBuf>,
+    #[arg(long)]
     no_rollback: bool,
 }
 
@@ -991,6 +995,7 @@ struct RemoteDeployReport {
     agent_host: String,
     gateway_host: String,
     dry_run: bool,
+    require_host_preflight: bool,
     rollback_on_fail: bool,
     rollback_attempted: bool,
     plan: RemotePlanReport,
@@ -1368,13 +1373,27 @@ fn run_remote_plan(args: RemotePlanArgs) -> Result<()> {
 }
 
 fn run_remote_deploy(args: RemoteDeployArgs) -> Result<()> {
+    let report_file = args.report_file.clone();
     let report = build_remote_deploy_report(args)?;
     let failed = report.overall == DoctorState::Fail;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let report_json = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = report_file {
+        write_report_file(&path, &report_json)?;
+    }
+    println!("{report_json}");
     if failed {
         bail!("remote deploy failed");
     }
     Ok(())
+}
+
+fn write_report_file(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, format!("{contents}\n"))
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployReport> {
@@ -1402,6 +1421,7 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
     let mut steps = Vec::new();
     let rollback_on_fail = !args.no_rollback;
     let dry_run = args.dry_run;
+    let require_host_preflight = args.require_host_preflight;
     let mut gateway_started = false;
     let mut agent_started = false;
     steps.push(RemoteDeployStep {
@@ -1414,6 +1434,23 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
         stderr: String::new(),
         detail: String::from("local remote profile check passed"),
     });
+
+    if require_host_preflight && steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "gateway_host_preflight",
+            Some(gateway_host.clone()),
+            remote_gateway_host_preflight_command(&args)?,
+            dry_run,
+        ));
+    }
+    if require_host_preflight && steps.iter().all(|step| step.state != DoctorState::Fail) {
+        steps.push(build_remote_deploy_step(
+            "agent_host_preflight",
+            Some(agent_host.clone()),
+            remote_agent_host_preflight_command(&args)?,
+            dry_run,
+        ));
+    }
 
     if steps.iter().all(|step| step.state != DoctorState::Fail) {
         steps.push(build_remote_deploy_step(
@@ -1566,6 +1603,7 @@ fn build_remote_deploy_report(args: RemoteDeployArgs) -> Result<RemoteDeployRepo
         agent_host,
         gateway_host,
         dry_run,
+        require_host_preflight,
         rollback_on_fail,
         rollback_attempted,
         plan,
@@ -1848,6 +1886,44 @@ fn deploy_ssh_command(ssh_bin: &str, host: &str, remote_command: &str) -> Vec<St
         host.to_owned(),
         remote_command.to_owned(),
     ]
+}
+
+fn remote_gateway_host_preflight_command(args: &RemoteDeployArgs) -> Result<Vec<String>> {
+    let host = args
+        .plan
+        .gateway_ssh_host
+        .as_deref()
+        .ok_or_else(|| anyhow!("remote-deploy requires --gateway-ssh-host"))?;
+    let command = format!(
+        "sh -lc {}",
+        shell_quote(&format!(
+            "command -v tunnel-cli >/dev/null && sudo -n true && test -c /dev/net/tun && command -v ip >/dev/null && command -v iptables >/dev/null && {}",
+            gateway_udp_port_available_script(args.plan.gateway_port)
+        ))
+    );
+    Ok(deploy_ssh_command(&args.ssh_bin, host, &command))
+}
+
+fn remote_agent_host_preflight_command(args: &RemoteDeployArgs) -> Result<Vec<String>> {
+    let host = args
+        .plan
+        .agent_ssh_host
+        .as_deref()
+        .ok_or_else(|| anyhow!("remote-deploy requires --agent-ssh-host"))?;
+    let command = format!(
+        "sh -lc {}",
+        shell_quote(&format!(
+            "command -v tunnel-cli >/dev/null && sudo -n true && test -c /dev/net/tun && command -v ip >/dev/null && ip route get {} >/dev/null",
+            shell_quote(&args.plan.gateway_host)
+        ))
+    );
+    Ok(deploy_ssh_command(&args.ssh_bin, host, &command))
+}
+
+fn gateway_udp_port_available_script(port: u16) -> String {
+    format!(
+        "if command -v ss >/dev/null 2>&1; then ! ss -H -lun 'sport = :{port}' | grep -q .; elif command -v netstat >/dev/null 2>&1; then ! netstat -lun | awk '{{print $4}}' | grep -Eq '(:|\\.){port}$'; else true; fi"
+    )
 }
 
 fn remote_gateway_connect_command(args: &RemotePlanArgs) -> String {
@@ -8439,6 +8515,8 @@ mod tests {
             ssh_bin: String::from("true"),
             scp_bin: String::from("true"),
             dry_run: false,
+            require_host_preflight: false,
+            report_file: None,
             no_rollback: false,
         })?;
 
@@ -8504,6 +8582,8 @@ mod tests {
             ssh_bin: path_display(&fake_bin),
             scp_bin: path_display(&fake_bin),
             dry_run: false,
+            require_host_preflight: false,
+            report_file: None,
             no_rollback: false,
         })?;
 
@@ -8566,6 +8646,8 @@ mod tests {
             ssh_bin: path_display(&fake_bin),
             scp_bin: path_display(&fake_bin),
             dry_run: false,
+            require_host_preflight: false,
+            report_file: None,
             no_rollback: true,
         })?;
 
@@ -8615,6 +8697,8 @@ mod tests {
             ssh_bin: path_display(&missing_bin),
             scp_bin: path_display(&missing_bin),
             dry_run: true,
+            require_host_preflight: false,
+            report_file: None,
             no_rollback: false,
         })?;
 
@@ -8641,6 +8725,176 @@ mod tests {
                 && step
                     .command
                     .contains("sudo -n tunnel-cli remote-smoke-test agent-prod")));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_deploy_writes_report_file() -> Result<()> {
+        let root = test_root("remote-deploy-report-file")?;
+        let missing_bin = root.join("definitely-not-a-real-command");
+        let report_file = root.join("reports").join("deploy-report.json");
+
+        run_remote_deploy(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: path_display(&missing_bin),
+            scp_bin: path_display(&missing_bin),
+            dry_run: true,
+            require_host_preflight: true,
+            report_file: Some(report_file.clone()),
+            no_rollback: false,
+        })?;
+
+        let report: serde_json::Value = serde_json::from_str(&fs::read_to_string(&report_file)?)?;
+        assert_eq!(report["profile"], "remote-prod");
+        assert_eq!(report["dry_run"], true);
+        assert_eq!(report["require_host_preflight"], true);
+        let steps = report["steps"]
+            .as_array()
+            .expect("steps should be an array");
+        assert!(steps
+            .iter()
+            .any(|step| step["name"] == "gateway_host_preflight"));
+        assert!(steps.iter().any(|step| step["name"] == "agent_smoke_test"));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_deploy_host_preflight_failure_stops_before_mutation() -> Result<()> {
+        let root = test_root("remote-deploy-preflight-fail")?;
+        let fake_bin = root.join("fake-ssh-scp");
+        write_fake_remote_deploy_binary(&fake_bin, "iptables")?;
+
+        let report = build_remote_deploy_report(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: path_display(&fake_bin),
+            scp_bin: path_display(&fake_bin),
+            dry_run: false,
+            require_host_preflight: true,
+            report_file: None,
+            no_rollback: false,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Fail);
+        assert!(report.require_host_preflight);
+        assert!(report
+            .steps
+            .iter()
+            .any(|step| step.name == "gateway_host_preflight" && step.state == DoctorState::Fail));
+        assert!(!report.steps.iter().any(|step| {
+            step.name == "copy_gateway_bundle"
+                || step.name == "gateway_import"
+                || step.name == "gateway_connect"
+        }));
+        assert!(!report.rollback_attempted);
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_deploy_dry_run_includes_host_preflight_without_execution() -> Result<()> {
+        let root = test_root("remote-deploy-preflight-dry-run")?;
+        let missing_bin = root.join("definitely-not-a-real-command");
+
+        let report = build_remote_deploy_report(RemoteDeployArgs {
+            plan: RemotePlanArgs {
+                profile: String::from("remote-prod"),
+                profile_file: root.join("profiles.json"),
+                tenant: String::from("tenant"),
+                attachment: Some(String::from("attachment")),
+                agent_config: root.join("agent.json"),
+                gateway_config: root.join("gateway.json"),
+                gateway_host: String::from("203.0.113.10"),
+                gateway_port: 7000,
+                destination_cidr: String::from("1.1.1.0/24"),
+                agent_tunnel_address: String::from("10.201.0.2"),
+                gateway_tunnel_address: String::from("10.201.0.1"),
+                egress_interface: String::from("eth0"),
+                out_dir: root.join("bundles"),
+                agent_profile: String::from("agent-prod"),
+                gateway_profile: String::from("gateway-prod"),
+                remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+                remote_install_dir: PathBuf::from("/private/tmp"),
+                agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+                gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+                agent_ssh_host: Some(String::from("agent.example")),
+                gateway_ssh_host: Some(String::from("gateway.example")),
+                smoke_target: String::from("1.1.1.1"),
+                smoke_count: 10,
+                force: true,
+            },
+            ssh_bin: path_display(&missing_bin),
+            scp_bin: path_display(&missing_bin),
+            dry_run: true,
+            require_host_preflight: true,
+            report_file: None,
+            no_rollback: false,
+        })?;
+
+        assert_eq!(report.overall, DoctorState::Warn);
+        assert!(report.dry_run);
+        assert!(report.require_host_preflight);
+        assert!(report.steps.iter().any(|step| {
+            step.name == "gateway_host_preflight"
+                && step.state == DoctorState::Warn
+                && step.command.contains("command -v iptables")
+        }));
+        assert!(report.steps.iter().any(|step| {
+            step.name == "agent_host_preflight"
+                && step.state == DoctorState::Warn
+                && step.command.contains("ip route get")
+        }));
         remove_test_root(root);
         Ok(())
     }

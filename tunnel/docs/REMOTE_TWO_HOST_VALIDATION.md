@@ -31,6 +31,8 @@ tunnel-cli remote-deploy remote-prod \
   --out-dir /tmp/tunnel-bundles \
   --agent-ssh-host <agent-ssh-target> \
   --gateway-ssh-host <gateway-ssh-target> \
+  --require-host-preflight \
+  --report-file ./deploy-report.json \
   --force
 ```
 
@@ -46,7 +48,9 @@ tunnel-cli remote-deploy remote-prod \
   --force
 ```
 
-`remote-deploy` generates/reuses the plan, copies both side bundles over `scp`, imports the profiles on each host over `ssh`, starts gateway then agent, and runs the agent-side smoke test. Remote privileged commands use `sudo -n`, so hosts must already allow non-interactive sudo for the tunnel operator. With `--dry-run`, it returns the same ordered step report with planned commands marked as not executed.
+`remote-deploy` generates/reuses the plan, copies both side bundles over `scp`, imports the profiles on each host over `ssh`, starts gateway then agent, and runs the agent-side smoke test. Remote privileged commands use `sudo -n`, so hosts must already allow non-interactive sudo for the tunnel operator. With `--dry-run`, it returns the same ordered step report with planned commands marked as not executed. Use `--report-file` to persist the exact JSON deploy artifact for support and debugging.
+
+Use `--require-host-preflight` to stop before mutation unless both hosts pass basic capability checks. It verifies `tunnel-cli`, non-interactive sudo, `/dev/net/tun`, `ip`, gateway `iptables`, gateway UDP port availability when `ss` or `netstat` exists, and agent routeability to the gateway host.
 
 Rollback is enabled by default. If a later step fails after gateway or agent startup, `remote-deploy` runs remote `disconnect` for the started side(s) and includes those rollback steps in the JSON result. Use `--no-rollback` when you intentionally want to leave failed state in place for manual debugging.
 
