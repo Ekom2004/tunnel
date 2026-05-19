@@ -10,7 +10,20 @@ The topology is:
 
 ## Flow
 
-On the build/operator machine, generate and export the profile:
+On the build/operator machine, generate an operator plan:
+
+```sh
+tunnel-cli remote-plan remote-prod \
+  --gateway-host <gateway-public-or-private-ip> \
+  --out-dir /tmp/tunnel-bundles \
+  --agent-ssh-host <agent-ssh-target> \
+  --gateway-ssh-host <gateway-ssh-target> \
+  --force
+```
+
+The plan emits JSON containing the generated bundle paths plus exact copy, import, connect, `remote-check`, and `remote-smoke-test` commands.
+
+The underlying manual flow is:
 
 ```sh
 tunnel-cli login remote-prod \

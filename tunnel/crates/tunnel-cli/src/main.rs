@@ -88,6 +88,8 @@ enum CommandKind {
     #[command(hide = true)]
     RemoteSmokeTest(RemoteSmokeTestArgs),
     #[command(hide = true)]
+    RemotePlan(RemotePlanArgs),
+    #[command(hide = true)]
     GatewayRun(SideRunArgs),
     #[command(hide = true)]
     AgentRun(SideRunArgs),
@@ -568,6 +570,58 @@ struct RemoteSmokeTestArgs {
 }
 
 #[derive(Debug, Args, Clone)]
+struct RemotePlanArgs {
+    #[arg(value_name = "PROFILE", default_value = "remote-prod")]
+    profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    profile_file: PathBuf,
+    #[arg(long, default_value = "local-tenant")]
+    tenant: String,
+    #[arg(long)]
+    attachment: Option<String>,
+    #[arg(long, default_value = "/private/tmp/tunnel-agent-wg.json")]
+    agent_config: PathBuf,
+    #[arg(long, default_value = "/private/tmp/tunnel-gateway-wg.json")]
+    gateway_config: PathBuf,
+    #[arg(long)]
+    gateway_host: String,
+    #[arg(long, default_value_t = 7000)]
+    gateway_port: u16,
+    #[arg(long, default_value = "1.1.1.0/24")]
+    destination_cidr: String,
+    #[arg(long, default_value = "10.201.0.2")]
+    agent_tunnel_address: String,
+    #[arg(long, default_value = "10.201.0.1")]
+    gateway_tunnel_address: String,
+    #[arg(long, default_value = "eth0")]
+    egress_interface: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-bundles")]
+    out_dir: PathBuf,
+    #[arg(long, default_value = "agent-prod")]
+    agent_profile: String,
+    #[arg(long, default_value = "gateway-prod")]
+    gateway_profile: String,
+    #[arg(long, default_value = "/private/tmp/tunnel-profiles.json")]
+    remote_profile_file: PathBuf,
+    #[arg(long, default_value = "/private/tmp")]
+    remote_install_dir: PathBuf,
+    #[arg(long, default_value = "/tmp/tunnel-agent-bundle")]
+    agent_remote_bundle_dir: PathBuf,
+    #[arg(long, default_value = "/tmp/tunnel-gateway-bundle")]
+    gateway_remote_bundle_dir: PathBuf,
+    #[arg(long)]
+    agent_ssh_host: Option<String>,
+    #[arg(long)]
+    gateway_ssh_host: Option<String>,
+    #[arg(long, default_value = "1.1.1.1")]
+    smoke_target: String,
+    #[arg(long, default_value_t = 10)]
+    smoke_count: u32,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args, Clone)]
 struct SideRunArgs {
     #[arg(value_name = "PROFILE", default_value = "local-dev")]
     profile: String,
@@ -885,6 +939,36 @@ struct UdpProbeReport {
 }
 
 #[derive(Debug, Serialize)]
+struct RemotePlanReport {
+    profile: String,
+    profile_file: PathBuf,
+    gateway_host: String,
+    gateway_port: u16,
+    destination_cidr: String,
+    agent_bundle: PathBuf,
+    gateway_bundle: PathBuf,
+    agent_profile: String,
+    gateway_profile: String,
+    generated_configs: GeneratedConfigReport,
+    readiness: ReadinessReport,
+    remote_check: RemoteCheckReport,
+    commands: RemotePlanCommands,
+    next: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RemotePlanCommands {
+    operator_remote_check: String,
+    copy_agent_bundle: Option<String>,
+    copy_gateway_bundle: Option<String>,
+    agent_import: String,
+    gateway_import: String,
+    gateway_connect: String,
+    agent_connect: String,
+    agent_smoke_test: String,
+}
+
+#[derive(Debug, Serialize)]
 struct RemoteLifecycleTestReport {
     overall: DoctorState,
     agent_profile: String,
@@ -1071,6 +1155,7 @@ fn main() -> Result<()> {
         CommandKind::RemoteLifecycleTest(args) => run_remote_lifecycle_test(args)?,
         CommandKind::RemoteCheck(args) => run_remote_check(args)?,
         CommandKind::RemoteSmokeTest(args) => run_remote_smoke_test(args)?,
+        CommandKind::RemotePlan(args) => run_remote_plan(args)?,
         CommandKind::GatewayRun(args) => run_side(args, ComponentSelection::Gateway)?,
         CommandKind::AgentRun(args) => run_side(args, ComponentSelection::Agent)?,
     }
@@ -1232,6 +1317,257 @@ fn run_login(args: LoginArgs) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+fn run_remote_plan(args: RemotePlanArgs) -> Result<()> {
+    let report = build_remote_plan_report(args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn build_remote_plan_report(args: RemotePlanArgs) -> Result<RemotePlanReport> {
+    let login_args = LoginArgs {
+        profile: args.profile.clone(),
+        profile_file: args.profile_file.clone(),
+        tenant: args.tenant.clone(),
+        attachment: args.attachment.clone(),
+        agent_config: args.agent_config.clone(),
+        gateway_config: args.gateway_config.clone(),
+        gateway_host: args.gateway_host.clone(),
+        gateway_port: args.gateway_port,
+        destination_cidr: args.destination_cidr.clone(),
+        agent_tunnel_address: args.agent_tunnel_address.clone(),
+        gateway_tunnel_address: args.gateway_tunnel_address.clone(),
+        egress_interface: args.egress_interface.clone(),
+        mode: Some(ProfileMode::Remote),
+        local_component: Some(ComponentSelection::Agent),
+        force: args.force,
+    };
+    let generated_configs = ensure_local_configs_for_login(&login_args)?;
+    write_profile(ProfileInitArgs {
+        profile: args.profile.clone(),
+        profile_file: args.profile_file.clone(),
+        tenant: args.tenant.clone(),
+        attachment: args.attachment.clone(),
+        agent_config: args.agent_config.clone(),
+        gateway_config: args.gateway_config.clone(),
+        egress_interface: args.egress_interface.clone(),
+        mode: ProfileMode::Remote,
+        local_component: Some(ComponentSelection::Agent),
+        force: args.force,
+    })?;
+
+    let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+        args.profile.clone(),
+        args.profile_file.clone(),
+    ))?;
+    let readiness = build_connect_readiness(&connect_args);
+    bail_if_not_ready(&readiness)?;
+
+    prepare_bundle_output_dir(&args.out_dir, args.force)?;
+    let agent_bundle = args.out_dir.join("agent");
+    let gateway_bundle = args.out_dir.join("gateway");
+    export_side_bundle(&connect_args, ComponentSelection::Agent, &agent_bundle)?;
+    export_side_bundle(&connect_args, ComponentSelection::Gateway, &gateway_bundle)?;
+
+    let remote_check = build_remote_check_report(RemoteCheckArgs {
+        profile: args.profile.clone(),
+        profile_file: args.profile_file.clone(),
+        peer_profile: None,
+        peer_profile_file: None,
+        gateway_host: Some(args.gateway_host.clone()),
+        gateway_port: Some(args.gateway_port),
+        udp_probe: false,
+        udp_probe_timeout_secs: 2.0,
+    })?;
+    if remote_check.overall == DoctorState::Fail {
+        bail!("remote plan config check failed");
+    }
+
+    let commands = remote_plan_commands(&args, &agent_bundle, &gateway_bundle);
+    let next = remote_plan_next_steps(&commands);
+    let report = RemotePlanReport {
+        profile: args.profile,
+        profile_file: args.profile_file,
+        gateway_host: args.gateway_host,
+        gateway_port: args.gateway_port,
+        destination_cidr: args.destination_cidr,
+        agent_bundle,
+        gateway_bundle,
+        agent_profile: args.agent_profile,
+        gateway_profile: args.gateway_profile,
+        generated_configs,
+        readiness,
+        remote_check,
+        commands,
+        next,
+    };
+    Ok(report)
+}
+
+fn prepare_bundle_output_dir(out_dir: &Path, force: bool) -> Result<()> {
+    if out_dir.exists() && !force {
+        bail!(
+            "bundle output directory already exists: {}. rerun with --force to overwrite",
+            out_dir.display()
+        );
+    }
+    if out_dir.exists() {
+        fs::remove_dir_all(out_dir)
+            .with_context(|| format!("failed to replace {}", out_dir.display()))?;
+    }
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("failed to create {}", out_dir.display()))?;
+    Ok(())
+}
+
+fn remote_plan_commands(
+    args: &RemotePlanArgs,
+    agent_bundle: &Path,
+    gateway_bundle: &Path,
+) -> RemotePlanCommands {
+    let operator_remote_check = render_command(vec![
+        String::from("tunnel-cli"),
+        String::from("remote-check"),
+        args.profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.profile_file),
+        String::from("--gateway-host"),
+        args.gateway_host.clone(),
+        String::from("--gateway-port"),
+        args.gateway_port.to_string(),
+    ]);
+    let copy_agent_bundle = args.agent_ssh_host.as_ref().map(|host| {
+        render_command(vec![
+            String::from("scp"),
+            String::from("-r"),
+            path_display(agent_bundle),
+            format!("{host}:{}", path_display(&args.agent_remote_bundle_dir)),
+        ])
+    });
+    let copy_gateway_bundle = args.gateway_ssh_host.as_ref().map(|host| {
+        render_command(vec![
+            String::from("scp"),
+            String::from("-r"),
+            path_display(gateway_bundle),
+            format!("{host}:{}", path_display(&args.gateway_remote_bundle_dir)),
+        ])
+    });
+    let agent_import = render_command(vec![
+        String::from("tunnel-cli"),
+        String::from("profile"),
+        String::from("import"),
+        path_display(&args.agent_remote_bundle_dir),
+        String::from("--profile"),
+        args.agent_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+        String::from("--install-dir"),
+        path_display(&args.remote_install_dir),
+        String::from("--force"),
+    ]);
+    let gateway_import = render_command(vec![
+        String::from("tunnel-cli"),
+        String::from("profile"),
+        String::from("import"),
+        path_display(&args.gateway_remote_bundle_dir),
+        String::from("--profile"),
+        args.gateway_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+        String::from("--install-dir"),
+        path_display(&args.remote_install_dir),
+        String::from("--force"),
+    ]);
+    let gateway_connect = render_command(vec![
+        String::from("sudo"),
+        String::from("tunnel-cli"),
+        String::from("connect"),
+        args.gateway_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+    ]);
+    let agent_connect = render_command(vec![
+        String::from("sudo"),
+        String::from("tunnel-cli"),
+        String::from("connect"),
+        args.agent_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+    ]);
+    let agent_smoke_test = render_command(vec![
+        String::from("sudo"),
+        String::from("tunnel-cli"),
+        String::from("remote-smoke-test"),
+        args.agent_profile.clone(),
+        String::from("--profile-file"),
+        path_display(&args.remote_profile_file),
+        String::from("--gateway-host"),
+        args.gateway_host.clone(),
+        String::from("--gateway-port"),
+        args.gateway_port.to_string(),
+        String::from("--target"),
+        args.smoke_target.clone(),
+        String::from("--count"),
+        args.smoke_count.to_string(),
+    ]);
+
+    RemotePlanCommands {
+        operator_remote_check,
+        copy_agent_bundle,
+        copy_gateway_bundle,
+        agent_import,
+        gateway_import,
+        gateway_connect,
+        agent_connect,
+        agent_smoke_test,
+    }
+}
+
+fn remote_plan_next_steps(commands: &RemotePlanCommands) -> Vec<String> {
+    let mut steps = Vec::new();
+    steps.push(commands.operator_remote_check.clone());
+    steps.push(
+        commands
+            .copy_gateway_bundle
+            .clone()
+            .unwrap_or_else(|| String::from("copy gateway_bundle to gateway host manually")),
+    );
+    steps.push(
+        commands
+            .copy_agent_bundle
+            .clone()
+            .unwrap_or_else(|| String::from("copy agent_bundle to agent host manually")),
+    );
+    steps.push(format!("gateway host: {}", commands.gateway_import));
+    steps.push(format!("gateway host: {}", commands.gateway_connect));
+    steps.push(format!("agent host: {}", commands.agent_import));
+    steps.push(format!("agent host: {}", commands.agent_connect));
+    steps.push(format!("agent host: {}", commands.agent_smoke_test));
+    steps
+}
+
+fn path_display(path: &Path) -> String {
+    path.display().to_string()
+}
+
+fn render_command(parts: Vec<String>) -> String {
+    parts
+        .iter()
+        .map(|part| shell_quote(part.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:@".contains(&byte))
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn resolved_login_mode(args: &LoginArgs) -> ProfileMode {
@@ -7554,6 +7890,54 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.name == "profile_pair" && check.state == DoctorState::Pass));
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn remote_plan_exports_bundles_and_operator_commands() -> Result<()> {
+        let root = test_root("remote-plan")?;
+        let report = build_remote_plan_report(RemotePlanArgs {
+            profile: String::from("remote-prod"),
+            profile_file: root.join("profiles.json"),
+            tenant: String::from("tenant"),
+            attachment: Some(String::from("attachment")),
+            agent_config: root.join("agent.json"),
+            gateway_config: root.join("gateway.json"),
+            gateway_host: String::from("203.0.113.10"),
+            gateway_port: 7000,
+            destination_cidr: String::from("1.1.1.0/24"),
+            agent_tunnel_address: String::from("10.201.0.2"),
+            gateway_tunnel_address: String::from("10.201.0.1"),
+            egress_interface: String::from("eth0"),
+            out_dir: root.join("bundles"),
+            agent_profile: String::from("agent-prod"),
+            gateway_profile: String::from("gateway-prod"),
+            remote_profile_file: PathBuf::from("/private/tmp/tunnel-profiles.json"),
+            remote_install_dir: PathBuf::from("/private/tmp"),
+            agent_remote_bundle_dir: PathBuf::from("/tmp/tunnel-agent-bundle"),
+            gateway_remote_bundle_dir: PathBuf::from("/tmp/tunnel-gateway-bundle"),
+            agent_ssh_host: Some(String::from("agent.example")),
+            gateway_ssh_host: Some(String::from("gateway.example")),
+            smoke_target: String::from("1.1.1.1"),
+            smoke_count: 10,
+            force: true,
+        })?;
+
+        assert!(report.readiness.ready);
+        assert_eq!(report.remote_check.overall, DoctorState::Pass);
+        assert!(report.agent_bundle.join("tunnel-bundle.json").exists());
+        assert!(report.gateway_bundle.join("tunnel-bundle.json").exists());
+        assert!(report.commands.copy_agent_bundle.is_some());
+        assert!(report.commands.copy_gateway_bundle.is_some());
+        assert!(report
+            .commands
+            .agent_smoke_test
+            .contains("remote-smoke-test agent-prod"));
+        assert!(report
+            .next
+            .iter()
+            .any(|step| step.contains("gateway host:")));
         remove_test_root(root);
         Ok(())
     }
