@@ -132,6 +132,8 @@ struct LoginArgs {
     destination_cidr: String,
     #[arg(long)]
     allow_full_tunnel: bool,
+    #[arg(long)]
+    production: bool,
     #[arg(long, default_value = "10.201.0.2")]
     agent_tunnel_address: String,
     #[arg(long, default_value = "10.201.0.1")]
@@ -222,6 +224,8 @@ struct ConnectArgs {
     mode: ProfileMode,
     #[arg(long, hide = true, value_enum)]
     local_component: Option<ComponentSelection>,
+    #[arg(long, hide = true)]
+    production: bool,
 }
 
 impl ConnectArgs {
@@ -252,6 +256,7 @@ impl ConnectArgs {
             supervisor_log_file: PathBuf::from("/private/tmp/tunnel-supervisor.log"),
             mode: ProfileMode::Local,
             local_component: None,
+            production: false,
         }
     }
 }
@@ -435,6 +440,8 @@ struct ProfileInitArgs {
     #[arg(long, hide = true, value_enum)]
     local_component: Option<ComponentSelection>,
     #[arg(long)]
+    production: bool,
+    #[arg(long)]
     force: bool,
 }
 
@@ -601,6 +608,8 @@ struct RemotePlanArgs {
     destination_cidr: String,
     #[arg(long)]
     allow_full_tunnel: bool,
+    #[arg(long)]
+    production: bool,
     #[arg(long, default_value = "10.201.0.2")]
     agent_tunnel_address: String,
     #[arg(long, default_value = "10.201.0.1")]
@@ -757,6 +766,8 @@ struct SessionManifest {
     mode: ProfileMode,
     #[serde(default)]
     local_component: Option<ComponentSelection>,
+    #[serde(default)]
+    production: bool,
     #[serde(default)]
     supervised: bool,
     #[serde(default)]
@@ -1114,6 +1125,8 @@ struct TunnelProfile {
     mode: ProfileMode,
     #[serde(default)]
     local_component: Option<ComponentSelection>,
+    #[serde(default)]
+    production: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1338,6 +1351,7 @@ fn apply_profile(args: &mut ConnectArgs, profile: &TunnelProfile) {
     }
     args.mode = profile.mode;
     args.local_component = profile.local_component;
+    args.production = profile.production;
 }
 
 fn required_connect_value<'a>(value: Option<&'a String>, label: &str) -> Result<&'a str> {
@@ -1361,6 +1375,7 @@ fn run_login(args: LoginArgs) -> Result<()> {
         egress_interface: args.egress_interface.clone(),
         mode,
         local_component,
+        production: args.production,
         force: true,
     };
     write_profile(profile_args)?;
@@ -1378,6 +1393,7 @@ fn run_login(args: LoginArgs) -> Result<()> {
             "mode": mode,
             "local_component": local_component,
             "remote_component": remote_component_for(mode, local_component),
+            "production": args.production,
             "profile": args.profile,
             "profile_file": args.profile_file,
             "gateway_host": args.gateway_host,
@@ -1805,6 +1821,7 @@ fn build_remote_plan_report(args: RemotePlanArgs) -> Result<RemotePlanReport> {
         gateway_port: args.gateway_port,
         destination_cidr: args.destination_cidr.clone(),
         allow_full_tunnel: args.allow_full_tunnel,
+        production: args.production,
         agent_tunnel_address: args.agent_tunnel_address.clone(),
         gateway_tunnel_address: args.gateway_tunnel_address.clone(),
         egress_interface: args.egress_interface.clone(),
@@ -1823,6 +1840,7 @@ fn build_remote_plan_report(args: RemotePlanArgs) -> Result<RemotePlanReport> {
         egress_interface: args.egress_interface.clone(),
         mode: ProfileMode::Remote,
         local_component: Some(ComponentSelection::Agent),
+        production: args.production,
         force: args.force,
     })?;
 
@@ -2886,6 +2904,9 @@ fn build_connect_readiness(args: &ConnectArgs) -> ReadinessReport {
     push_mode_check(&mut checks, "route_mode", args.route_mode);
     push_mode_check(&mut checks, "forwarding_mode", args.forwarding_mode);
     push_mode_check(&mut checks, "nat_mode", args.nat_mode);
+    if args.production {
+        checks.extend(production_readiness_checks(args));
+    }
 
     let ready = checks.iter().all(|check| check.state != DoctorState::Fail);
     ReadinessReport {
@@ -2893,6 +2914,157 @@ fn build_connect_readiness(args: &ConnectArgs) -> ReadinessReport {
         profile: args.profile.clone(),
         checks,
     }
+}
+
+fn production_readiness_checks(args: &ConnectArgs) -> Vec<ReadinessCheck> {
+    let mut checks = Vec::new();
+    checks.push(ReadinessCheck {
+        name: String::from("production_mode"),
+        state: DoctorState::Pass,
+        detail: String::from("production guardrails enabled"),
+    });
+    push_production_apply_check(&mut checks, "production_route_mode", args.route_mode);
+    push_production_apply_check(
+        &mut checks,
+        "production_forwarding_mode",
+        args.forwarding_mode,
+    );
+    push_production_apply_check(&mut checks, "production_nat_mode", args.nat_mode);
+
+    for (label, path) in production_config_paths(args) {
+        push_production_config_checks(&mut checks, label, path);
+    }
+
+    checks.push(ReadinessCheck {
+        name: String::from("production_plaintext_capture"),
+        state: DoctorState::Pass,
+        detail: String::from("connect path does not enable gateway plaintext packet capture"),
+    });
+    checks
+}
+
+fn push_production_apply_check(
+    checks: &mut Vec<ReadinessCheck>,
+    name: &str,
+    mode: SystemCommandMode,
+) {
+    let (state, detail) = if mode == SystemCommandMode::Apply {
+        (DoctorState::Pass, format!("{name} applies OS state"))
+    } else {
+        (
+            DoctorState::Fail,
+            format!("production requires Apply, found {mode:?}"),
+        )
+    };
+    checks.push(ReadinessCheck {
+        name: name.to_owned(),
+        state,
+        detail,
+    });
+}
+
+fn production_config_paths(args: &ConnectArgs) -> Vec<(&'static str, &Path)> {
+    match args.mode {
+        ProfileMode::Local => vec![
+            ("production_agent_config", args.agent_config.as_path()),
+            ("production_gateway_config", args.gateway_config.as_path()),
+        ],
+        ProfileMode::Remote => match args.local_component {
+            Some(ComponentSelection::Agent) => {
+                vec![("production_agent_config", args.agent_config.as_path())]
+            }
+            Some(ComponentSelection::Gateway) => {
+                vec![("production_gateway_config", args.gateway_config.as_path())]
+            }
+            None => Vec::new(),
+        },
+    }
+}
+
+fn push_production_config_checks(checks: &mut Vec<ReadinessCheck>, label: &str, path: &Path) {
+    let config = match load_validated_config_file(label, path) {
+        Ok(config) => config,
+        Err(error) => {
+            checks.push(ReadinessCheck {
+                name: label.to_owned(),
+                state: DoctorState::Fail,
+                detail: format!("{error:#}"),
+            });
+            return;
+        }
+    };
+
+    let has_wireguard = config.wireguard.is_some();
+    checks.push(ReadinessCheck {
+        name: format!("{label}_wireguard"),
+        state: if has_wireguard {
+            DoctorState::Pass
+        } else {
+            DoctorState::Fail
+        },
+        detail: if has_wireguard {
+            String::from("WireGuard config present; legacy JSON/TCP is not required")
+        } else {
+            String::from("production requires WireGuard; legacy JSON/TCP is disabled by default")
+        },
+    });
+
+    let route_state = if config.route_policy.allow_full_tunnel {
+        DoctorState::Warn
+    } else {
+        DoctorState::Pass
+    };
+    checks.push(ReadinessCheck {
+        name: format!("{label}_route_policy"),
+        state: route_state,
+        detail: if config.route_policy.allow_full_tunnel {
+            String::from("full-tunnel route explicitly enabled; confirm customer approval")
+        } else {
+            String::from("route policy passed production validation")
+        },
+    });
+
+    if config_contains_private_key(&config) {
+        let temp_path = is_temp_secret_path(path);
+        checks.push(ReadinessCheck {
+            name: format!("{label}_secret_path"),
+            state: if temp_path {
+                DoctorState::Fail
+            } else {
+                DoctorState::Pass
+            },
+            detail: if temp_path {
+                format!(
+                    "production private-key config must not live under a temp directory: {}",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "private-key config path is outside temp storage: {}",
+                    path.display()
+                )
+            },
+        });
+    }
+}
+
+fn load_validated_config_file(label: &str, path: &Path) -> Result<TunnelConfig> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("{label} not found or unreadable: {}", path.display()))?;
+    let config: TunnelConfig = serde_json::from_str(&contents)
+        .with_context(|| format!("{label} is invalid JSON: {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("{label} failed validation: {}", path.display()))?;
+    validate_secret_config_permissions(label, path, &config)?;
+    Ok(config)
+}
+
+fn is_temp_secret_path(path: &Path) -> bool {
+    path.starts_with(env::temp_dir())
+        || path.starts_with("/tmp")
+        || path.starts_with("/private/tmp")
+        || path.starts_with("/var/tmp")
 }
 
 fn push_required_string_check(
@@ -2992,6 +3164,7 @@ fn write_profile(args: ProfileInitArgs) -> Result<()> {
         ready_timeout_secs: Some(12),
         mode: args.mode,
         local_component: args.local_component,
+        production: args.production,
     };
     write_profile_entry(&args.profile_file, profile, args.force)
 }
@@ -3131,6 +3304,7 @@ fn side_bundle_profile(
         ready_timeout_secs: Some(args.ready_timeout_secs),
         mode: ProfileMode::Remote,
         local_component: Some(side),
+        production: args.production,
     })
 }
 
@@ -3198,6 +3372,7 @@ fn imported_side_profile(
         ready_timeout_secs: bundled_profile.ready_timeout_secs.or(Some(12)),
         mode: ProfileMode::Remote,
         local_component: Some(side),
+        production: bundled_profile.production,
     }
 }
 
@@ -3603,6 +3778,7 @@ fn run_connect_oneshot(args: ConnectArgs) -> Result<()> {
         gateway_pid: Some(gateway_child.id()),
         mode: ProfileMode::Local,
         local_component: None,
+        production: args.production,
         supervised: false,
         supervisor_pid: None,
         supervisor_log_file: args.supervisor_log_file.clone(),
@@ -3956,6 +4132,7 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
         gateway_port: 7000,
         destination_cidr: String::from("1.1.1.0/24"),
         allow_full_tunnel: false,
+        production: false,
         agent_tunnel_address: String::from("10.201.0.2"),
         gateway_tunnel_address: String::from("10.201.0.1"),
         egress_interface: String::from("en0"),
@@ -3980,6 +4157,7 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
         egress_interface: login_args.egress_interface.clone(),
         mode: ProfileMode::Local,
         local_component: None,
+        production: false,
         force: true,
     })?;
 
@@ -4268,6 +4446,7 @@ fn prepare_remote_lifecycle_side(
         gateway_port: args.gateway_port,
         destination_cidr: String::from("1.1.1.0/24"),
         allow_full_tunnel: false,
+        production: false,
         agent_tunnel_address: String::from("10.201.0.2"),
         gateway_tunnel_address: String::from("10.201.0.1"),
         egress_interface: String::from("en0"),
@@ -4333,6 +4512,7 @@ fn remote_lifecycle_profile(
         ready_timeout_secs: Some(12),
         mode: ProfileMode::Remote,
         local_component: Some(local_component),
+        production: false,
     }
 }
 
@@ -4409,6 +4589,7 @@ fn write_remote_lifecycle_session(args: &ConnectArgs, gateway_pid: Option<u32>) 
         gateway_pid,
         mode: ProfileMode::Remote,
         local_component: Some(ComponentSelection::Gateway),
+        production: args.production,
         supervised: false,
         supervisor_pid: None,
         supervisor_log_file: args.supervisor_log_file.clone(),
@@ -5064,6 +5245,12 @@ fn build_doctor_report(args: DoctorArgs) -> Result<DoctorReport> {
             session.tenant, session.attachment
         ),
     ));
+    if session.production {
+        let connect_args = connect_args_from_session(&session, &args.session_file);
+        for check in production_readiness_checks(&connect_args) {
+            checks.push(doctor_check(&check.name, check.state, check.detail));
+        }
+    }
 
     check_component_process(&session, ComponentSelection::Agent, &mut checks);
     check_component_process(&session, ComponentSelection::Gateway, &mut checks);
@@ -5731,6 +5918,7 @@ fn start_remote_side_session(args: &ConnectArgs) -> Result<()> {
         gateway_pid: (local_component == ComponentSelection::Gateway).then_some(side_report.pid),
         mode: ProfileMode::Remote,
         local_component: Some(local_component),
+        production: args.production,
         supervised: false,
         supervisor_pid: None,
         supervisor_log_file: args.supervisor_log_file.clone(),
@@ -6385,6 +6573,7 @@ fn connect_args_from_session(session: &SessionManifest, session_file: &Path) -> 
         supervisor_log_file: session.supervisor_log_file.clone(),
         mode: session.mode,
         local_component: session.local_component,
+        production: session.production,
     }
 }
 
@@ -8289,14 +8478,7 @@ fn cleanup_remote_side_state(args: &ConnectArgs, component: ComponentSelection) 
 }
 
 fn validate_config_file(label: &str, path: &Path) -> Result<()> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("{label} not found or unreadable: {}", path.display()))?;
-    let config: TunnelConfig = serde_json::from_str(&contents)
-        .with_context(|| format!("{label} is invalid JSON: {}", path.display()))?;
-    config
-        .validate()
-        .with_context(|| format!("{label} failed validation: {}", path.display()))?;
-    validate_secret_config_permissions(label, path, &config)?;
+    load_validated_config_file(label, path)?;
     Ok(())
 }
 
@@ -8745,6 +8927,9 @@ fn append_connect_args(command: &mut Command, args: &ConnectArgs) {
             .arg("--local-component")
             .arg(component_label(local_component));
     }
+    if args.production {
+        command.arg("--production");
+    }
 }
 
 #[cfg(test)]
@@ -8940,6 +9125,7 @@ mod tests {
             egress_interface: args.egress_interface.clone(),
             mode: ProfileMode::Remote,
             local_component: Some(ComponentSelection::Gateway),
+            production: false,
             force: true,
         })?;
 
@@ -9003,6 +9189,7 @@ mod tests {
             gateway_pid: Some(42),
             mode: ProfileMode::Remote,
             local_component: Some(ComponentSelection::Gateway),
+            production: false,
             supervised: true,
             supervisor_pid: Some(7),
             supervisor_log_file: root.join("supervisor.log"),
@@ -9082,6 +9269,90 @@ mod tests {
             agent_config.route_policy.destination_cidrs,
             vec![String::from("0.0.0.0/0")]
         );
+
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn production_readiness_rejects_temp_private_key_configs() -> Result<()> {
+        let root = test_root("production-readiness")?;
+        let mut args = test_login_args(&root, true);
+        args.production = true;
+        ensure_local_configs_for_login(&args)?;
+        write_profile_for_login(&args)?;
+
+        let connect_args = resolve_connect_args(ConnectArgs::for_profile(
+            args.profile.clone(),
+            args.profile_file.clone(),
+        ))?;
+        let readiness = build_connect_readiness(&connect_args);
+
+        assert!(connect_args.production);
+        assert!(!readiness.ready);
+        assert!(readiness.checks.iter().any(|check| {
+            check.name.ends_with("_secret_path") && check.state == DoctorState::Fail
+        }));
+        assert!(readiness.checks.iter().any(|check| {
+            check.name == "production_plaintext_capture" && check.state == DoctorState::Pass
+        }));
+
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
+    fn doctor_surfaces_production_guardrails_from_session() -> Result<()> {
+        let root = test_root("production-doctor")?;
+        let mut args = test_login_args(&root, true);
+        args.production = true;
+        ensure_local_configs_for_login(&args)?;
+
+        let session_file = root.join("session.json");
+        let session = SessionManifest {
+            tenant: args.tenant.clone(),
+            attachment: args.attachment.clone().expect("attachment should exist"),
+            agent_config: args.agent_config.clone(),
+            gateway_config: args.gateway_config.clone(),
+            agent_state_file: root.join("missing-agent-state.json"),
+            agent_status_file: root.join("missing-agent-status.json"),
+            gateway_state_file: root.join("missing-gateway-state.json"),
+            gateway_status_file: root.join("missing-gateway-status.json"),
+            agent_log_file: root.join("agent.log"),
+            gateway_log_file: root.join("gateway.log"),
+            egress_interface: args.egress_interface.clone(),
+            route_mode: SystemCommandMode::Apply,
+            forwarding_mode: SystemCommandMode::Apply,
+            nat_mode: SystemCommandMode::Apply,
+            agent_pid: None,
+            gateway_pid: None,
+            mode: ProfileMode::Remote,
+            local_component: Some(ComponentSelection::Gateway),
+            production: true,
+            supervised: false,
+            supervisor_pid: None,
+            supervisor_log_file: root.join("supervisor.log"),
+        };
+        write_json_file(&session_file, &session)?;
+
+        let report = build_doctor_report(DoctorArgs {
+            profile: None,
+            profile_file: root.join("profiles.json"),
+            session_file,
+            target: String::from("1.1.1.1"),
+            probe_timeout_secs: 0.1,
+            stale_after_secs: 15,
+            post_probe_settle_secs: 0,
+        })?;
+
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.name == "production_mode" && check.state == DoctorState::Pass));
+        assert!(report.checks.iter().any(|check| {
+            check.name == "production_gateway_config_secret_path"
+                && check.state == DoctorState::Fail
+        }));
 
         remove_test_root(root);
         Ok(())
@@ -9215,6 +9486,7 @@ mod tests {
             gateway_port: 7000,
             destination_cidr: String::from("1.1.1.0/24"),
             allow_full_tunnel: false,
+            production: false,
             agent_tunnel_address: String::from("10.201.0.2"),
             gateway_tunnel_address: String::from("10.201.0.1"),
             egress_interface: String::from("eth0"),
@@ -9265,6 +9537,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9342,6 +9615,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9406,6 +9680,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9476,6 +9751,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9548,6 +9824,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9605,6 +9882,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9679,6 +9957,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9778,6 +10057,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9840,6 +10120,7 @@ mod tests {
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
                 allow_full_tunnel: false,
+                production: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -10050,6 +10331,7 @@ mod tests {
             gateway_port: 7000,
             destination_cidr: String::from("1.1.1.0/24"),
             allow_full_tunnel: false,
+            production: false,
             agent_tunnel_address: String::from("10.201.0.2"),
             gateway_tunnel_address: String::from("10.201.0.1"),
             egress_interface: String::from("en0"),
@@ -10070,6 +10352,7 @@ mod tests {
             egress_interface: args.egress_interface.clone(),
             mode: ProfileMode::Local,
             local_component: None,
+            production: args.production,
             force: true,
         })
     }
