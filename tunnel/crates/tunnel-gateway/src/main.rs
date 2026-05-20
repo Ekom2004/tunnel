@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, ValueEnum};
@@ -32,6 +32,8 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     output_dir: Option<PathBuf>,
+    #[arg(long)]
+    allow_plaintext_capture: bool,
     #[arg(long, default_value = "/private/tmp/tunnel-gateway-state.json")]
     state_file: PathBuf,
     #[arg(long, default_value = "/private/tmp/tunnel-gateway-status.json")]
@@ -232,6 +234,7 @@ fn run_wireguard_gateway(
     config: &TunnelConfig,
     wireguard: &WireGuardConfig,
 ) -> Result<()> {
+    validate_plaintext_capture_gate(cli.output_dir.as_deref(), cli.allow_plaintext_capture)?;
     let bind_addr = format!(
         "{}:{}",
         wireguard.local_bind_host, wireguard.local_bind_port
@@ -289,7 +292,7 @@ fn run_wireguard_gateway(
             tunnel_id: Some(config.tunnel_id.clone()),
             transport: TransportKind::WireGuardUdp,
             tunnel_interface: interface_name.clone(),
-            detail: String::from("wireguard gateway running"),
+            detail: gateway_runtime_detail(cli.output_dir.as_deref()),
             started_at_unix_secs: now_unix_secs(),
         },
         Arc::clone(&peer),
@@ -341,6 +344,7 @@ fn run_wireguard_gateway(
 }
 
 fn handle_client(stream: TcpStream, cli: &Cli) -> Result<()> {
+    validate_plaintext_capture_gate(cli.output_dir.as_deref(), cli.allow_plaintext_capture)?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let mut reader = BufReader::new(stream);
 
@@ -1617,6 +1621,26 @@ fn prepare_output_file(
     Ok(Some(File::create(path)?))
 }
 
+fn validate_plaintext_capture_gate(output_dir: Option<&Path>, allowed: bool) -> Result<()> {
+    if output_dir.is_some() && !allowed {
+        bail!(
+            "--output-dir writes decrypted customer packet payloads; rerun with --allow-plaintext-capture only for explicit debug capture"
+        );
+    }
+    Ok(())
+}
+
+fn gateway_runtime_detail(output_dir: Option<&Path>) -> String {
+    if let Some(output_dir) = output_dir {
+        format!(
+            "wireguard gateway running; PLAINTEXT PACKET CAPTURE ENABLED at {}",
+            output_dir.display()
+        )
+    } else {
+        String::from("wireguard gateway running")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1740,6 +1764,23 @@ mod tests {
         ));
         assert_eq!(status.endpoint, Some(legitimate_roam));
         assert_eq!(status.last_activity_unix_secs, 12);
+    }
+
+    #[test]
+    fn plaintext_capture_requires_explicit_allow_flag() {
+        let output_dir = Path::new("/tmp/tunnel-capture");
+        let error = validate_plaintext_capture_gate(Some(output_dir), false)
+            .expect_err("plaintext capture must require explicit unsafe opt-in");
+        assert!(error.to_string().contains("--allow-plaintext-capture"));
+        assert!(validate_plaintext_capture_gate(Some(output_dir), true).is_ok());
+        assert!(validate_plaintext_capture_gate(None, false).is_ok());
+    }
+
+    #[test]
+    fn plaintext_capture_status_detail_is_loud() {
+        let detail = gateway_runtime_detail(Some(Path::new("/tmp/tunnel-capture")));
+        assert!(detail.contains("PLAINTEXT PACKET CAPTURE ENABLED"));
+        assert_eq!(gateway_runtime_detail(None), "wireguard gateway running");
     }
 
     #[test]
