@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::{Args, Parser, ValueEnum};
@@ -38,6 +38,8 @@ struct Cli {
     status_file: PathBuf,
     #[arg(long)]
     cleanup_only: bool,
+    #[arg(long)]
+    allow_legacy_json_tcp: bool,
     #[arg(long, default_value_t = 5)]
     status_interval_secs: u64,
     #[command(flatten)]
@@ -110,6 +112,7 @@ fn main() -> Result<()> {
         return run_wireguard_mode(&config, &cli, wireguard);
     }
 
+    validate_legacy_json_tcp_gate(cli.allow_legacy_json_tcp)?;
     run_json_session_mode(&config, &cli)
 }
 
@@ -185,6 +188,7 @@ fn run_cleanup_only(cli: &Cli, config: &TunnelConfig) -> Result<()> {
 }
 
 fn run_json_session_mode(config: &TunnelConfig, cli: &Cli) -> Result<()> {
+    eprintln!("{}", legacy_json_tcp_detail());
     let stream = TcpStream::connect((config.gateway.host.as_str(), config.gateway.port))?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let mut reader = BufReader::new(stream);
@@ -201,6 +205,19 @@ fn run_json_session_mode(config: &TunnelConfig, cli: &Cli) -> Result<()> {
     } else {
         run_payload_mode(config, cli, &writer, &mut reader)
     }
+}
+
+fn validate_legacy_json_tcp_gate(allowed: bool) -> Result<()> {
+    if !allowed {
+        bail!(
+            "legacy JSON/TCP mode is disabled by default; rerun with --allow-legacy-json-tcp only for explicit compatibility testing"
+        );
+    }
+    Ok(())
+}
+
+fn legacy_json_tcp_detail() -> String {
+    String::from("LEGACY JSON/TCP MODE ENABLED")
 }
 
 fn run_payload_mode(
@@ -1296,6 +1313,15 @@ fn load_payload(cli: &Cli) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_json_tcp_requires_explicit_allow_flag() {
+        let error = validate_legacy_json_tcp_gate(false)
+            .expect_err("legacy JSON/TCP must require explicit unsafe opt-in");
+        assert!(error.to_string().contains("--allow-legacy-json-tcp"));
+        assert!(validate_legacy_json_tcp_gate(true).is_ok());
+        assert!(legacy_json_tcp_detail().contains("LEGACY JSON/TCP MODE ENABLED"));
+    }
 
     #[test]
     fn linux_route_commands_use_ip_route_replace_and_delete() {

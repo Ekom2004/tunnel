@@ -40,6 +40,8 @@ struct Cli {
     status_file: PathBuf,
     #[arg(long)]
     cleanup_only: bool,
+    #[arg(long)]
+    allow_legacy_json_tcp: bool,
     #[arg(long, default_value_t = 5)]
     status_interval_secs: u64,
     #[command(flatten)]
@@ -150,6 +152,7 @@ fn main() -> Result<()> {
         }
     }
 
+    validate_legacy_json_tcp_gate(cli.allow_legacy_json_tcp)?;
     run_json_session_gateway(&cli)
 }
 
@@ -211,7 +214,11 @@ fn run_json_session_gateway(cli: &Cli) -> Result<()> {
     let status = HealthStatus {
         component: ComponentKind::Gateway,
         state: HealthState::Healthy,
-        detail: format!("gateway listening on {}", cli.bind),
+        detail: format!(
+            "{}; gateway listening on {}",
+            legacy_json_tcp_detail(),
+            cli.bind
+        ),
     };
     println!("{}", serde_json::to_string_pretty(&status)?);
 
@@ -227,6 +234,19 @@ fn run_json_session_gateway(cli: &Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_legacy_json_tcp_gate(allowed: bool) -> Result<()> {
+    if !allowed {
+        bail!(
+            "legacy JSON/TCP mode is disabled by default; rerun with --allow-legacy-json-tcp only for explicit compatibility testing"
+        );
+    }
+    Ok(())
+}
+
+fn legacy_json_tcp_detail() -> String {
+    String::from("LEGACY JSON/TCP MODE ENABLED")
 }
 
 fn run_wireguard_gateway(
@@ -1644,6 +1664,15 @@ fn gateway_runtime_detail(output_dir: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_json_tcp_requires_explicit_allow_flag() {
+        let error = validate_legacy_json_tcp_gate(false)
+            .expect_err("legacy JSON/TCP must require explicit unsafe opt-in");
+        assert!(error.to_string().contains("--allow-legacy-json-tcp"));
+        assert!(validate_legacy_json_tcp_gate(true).is_ok());
+        assert!(legacy_json_tcp_detail().contains("LEGACY JSON/TCP MODE ENABLED"));
+    }
 
     #[test]
     fn linux_forwarding_commands_enable_ip_forwarding_and_forward_rules() {

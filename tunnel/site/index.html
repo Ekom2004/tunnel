@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tunnel</title>
+    <meta
+      name="description"
+      content="Tunnel cuts cloud egress costs by finding expensive data paths and routing them through cheaper, neutral infrastructure."
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#overview">Skip to content</a>
+    <header class="site-header">
+      <div class="container nav">
+        <a class="brand" href="#top">tunnel</a>
+        <nav class="nav__links" aria-label="Primary">
+          <a href="#overview">Overview</a>
+          <a href="#why-costly">Why pay</a>
+          <a href="#system">How it works</a>
+          <a href="#faq">FAQ</a>
+        </nav>
+        <div class="nav__actions">
+          <a class="button button--primary" href="#contact">Talk to us</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="section hero reveal" id="overview">
+        <div class="container hero-grid">
+          <div>
+            <div class="hero__meta">
+              <span class="hero__eyebrow">Cloud egress</span>
+            </div>
+            <h1>Cut your cloud egress bill in half.</h1>
+            <p class="hero__body">
+              Tunnel finds expensive data paths across clouds, regions, vendors, and compute, then routes them through
+              cheaper, neutral infrastructure.
+            </p>
+            <div class="hero__actions">
+              <a class="button button--primary" href="#contact">Talk to us</a>
+              <a class="button button--secondary" href="#system">See how it works</a>
+            </div>
+            <pre class="code-snippet"><code>tunnel login
+tunnel tenant create northwind
+tunnel attachment register --provider aws --cloud-account 123456789012 --name prod
+tunnel agent enroll --tenant northwind --token &lt;token&gt;
+tunnel connect --tenant northwind --attachment prod</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="section reveal" id="why-costly">
+        <div class="container">
+          <div class="section-head">
+            <p class="section-head__label">Why pay for it</p>
+            <h2>The default path is already there. That is why teams keep overpaying for it.</h2>
+            <p>
+              Most teams do not choose the cheapest route for data movement. They use the default path that happens to
+              exist between clouds, regions, vendors, and workloads, then pay whatever that path costs.
+            </p>
+          </div>
+          <div class="point-list">
+            <div class="point-row">
+              <span>01</span>
+              <p>Data crosses cloud and vendor boundaries on the default route, so the default price becomes the bill.</p>
+            </div>
+            <div class="point-row">
+              <span>02</span>
+              <p>Once those paths carry real volume, egress stops looking incidental and starts acting like infrastructure spend.</p>
+            </div>
+            <div class="point-row">
+              <span>03</span>
+              <p>Teams pay for Tunnel when they want those expensive paths rerouted through cheaper neutral infrastructure.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section reveal" id="system">
+        <div class="container two-up">
+          <div class="section-head">
+            <p class="section-head__label">How it works</p>
+            <h2>Tunnel replaces expensive routes with cheaper neutral ones.</h2>
+            <p>
+              The operator flow stays narrow: enroll the agent, attach it to the right tenant and path, bring the
+              session up, and let traffic take Tunnel instead of the expensive default route.
+            </p>
+            <p>
+              The product is not trying to expose more network machinery than necessary. It is trying to make a
+              cheaper path real, operable, and measurable.
+            </p>
+          </div>
+            <pre class="code-snippet"><code>$ tunnel status --tenant northwind
+tenant: northwind
+tunnel: up
+attachment: healthy
+gateway: yyz-01
+outbound bytes: 18.2 GB
+last sync: 19s ago</code></pre>
+        </div>
+      </section>
+
+      <section class="section reveal" id="faq">
+        <div class="container">
+          <div class="section-head">
+            <p class="section-head__label">FAQ</p>
+            <h2>FAQ</h2>
+          </div>
+          <div class="faq">
+            <div class="faq-row">
+              <p class="faq-row__question">What is Tunnel actually selling?</p>
+              <p>A lower-cost replacement for default cloud egress, delivered as something operators can turn on and manage.</p>
+            </div>
+            <div class="faq-row">
+              <p class="faq-row__question">Is this just for one kind of outbound job?</p>
+              <p>No. The point is not one workload category. The point is that cloud-priced outbound is broadly expensive when it becomes your default.</p>
+            </div>
+            <div class="faq-row">
+              <p class="faq-row__question">Why does the operator workflow matter if the wedge is price?</p>
+              <p>Because a cheaper path only matters if teams can actually deploy it, monitor it, and keep it running without turning egress into a network project.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer" id="contact">
+      <div class="container footer">
+        <div>
+          <p class="footer__title">tunnel</p>
+          <p>Cheaper neutral infrastructure for teams that are tired of paying default cloud egress prices.</p>
+        </div>
+        <div class="footer__actions">
+          <a class="button button--primary" href="mailto:hello@tunnel.local">Talk to us</a>
+        </div>
+      </div>
+    </footer>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
