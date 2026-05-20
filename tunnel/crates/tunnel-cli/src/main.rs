@@ -130,6 +130,8 @@ struct LoginArgs {
     gateway_port: u16,
     #[arg(long, default_value = "1.1.1.0/24")]
     destination_cidr: String,
+    #[arg(long)]
+    allow_full_tunnel: bool,
     #[arg(long, default_value = "10.201.0.2")]
     agent_tunnel_address: String,
     #[arg(long, default_value = "10.201.0.1")]
@@ -597,6 +599,8 @@ struct RemotePlanArgs {
     gateway_port: u16,
     #[arg(long, default_value = "1.1.1.0/24")]
     destination_cidr: String,
+    #[arg(long)]
+    allow_full_tunnel: bool,
     #[arg(long, default_value = "10.201.0.2")]
     agent_tunnel_address: String,
     #[arg(long, default_value = "10.201.0.1")]
@@ -1800,6 +1804,7 @@ fn build_remote_plan_report(args: RemotePlanArgs) -> Result<RemotePlanReport> {
         gateway_host: args.gateway_host.clone(),
         gateway_port: args.gateway_port,
         destination_cidr: args.destination_cidr.clone(),
+        allow_full_tunnel: args.allow_full_tunnel,
         agent_tunnel_address: args.agent_tunnel_address.clone(),
         gateway_tunnel_address: args.gateway_tunnel_address.clone(),
         egress_interface: args.egress_interface.clone(),
@@ -2714,6 +2719,7 @@ fn build_local_wireguard_config_pair(args: &LoginArgs) -> (TunnelConfig, TunnelC
         traffic_class: TrafficClass::BulkExport,
         destination_cidrs: vec![args.destination_cidr.clone()],
         routing_mark: 100,
+        allow_full_tunnel: args.allow_full_tunnel,
     };
     let (agent_private, agent_public) = generate_wireguard_keypair();
     let (gateway_private, gateway_public) = generate_wireguard_keypair();
@@ -3949,6 +3955,7 @@ fn run_lifecycle_test(args: LifecycleTestArgs) -> Result<()> {
         gateway_host: String::from("127.0.0.1"),
         gateway_port: 7000,
         destination_cidr: String::from("1.1.1.0/24"),
+        allow_full_tunnel: false,
         agent_tunnel_address: String::from("10.201.0.2"),
         gateway_tunnel_address: String::from("10.201.0.1"),
         egress_interface: String::from("en0"),
@@ -4260,6 +4267,7 @@ fn prepare_remote_lifecycle_side(
         gateway_host: args.gateway_host.clone(),
         gateway_port: args.gateway_port,
         destination_cidr: String::from("1.1.1.0/24"),
+        allow_full_tunnel: false,
         agent_tunnel_address: String::from("10.201.0.2"),
         gateway_tunnel_address: String::from("10.201.0.1"),
         egress_interface: String::from("en0"),
@@ -9054,6 +9062,32 @@ mod tests {
     }
 
     #[test]
+    fn login_generation_requires_explicit_full_tunnel_opt_in() -> Result<()> {
+        let root = test_root("full-tunnel")?;
+        let mut args = test_login_args(&root, true);
+        args.destination_cidr = String::from("0.0.0.0/0");
+
+        let error = ensure_local_configs_for_login(&args)
+            .expect_err("full-tunnel route must be rejected without explicit opt-in");
+        assert!(error
+            .to_string()
+            .contains("generated agent config is invalid"));
+
+        args.allow_full_tunnel = true;
+        ensure_local_configs_for_login(&args)?;
+        let agent_config: TunnelConfig =
+            serde_json::from_str(&fs::read_to_string(&args.agent_config)?)?;
+        assert!(agent_config.route_policy.allow_full_tunnel);
+        assert_eq!(
+            agent_config.route_policy.destination_cidrs,
+            vec![String::from("0.0.0.0/0")]
+        );
+
+        remove_test_root(root);
+        Ok(())
+    }
+
+    #[test]
     fn profile_export_separates_private_keys_and_imports_side_bundle() -> Result<()> {
         let root = test_root("profile-export")?;
         let args = test_login_args(&root, true);
@@ -9180,6 +9214,7 @@ mod tests {
             gateway_host: String::from("203.0.113.10"),
             gateway_port: 7000,
             destination_cidr: String::from("1.1.1.0/24"),
+            allow_full_tunnel: false,
             agent_tunnel_address: String::from("10.201.0.2"),
             gateway_tunnel_address: String::from("10.201.0.1"),
             egress_interface: String::from("eth0"),
@@ -9229,6 +9264,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9305,6 +9341,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9368,6 +9405,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9437,6 +9475,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9508,6 +9547,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9564,6 +9604,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9637,6 +9678,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9735,6 +9777,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -9796,6 +9839,7 @@ mod tests {
                 gateway_host: String::from("203.0.113.10"),
                 gateway_port: 7000,
                 destination_cidr: String::from("1.1.1.0/24"),
+                allow_full_tunnel: false,
                 agent_tunnel_address: String::from("10.201.0.2"),
                 gateway_tunnel_address: String::from("10.201.0.1"),
                 egress_interface: String::from("eth0"),
@@ -10005,6 +10049,7 @@ mod tests {
             gateway_host: String::from("127.0.0.1"),
             gateway_port: 7000,
             destination_cidr: String::from("1.1.1.0/24"),
+            allow_full_tunnel: false,
             agent_tunnel_address: String::from("10.201.0.2"),
             gateway_tunnel_address: String::from("10.201.0.1"),
             egress_interface: String::from("en0"),

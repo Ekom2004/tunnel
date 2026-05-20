@@ -894,6 +894,7 @@ fn handle_agent_routes(
         return Ok(());
     }
 
+    config.route_policy.validate()?;
     let commands = build_agent_route_commands(interface_name, config);
     execute_commands(mode, "agent route", &commands)
 }

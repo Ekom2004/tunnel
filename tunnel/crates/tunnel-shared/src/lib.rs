@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -30,6 +31,8 @@ pub struct RoutePolicy {
     pub traffic_class: TrafficClass,
     pub destination_cidrs: Vec<String>,
     pub routing_mark: u32,
+    #[serde(default)]
+    pub allow_full_tunnel: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -215,6 +218,8 @@ pub enum ConfigError {
     EmptyGatewayHost,
     #[error("at least one destination CIDR is required")]
     EmptyDestinationCidrs,
+    #[error("destination CIDR {cidr} is not allowed: {reason}")]
+    InvalidDestinationCidr { cidr: String, reason: String },
     #[error("heartbeat interval must be greater than zero")]
     InvalidHeartbeatInterval,
     #[error("max chunk bytes must be greater than zero")]
@@ -264,6 +269,7 @@ impl TunnelConfig {
         if self.route_policy.destination_cidrs.is_empty() {
             return Err(ConfigError::EmptyDestinationCidrs);
         }
+        self.route_policy.validate()?;
 
         if self.heartbeat_interval_secs == 0 {
             return Err(ConfigError::InvalidHeartbeatInterval);
@@ -275,6 +281,20 @@ impl TunnelConfig {
 
         if let Some(wireguard) = &self.wireguard {
             wireguard.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+impl RoutePolicy {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.destination_cidrs.is_empty() {
+            return Err(ConfigError::EmptyDestinationCidrs);
+        }
+
+        for cidr in &self.destination_cidrs {
+            validate_destination_cidr(cidr, self.allow_full_tunnel)?;
         }
 
         Ok(())
@@ -329,6 +349,130 @@ fn decode_key_32_raw(
     Ok(bytes.as_slice().try_into()?)
 }
 
+fn validate_destination_cidr(cidr: &str, allow_full_tunnel: bool) -> Result<(), ConfigError> {
+    let cidr = cidr.trim();
+    let (addr, prefix) =
+        parse_destination_cidr(cidr).map_err(|reason| ConfigError::InvalidDestinationCidr {
+            cidr: cidr.to_owned(),
+            reason,
+        })?;
+
+    let reason = match addr {
+        IpAddr::V4(addr) => validate_ipv4_route(addr, prefix, allow_full_tunnel),
+        IpAddr::V6(addr) => validate_ipv6_route(addr, prefix, allow_full_tunnel),
+    };
+
+    if let Some(reason) = reason {
+        return Err(ConfigError::InvalidDestinationCidr {
+            cidr: cidr.to_owned(),
+            reason,
+        });
+    }
+
+    Ok(())
+}
+
+fn parse_destination_cidr(cidr: &str) -> Result<(IpAddr, u8), String> {
+    let (addr, prefix) = cidr
+        .split_once('/')
+        .ok_or_else(|| String::from("CIDR must include a prefix length"))?;
+    if addr.trim() != addr || prefix.trim() != prefix {
+        return Err(String::from("CIDR must not contain surrounding whitespace"));
+    }
+
+    let addr = addr
+        .parse::<IpAddr>()
+        .map_err(|_| String::from("invalid IP address"))?;
+    let prefix = prefix
+        .parse::<u8>()
+        .map_err(|_| String::from("invalid prefix length"))?;
+
+    let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
+    if prefix > max_prefix {
+        return Err(format!("prefix length must be <= {max_prefix}"));
+    }
+
+    Ok((addr, prefix))
+}
+
+fn validate_ipv4_route(addr: Ipv4Addr, prefix: u8, allow_full_tunnel: bool) -> Option<String> {
+    if prefix == 0 {
+        return (!allow_full_tunnel || addr != Ipv4Addr::UNSPECIFIED)
+            .then(|| String::from("full-tunnel route requires allow_full_tunnel=true"));
+    }
+    if addr.is_unspecified() {
+        return Some(String::from("unspecified address ranges are not routable"));
+    }
+    if addr.is_loopback() {
+        return Some(String::from(
+            "loopback ranges must not be routed through Tunnel",
+        ));
+    }
+    if addr.is_multicast() {
+        return Some(String::from(
+            "multicast ranges must not be routed through Tunnel",
+        ));
+    }
+    if addr.is_link_local() {
+        return Some(String::from(
+            "link-local ranges must not be routed through Tunnel",
+        ));
+    }
+    if !is_ipv4_network_address(addr, prefix) {
+        return Some(String::from("CIDR address must be the network address"));
+    }
+    None
+}
+
+fn validate_ipv6_route(addr: Ipv6Addr, prefix: u8, allow_full_tunnel: bool) -> Option<String> {
+    if prefix == 0 {
+        return (!allow_full_tunnel || addr != Ipv6Addr::UNSPECIFIED)
+            .then(|| String::from("full-tunnel route requires allow_full_tunnel=true"));
+    }
+    if addr.is_unspecified() {
+        return Some(String::from("unspecified address ranges are not routable"));
+    }
+    if addr.is_loopback() {
+        return Some(String::from(
+            "loopback ranges must not be routed through Tunnel",
+        ));
+    }
+    if addr.is_multicast() {
+        return Some(String::from(
+            "multicast ranges must not be routed through Tunnel",
+        ));
+    }
+    if addr.is_unicast_link_local() {
+        return Some(String::from(
+            "link-local ranges must not be routed through Tunnel",
+        ));
+    }
+    if !is_ipv6_network_address(addr, prefix) {
+        return Some(String::from("CIDR address must be the network address"));
+    }
+    None
+}
+
+fn is_ipv4_network_address(addr: Ipv4Addr, prefix: u8) -> bool {
+    let value = u32::from(addr);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    value & !mask == 0
+}
+
+fn is_ipv6_network_address(addr: Ipv6Addr, prefix: u8) -> bool {
+    let value = u128::from(addr);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    value & !mask == 0
+}
+
 pub fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -379,6 +523,7 @@ mod tests {
                 traffic_class: TrafficClass::BulkExport,
                 destination_cidrs: vec![String::from("10.0.0.0/8")],
                 routing_mark: 100,
+                allow_full_tunnel: false,
             },
             heartbeat_interval_secs: 5,
             max_chunk_bytes: 4096,
@@ -401,6 +546,7 @@ mod tests {
                 traffic_class: TrafficClass::BulkExport,
                 destination_cidrs: vec![String::from("10.0.0.0/8")],
                 routing_mark: 100,
+                allow_full_tunnel: false,
             },
             heartbeat_interval_secs: 5,
             max_chunk_bytes: 0,
@@ -408,6 +554,48 @@ mod tests {
         };
 
         assert_eq!(config.validate(), Err(ConfigError::InvalidChunkSize));
+    }
+
+    #[test]
+    fn rejects_invalid_and_dangerous_destination_cidrs() {
+        for cidr in [
+            "not-a-cidr",
+            "1.1.1.1/24",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "224.0.0.0/4",
+            "::1/128",
+            "fe80::/10",
+            "ff00::/8",
+            "0.0.0.0/0",
+        ] {
+            let policy = RoutePolicy {
+                traffic_class: TrafficClass::BulkExport,
+                destination_cidrs: vec![String::from(cidr)],
+                routing_mark: 100,
+                allow_full_tunnel: false,
+            };
+
+            assert!(
+                matches!(
+                    policy.validate(),
+                    Err(ConfigError::InvalidDestinationCidr { .. })
+                ),
+                "{cidr} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_explicit_full_tunnel_destination_cidr() {
+        let policy = RoutePolicy {
+            traffic_class: TrafficClass::BulkExport,
+            destination_cidrs: vec![String::from("0.0.0.0/0")],
+            routing_mark: 100,
+            allow_full_tunnel: true,
+        };
+
+        assert_eq!(policy.validate(), Ok(()));
     }
 
     #[test]

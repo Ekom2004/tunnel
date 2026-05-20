@@ -30,6 +30,8 @@ struct Cli {
     destination_cidrs: Vec<String>,
     #[arg(long, default_value_t = 100)]
     routing_mark: u32,
+    #[arg(long)]
+    allow_full_tunnel: bool,
     #[arg(long, default_value_t = 5)]
     heartbeat_interval_secs: u64,
     #[arg(long, default_value_t = 4096)]
@@ -71,6 +73,7 @@ fn main() -> Result<()> {
         },
         destination_cidrs: cli.destination_cidrs.clone(),
         routing_mark: cli.routing_mark,
+        allow_full_tunnel: cli.allow_full_tunnel,
     };
 
     if cli.wireguard {
